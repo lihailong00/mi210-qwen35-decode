@@ -1,6 +1,8 @@
 #include "models.h"
 #include "llama-memory-recurrent.h"
 
+#include <cstring>
+
 void llama_model_qwen35::load_arch_hparams(llama_model_loader & ml) {
     ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS,       hparams.f_norm_rms_eps);
     ml.get_key_or_arr(LLM_KV_ROPE_DIMENSION_SECTIONS,    hparams.rope_sections, 4, true);
@@ -374,6 +376,41 @@ static bool qwen35_tensor_on_dev(const ggml_tensor * t, ggml_backend_dev_t dev) 
 // when they run on the device that holds the states (and every weight that steers the op placement); otherwise,
 // or if the backend does not support them, nullptr is returned and the caller builds the unfused graph.
 // returns the gated, normalized attention output [head_v_dim*num_v_heads, 1] (input of ssm_out)
+// Every precondition that the ggml_gdn_decode_prep/_out constructors assert on (plus the contiguity the reshapes need),
+// checked before any node is built, so that an unusual GGUF (e.g. ssm_alpha/ssm_beta of different types from a
+// --tensor-type override) falls back to the unfused graph instead of aborting. Backend limits are left to supports_op.
+static bool qwen35_gdn_fused_decode_args_ok(const llama_layer & layer, const ggml_tensor * qkv_mixed, const ggml_tensor * x,
+        const ggml_tensor * z, const ggml_tensor * conv_states, const ggml_tensor * ssm_states, const ggml_tensor * s_copy,
+        const int64_t H_k, const int64_t H_v, const int64_t S, const int64_t dst_row) {
+    const ggml_tensor * wa = layer.ssm_alpha;
+    const ggml_tensor * wb = layer.ssm_beta;
+    const ggml_tensor * dt = layer.ssm_dt;
+    const ggml_tensor * a  = layer.ssm_a;
+    const ggml_tensor * cw = layer.ssm_conv1d;
+    const ggml_tensor * nw = layer.ssm_norm;
+    if (!wa || !wb || !dt || !a || !cw || !nw || !s_copy || H_k <= 0 || H_v <= 0 || S <= 0 || H_v % H_k != 0) {
+        return false;
+    }
+    const int64_t conv_dim = (2*H_k + H_v) * S;
+    const int64_t n_embd   = x->ne[0];
+    const int64_t d_conv   = cw->ne[0];
+    return qkv_mixed->type == GGML_TYPE_F32 && ggml_is_contiguous(qkv_mixed) && ggml_nelements(qkv_mixed) == conv_dim &&
+           x->type == GGML_TYPE_F32 && ggml_is_contiguous(x) && ggml_nelements(x) == n_embd &&
+           wa->ne[0] == n_embd && wa->ne[1] == H_v && ggml_is_contiguous_rows(wa) &&
+           wb->ne[0] == n_embd && wb->ne[1] == H_v && ggml_is_contiguous_rows(wb) &&
+           wa->type == wb->type &&
+           dt->type == GGML_TYPE_F32 && ggml_nelements(dt) == H_v && ggml_is_contiguous(dt) &&
+           a->type == GGML_TYPE_F32 && ggml_nelements(a) == H_v && ggml_is_contiguous(a) &&
+           cw->type == GGML_TYPE_F32 && cw->ne[1] == conv_dim && ggml_is_contiguous(cw) && d_conv >= 2 &&
+           conv_states->type == GGML_TYPE_F32 && conv_states->ne[0] == (d_conv - 1)*conv_dim &&
+           conv_states->nb[0] == sizeof(float) && dst_row >= 0 && dst_row < conv_states->ne[1] &&
+           s_copy->type == GGML_TYPE_I32 && ggml_nelements(s_copy) >= 1 &&
+           z->type == GGML_TYPE_F32 && ggml_is_contiguous(z) && ggml_nelements(z) == H_v*S &&
+           nw->type == GGML_TYPE_F32 && ggml_is_contiguous(nw) && ggml_nelements(nw) == S &&
+           ssm_states->type == GGML_TYPE_F32 && ssm_states->ne[0] == S*S*H_v &&
+           ssm_states->nb[0] == sizeof(float) && dst_row < ssm_states->ne[1];
+}
+
 static ggml_tensor * qwen35_build_gdn_fused_decode(
         llm_graph_context  & g,
         const llama_model  & model,
@@ -408,6 +445,16 @@ static ggml_tensor * qwen35_build_gdn_fused_decode(
     if (dev == nullptr || ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU) {
         return nullptr;
     }
+    // only the CUDA/ROCm backend implements the fused ops on a GPU device. Other devices may still claim support:
+    // RPC reports GPU type and supports_op == true for every op without knowing what the remote server implements
+    // (a Vulkan remote silently skips unknown ops, Metal/SYCL/OpenCL or an older server abort)
+    {
+        ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
+        const char * reg_name = reg ? ggml_backend_reg_name(reg) : nullptr;
+        if (reg_name == nullptr || (strcmp(reg_name, "CUDA") != 0 && strcmp(reg_name, "ROCm") != 0)) {
+            return nullptr;
+        }
+    }
     for (const ggml_tensor * t : { conv_states_all, ssm_states_all, layer.ssm_alpha, layer.ssm_beta, layer.ssm_dt,
                                    layer.ssm_a, layer.ssm_conv1d, layer.ssm_norm }) {
         if (!qwen35_tensor_on_dev(t, dev)) {
@@ -423,6 +470,11 @@ static ggml_tensor * qwen35_build_gdn_fused_decode(
         if (lora.first->get_weight(layer.ssm_alpha) || lora.first->get_weight(layer.ssm_beta)) {
             return nullptr;
         }
+    }
+
+    if (!qwen35_gdn_fused_decode_args_ok(layer, qkv_mixed, x, z, conv_states_all, ssm_states_all, inp->s_copy,
+            num_k_heads, num_v_heads, head_k_dim, (int64_t) mctx->get_head())) {
+        return nullptr;
     }
 
     ggml_context * ctx0 = g.ctx0;

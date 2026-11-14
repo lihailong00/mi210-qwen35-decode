@@ -757,6 +757,10 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
     for (int i = 0; i < GGML_CUDA_MAX_DEVICES; ++i) {
         for (int j = 0; j < GGML_CUDA_MAX_STREAMS; ++j) {
             if (streams[i][j] != nullptr) {
+                // per-stream caches keyed by the stream handle: free them before the handle can be reused
+                ggml_cuda_set_device(i);
+                ggml_cuda_mmvq_cache_release(i, streams[i][j]);
+                ggml_cuda_mmvq_fused_release(i, streams[i][j]);
                 CUDA_CHECK(cudaStreamDestroy(streams[i][j]));
             }
             if (cublas_handles[i][j] != nullptr) {
@@ -2191,8 +2195,10 @@ static bool ggml_cuda_should_fuse_mul_mat(const ggml_tensor * ffn_up,
     if (ffn_up->src[0]->type != ffn_gate->src[0]->type || !ggml_are_same_shape(ffn_up->src[0], ffn_gate->src[0]) ||
         !ggml_are_same_stride(ffn_up->src[0], ffn_gate->src[0])) {
 #if defined(GGML_USE_HIP)
-        // IQ3_S + IQ3_XXS gate/up pairs: fused by the single-token iq3gemv kernel (mmvq-iq3.cu)
-        if (!(is_mul_mat && !has_bias && !has_scale && ggml_cuda_mmvq_iq3_fuse_mixed_ok(ffn_up->src[0], ffn_gate->src[0]))) {
+        // IQ3_S + IQ3_XXS gate/up pairs: fused by the single-token iq3gemv kernel (mmvq-iq3.cu), which implements only
+        // plain (non-swapped) SwiGLU; every other GLU op would reach the generic kernel with the wrong gate type
+        if (!(is_mul_mat && !has_bias && !has_scale && ggml_get_glu_op(glu) == GGML_GLU_OP_SWIGLU &&
+              ggml_get_op_params_i32(glu, 1) == 0 && ggml_cuda_mmvq_iq3_fuse_mixed_ok(ffn_up->src[0], ffn_gate->src[0]))) {
             return false;
         }
 #else
@@ -2316,7 +2322,10 @@ static bool ggml_cuda_match_shared_expert(const ggml_cgraph * graph, int routed_
     if (input->op != GGML_OP_RESHAPE || input->src[0] != shared_up->src[1] ||
             input->ne[1] != 1 || input->ne[3] != 1 || !ggml_is_contiguous(input) ||
             !ggml_is_contiguous(shared_up->src[1]) || !ggml_is_matrix(shared_up->src[1]) ||
-            weight->type != shared_weight->type || weight->ne[0] != shared_weight->ne[0] ||
+            // same type for routed up, shared up and shared gate: the shared-expert kernel decodes all of them with one
+            // type (the mixed IQ3 gate/up exception of ggml_cuda_should_fuse_mul_mat must not leak into this match)
+            weight->type != shared_weight->type || shared_gate->src[0]->type != shared_weight->type ||
+            weight->ne[0] != shared_weight->ne[0] ||
             weight->ne[1] != shared_weight->ne[1] || weight->nb[1] != shared_weight->nb[1] || weight->ne[3] != 1 ||
             !ggml_is_matrix(shared_weight) || !ggml_is_contiguous(shared_weight) ||
             !ggml_is_contiguous(shared_gate->src[0]) || !ggml_is_contiguous(routed) || !ggml_is_contiguous(shared)) {
@@ -5020,7 +5029,8 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
 
     ggml_tensor * node = cgraph->nodes[i];
 
-    if (node->op == GGML_OP_FLASH_ATTN_EXT) {
+    // like the other fusions added with it: not with concurrent stream regions (GGML_CUDA_GRAPH_OPT)
+    if (node->op == GGML_OP_FLASH_ATTN_EXT && cuda_ctx->stream_context().concurrent_events.empty()) {
         const int nodes_to_skip = ggml_cuda_try_fattn_gate_fusion(cuda_ctx, cgraph, i);
         if (nodes_to_skip > 0) {
             return nodes_to_skip;
@@ -5064,8 +5074,9 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     }
 #endif
 
-    // full-attention prep chain (q/k norm + rope, gate copy, k/v cache stores) as one kernel
-    if (node->op == GGML_OP_RMS_NORM) {
+    // full-attention prep chain (q/k norm + rope, gate copy, k/v cache stores) as one kernel. Not inside concurrent
+    // stream regions (GGML_CUDA_GRAPH_OPT): the kernel reads k/v, which other streams of the region may still produce.
+    if (node->op == GGML_OP_RMS_NORM && cuda_ctx->stream_context().concurrent_events.empty()) {
         ggml_tensor * prep_nodes[9];
         const int nodes_to_skip = ggml_cuda_try_attn_prep_fusion(cgraph, i, prep_nodes);
         if (nodes_to_skip > 0) {

@@ -1,4 +1,8 @@
 // Host dispatch for the single-token GEMV kernels with in-kernel q8_1 activation quantization (mmvq-fused.cuh).
+// AMD wave64 only (HIP builtins, hipStream* APIs): non-HIP builds (CUDA/MUSA glob this file too) get the stubs at the end.
+#include "mmvq-fused-host.cuh"
+
+#if defined(GGML_USE_HIP)
 #define vec_dot_iq3_s_q8_1 vec_dot_iq3_s_q8_1_original
 #define vec_dot_iq3_xxs_q8_1 vec_dot_iq3_xxs_q8_1_original
 #include "vecdotq.cuh"
@@ -16,10 +20,14 @@ using namespace mmvqf;
 #include <mutex>
 #include <map>
 
-// per (device, stream) cooperative-quantization state + global q8 buffer, allocated once (outside graph capture)
+// per (device, stream) cooperative-quantization state + global q8 buffer, allocated once (outside graph capture),
+// freed by ggml_cuda_mmvq_fused_release when the stream is destroyed
+static std::mutex coop_mtx;
+static std::map<std::pair<int, cudaStream_t>, char *> coop_bufs;
+
 static bool get_coop(const int device, cudaStream_t stream, coop_state ** st, char ** q8) {
-    static std::mutex mtx;
-    static std::map<std::pair<int, cudaStream_t>, char *> bufs;
+    std::mutex & mtx = coop_mtx;
+    std::map<std::pair<int, cudaStream_t>, char *> & bufs = coop_bufs;
     static const bool disabled = [] {
         const char * v = getenv("GGML_MMVQF_COOP");
         return v != nullptr && v[0] == '0';
@@ -46,6 +54,21 @@ static bool get_coop(const int device, cudaStream_t stream, coop_state ** st, ch
     *st = (coop_state *) it->second;
     *q8 = it->second + 256;
     return true;
+}
+
+void ggml_cuda_mmvq_fused_release(const int device, cudaStream_t stream) {
+    char * mem = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(coop_mtx);
+        const auto it = coop_bufs.find({device, stream});
+        if (it == coop_bufs.end()) {
+            return;
+        }
+        mem = it->second;
+        coop_bufs.erase(it);
+    }
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    CUDA_CHECK(cudaFree(mem));
 }
 
 // GGML_MMVQF: 0 = off, 1 (default) = only where measured faster in situ, 2 = every supported GEMV
@@ -382,3 +405,21 @@ bool ggml_cuda_mmvq_fused(ggml_backend_cuda_context & ctx, const ggml_tensor * s
     }
     return ok;
 }
+
+#else
+
+bool ggml_cuda_mmvq_fused_supported(const ggml_tensor *, const ggml_tensor *, const ggml_tensor *) {
+    return false;
+}
+bool ggml_cuda_mmvq_fused_preq(ggml_backend_cuda_context &, const ggml_tensor *, const block_q8_1 *, const int *,
+        ggml_tensor *, const ggml_cuda_mm_fusion_args_host *) {
+    return false;
+}
+bool ggml_cuda_mmvq_fused(ggml_backend_cuda_context &, const ggml_tensor *, const ggml_tensor *, ggml_tensor *,
+        const ggml_cuda_mm_fusion_args_host *, const float *, const int) {
+    return false;
+}
+void ggml_cuda_mmvq_fused_release(int, cudaStream_t) {
+}
+
+#endif // defined(GGML_USE_HIP)

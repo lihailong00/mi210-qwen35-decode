@@ -1461,6 +1461,16 @@ static void mul_mat_vec_q_switch_type(
     }
 }
 
+// GGML_MMVQ_Q8_CACHE=0 disables the per-stream activation cache (plain host code: also used outside the HIP-only
+// section, ggml_cuda_mul_mat_vec_q)
+static bool mmvq_q8_cache_disabled() {
+    static const bool disabled = [] {
+        const char * v = getenv("GGML_MMVQ_Q8_CACHE");
+        return v != nullptr && v[0] == '0';
+    }();
+    return disabled;
+}
+
 #if defined(GGML_USE_HIP)
 static __global__ void codex_iq3_sum_q8(const block_q8_1 * x, int * sums, int groups) {
     const int g = blockIdx.x*blockDim.x+threadIdx.x;
@@ -1657,10 +1667,12 @@ static __global__ void quantize_q8_1_sums(const float * __restrict__ x, block_q8
     }
 }
 
+// The identity of the cached activation is kept by value: base = root tensor (view_src or the tensor itself) at the
+// time of insertion, only ever compared as a pointer value, never dereferenced (the graph that owned it may be freed).
 struct mmvq_q8_cache_entry {
     char              * buf  = nullptr;
     size_t              size = 0;
-    const ggml_tensor * src  = nullptr;
+    const ggml_tensor * base = nullptr;
     const void        * data = nullptr;
     int64_t             ne10 = 0;
     bool                valid = false;
@@ -1668,20 +1680,32 @@ struct mmvq_q8_cache_entry {
 static std::mutex mmvq_q8_cache_mutex;
 static std::map<std::pair<int, cudaStream_t>, mmvq_q8_cache_entry> mmvq_q8_caches;
 
-static bool mmvq_q8_cache_disabled() {
-    static const bool disabled = [] {
-        const char * v = getenv("GGML_MMVQ_Q8_CACHE");
-        return v != nullptr && v[0] == '0';
-    }();
-    return disabled;
-}
-
 void ggml_cuda_mmvq_cache_reset(ggml_backend_cuda_context & ctx) {
     std::lock_guard<std::mutex> lock(mmvq_q8_cache_mutex);
     for (auto & e : mmvq_q8_caches) {
         if (e.first.first == ctx.device) {
             e.second.valid = false;
+            e.second.base  = nullptr;
+            e.second.data  = nullptr;
         }
+    }
+}
+
+// drop the entry of a stream that is about to be destroyed (its handle may be recycled by a new stream)
+void ggml_cuda_mmvq_cache_release(const int device, cudaStream_t stream) {
+    char * buf = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(mmvq_q8_cache_mutex);
+        const auto it = mmvq_q8_caches.find({device, stream});
+        if (it == mmvq_q8_caches.end()) {
+            return;
+        }
+        buf = it->second.buf;
+        mmvq_q8_caches.erase(it);
+    }
+    if (buf) {
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+        CUDA_CHECK(cudaFree(buf));
     }
 }
 
@@ -1713,7 +1737,7 @@ bool ggml_cuda_mmvq_cache_produce(ggml_backend_cuda_context & ctx, const ggml_te
     const size_t sums_off = (q8_bytes + 255) & ~(size_t) 255;
     *q8   = (block_q8_1 *) e.buf;
     *sums = (int *) (e.buf + sums_off);
-    e.src   = t;
+    e.base  = t->view_src ? t->view_src : t;
     e.data  = t->data;
     e.ne10  = ne10;
     e.valid = true;
@@ -1749,15 +1773,14 @@ static bool mmvq_q8_cache_get(ggml_backend_cuda_context & ctx, const ggml_tensor
     *q8   = (const block_q8_1 *) e.buf;
     *sums = (const int *) (e.buf + sums_off);
     const ggml_tensor * base_src1 = src1->view_src ? src1->view_src : src1;
-    const ggml_tensor * base_e    = e.src ? (e.src->view_src ? e.src->view_src : e.src) : nullptr;
-    if (e.valid && base_e == base_src1 && e.data == src1->data && e.ne10 == ne10) {
+    if (e.valid && e.base == base_src1 && e.data == src1->data && e.ne10 == ne10) {
         return true;
     }
     const int64_t nblk = (ne10_padded + CUDA_QUANTIZE_BLOCK_SIZE - 1) / CUDA_QUANTIZE_BLOCK_SIZE;
     quantize_q8_1_sums<<<nblk, CUDA_QUANTIZE_BLOCK_SIZE, 0, stream>>>((const float *) src1->data, (block_q8_1 *) e.buf,
             (int *) (e.buf + sums_off), ne10, ne10_padded);
     CUDA_CHECK(cudaGetLastError());
-    e.src   = src1;
+    e.base  = base_src1;
     e.data  = src1->data;
     e.ne10  = ne10;
     e.valid = true;
@@ -1775,6 +1798,17 @@ bool ggml_cuda_mmvq_q8_cached(ggml_backend_cuda_context & ctx, const ggml_tensor
 #else
 bool ggml_cuda_mmvq_q8_cached(ggml_backend_cuda_context &, const ggml_tensor *, const block_q8_1 **) {
     return false;
+}
+// the activation cache is HIP-only; callers outside HIP-only code (fattn-common.cuh launch_fattn, fattn-dec.cu,
+// q8-producers.cu, ggml-cuda.cu) must link in every build
+void ggml_cuda_mmvq_cache_reset(ggml_backend_cuda_context &) {
+}
+bool ggml_cuda_mmvq_cache_produce(ggml_backend_cuda_context &, const ggml_tensor *, block_q8_1 ** q8, int ** sums) {
+    *q8   = nullptr;
+    *sums = nullptr;
+    return false;
+}
+void ggml_cuda_mmvq_cache_release(int, cudaStream_t) {
 }
 #endif
 
@@ -1838,8 +1872,9 @@ void ggml_cuda_mul_mat_vec_q(
             fusion_local.x_bias = fusion->x_bias->data;
         }
         if (fusion->gate) {
+            // mixed IQ3_S/IQ3_XXS gate/up: only the iq3gemv SwiGLU kernel (mmvq-iq3.cu) handles it
             GGML_ASSERT((fusion->gate->type == src0->type && ggml_are_same_stride(fusion->gate, src0)) ||
-                        ggml_cuda_mmvq_iq3_fuse_mixed_ok(src0, fusion->gate));   // mixed IQ3_S/IQ3_XXS: mmvq-iq3.cu
+                        (!ids && fusion->glu_op == GGML_GLU_OP_SWIGLU && ggml_cuda_mmvq_iq3_fuse_mixed_ok(src0, fusion->gate)));
             fusion_local.gate = fusion->gate->data;
         }
         if (fusion->gate_bias) {
@@ -1912,6 +1947,8 @@ void ggml_cuda_mul_mat_vec_q(
         return;
     }
 #endif
+    // a mixed-type gate must never reach the kernels below: they decode the gate with src0's type and row stride
+    GGML_ASSERT(!fusion || !fusion->gate || fusion->gate->type == src0->type);
 
 #if defined(GGML_USE_HIP)
     if (!ids && ne11 == 1 && ne12 == 1 && ne13 == 1 &&

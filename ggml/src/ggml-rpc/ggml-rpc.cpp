@@ -3055,7 +3055,12 @@ static ggml_backend_buffer_type_t ggml_backend_rpc_device_get_buffer_type(ggml_b
 
 static bool ggml_backend_rpc_device_supports_op(ggml_backend_dev_t dev, const struct ggml_tensor * op) {
     GGML_UNUSED(dev);
-    GGML_UNUSED(op);
+    // the fused GDN decode ops are implemented only by the CPU and CUDA/HIP backends, and older servers do not know
+    // them at all: the client cannot tell what the remote runs, so never place them on an RPC device (as the meta
+    // backend does); the model then builds the unfused graph
+    if (op->op == GGML_OP_GDN_DECODE_PREP || op->op == GGML_OP_GDN_DECODE_OUT) {
+        return false;
+    }
     //TODO: call the remote backend and cache the results
     return true;
 }
