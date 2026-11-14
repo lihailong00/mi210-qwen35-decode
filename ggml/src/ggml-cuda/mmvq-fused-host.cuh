@@ -64,3 +64,11 @@ bool ggml_cuda_mmvq_iq3_multi(ggml_backend_cuda_context & ctx, const ggml_tensor
 bool ggml_cuda_mmvq_iq4k(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const block_q8_1 * src1_q8_1, ggml_tensor * dst,
         const ggml_cuda_mm_fusion_args_host * fusion);
 bool ggml_cuda_mmvq_iq4k_wants(const ggml_tensor * src0);
+// iq4k-r3: one launch for 2..4 single-token MUL_MATs that read the same activation (IQ4_XS/Q4_K weights, may be mixed).
+// Default: only groups of small GEMVs (attn_k + attn_v, N <= 2048; bit-identical); groups with a large member
+// (q/k/v, qkv/z, mixed-type gate/up) only with GGML_MMVQ_IQ4K_GROUP_BIG=1. group_ok: can this node be a member;
+// group: run them (false: nothing launched, caller runs the nodes one by one). GGML_MMVQ_IQ4K_GROUP=0 disables.
+bool ggml_cuda_mmvq_iq4k_group_ok(const ggml_tensor * mm);
+bool ggml_cuda_mmvq_iq4k_group(ggml_backend_cuda_context & ctx, ggml_tensor * const * mm, int n);
+// q8_1 blocks of a single-row f32 activation from the per-stream cache (quantized on a miss); false if not usable
+bool ggml_cuda_mmvq_q8_cached(ggml_backend_cuda_context & ctx, const ggml_tensor * src1, const block_q8_1 ** q8);

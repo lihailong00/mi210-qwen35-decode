@@ -14,6 +14,7 @@
 #pragma once
 #include "common.cuh"
 #include "vecdotq.cuh"
+#include <type_traits>
 
 namespace iq4k {
 
@@ -708,6 +709,433 @@ static inline bool repack(ggml_type t, const void * src, void * dst, int64_t nro
 }
 static inline bool repack_glu(ggml_type t, const void * src, void * dst, int64_t nrows, int K, hipStream_t st, int ncu = 104) {
     return repack_cfg(t, src, dst, nrows, K, pick_cfg_glu(t, (int) nrows, K, ncu), st);
+}
+
+
+// ================================================================================================
+// Grouped, workgroup-balanced GEMV ("g" kernel, iq4k-r3)
+// One launch computes up to G_MAXJ GEMVs that read the same activation y (same K): phase A = jobs of type TA,
+// phase B = jobs of type TB (none_t: no phase B). Every job uses the row-interleaved copy with IL = 64/L (L = 16: the
+// same copy as the single-matrix launcher at K <= 8192). The units (GR = 64/L rows) of a phase are concatenated over
+// its jobs; workgroup b takes the balanced contiguous unit range [b*U/grid, (b+1)*U/grid) of every phase, and its
+// step stream (units x q steps, one 16-byte item per lane per step) is cut into blockDim.y contiguous ranges of
+// Tw = ceil(steps/NW) steps, one per wave, so every wave does (almost) the same number of steps whatever N is: no
+// round-robin tail, and small N becomes a split-K inside the workgroup. Loads are ping-pong pipelined as in gemv; the
+// first step of both phases is loaded before the y staging. A wave stores the group sum of every unit piece it
+// computed in LDS slot [unit][part] (part = wave index - first wave of the unit); after a barrier the workgroup adds
+// the parts in fixed order (deterministic) and applies the epilogue: plain (+ optional residual per job) or GLU
+// (dst = up * silu(gate), gate = phase A job 0, up = phase B job 0, same N).
+struct none_t { static constexpr int IPB = 8, YW = 0, YPI = 1; };
+
+static constexpr int G_MAXJ = 4;   // jobs per launch (at most 3 per phase)
+struct gjob { const uint8_t * Q; const uint8_t * S; float * dst; const float * res; int u0; int nu; uint32_t boff; int pad_; };
+struct gargs {
+    gjob j[G_MAXJ];
+    const block_q8_1 * y;
+    int K, na, nb;        // phase A jobs j[0, na), phase B jobs j[na, na + nb)
+    int UA, UB;           // units per phase
+    int MA, PA, MB, PB;   // LDS partial slots per phase: max units per workgroup x max parts per unit
+    int glu;
+};
+
+#define GSEL(i, f) ((i) == 0 ? P.j[0].f : (i) == 1 ? P.j[1].f : (i) == 2 ? P.j[2].f : P.j[3].f)
+#ifndef IQ4K_G_STRIDED
+#define IQ4K_G_STRIDED 1   // 1: workgroup b owns units b, b + grid, ... (consecutive units on different CUs, like the
+                           // round-robin kernel); 0: a contiguous unit range per workgroup
+#endif
+struct gpg { int ub0, nu, q, Tw, b, e, luf, pf, us; };   // global unit of local unit lu = ub0 + lu*us
+static __device__ __forceinline__ gpg g_geo(const int U, const int q, const int wy, const int NW) {
+    gpg g;
+#if IQ4K_G_STRIDED
+    g.ub0 = blockIdx.x; g.us = gridDim.x;
+    g.nu  = U > (int) blockIdx.x ? (U - 1 - (int) blockIdx.x)/(int) gridDim.x + 1 : 0;
+#else
+    g.ub0 = (int) (((int64_t) blockIdx.x*U)/gridDim.x); g.us = 1;
+    g.nu  = (int) (((int64_t) (blockIdx.x + 1)*U)/gridDim.x) - g.ub0;
+#endif
+    g.q   = q;
+    const int S = g.nu*q;
+    g.Tw  = (S + NW - 1)/NW;
+    g.b   = min(wy*g.Tw, S);
+    g.e   = min(g.b + g.Tw, S);
+    g.luf = g.Tw > 0 ? g.b/q : 0;
+    g.pf  = g.Tw > 0 ? wy - (g.luf*q)/g.Tw : 0;
+    return g;
+}
+// round-robin mode (RRM): wave gw (= wy*grid + blockIdx.x, NWV waves) owns complete units i0, i0 + NWV, ... of the phase,
+// where unit i is dealt to wave (i + rot) % NWV (phase B is rotated by UA % NWV so that it fills the waves phase A
+// leaves idle; GLU: rot = 0, gate and up unit on the same wave).
+static __device__ __forceinline__ gpg g_geo_rr(const int U, const int q, const int gw, const int NWV, const int rot) {
+    gpg g;
+    const int i0 = (gw - rot % NWV + NWV) % NWV;
+    g.ub0 = i0; g.us = NWV;
+    g.nu  = U > i0 ? (U - 1 - i0)/NWV + 1 : 0;
+    g.q   = q;
+    g.b   = 0; g.e = g.nu*q; g.Tw = g.e > 0 ? g.e : 1;
+    g.luf = 0; g.pf = 0;
+    return g;
+}
+
+template <class T, int L>
+struct gph {
+    static constexpr int GR = 64/L;
+    typedef typename T::raw raw;
+    gpg g;
+    uint32_t cpr, bpr, qlane, slane;
+    int j0, nj;
+    const gargs * Pp;   // job table: read from the kernarg segment (scalar loads); keeping copies of several jobs in
+                        // this struct and selecting between them made the compiler index the struct in scratch memory
+    // load cursor (clamped at the last real step) and current job
+    int ls, lk, lun, lj, jnu, lgu, jnext;
+    const uint8_t * Q, * S;
+    uint32_t boff;
+    // compute cursor
+    int cs, ck, cl;
+    float acc;
+
+    __device__ __forceinline__ void set_job() {
+        const gjob & J = Pp->j[j0 + lj];
+        Q = J.Q; S = J.S; boff = J.boff; jnu = J.nu;
+        jnext = lj + 1 < nj ? Pp->j[j0 + lj + 1].u0 : 0x7fffffff;
+    }
+    static __device__ __forceinline__ int steps_per_unit(const int K) { return (int) ((K/QK_K)*T::IPB)/L; }
+    __device__ __forceinline__ void init(const gargs & P, const int j0_, const int nj_, const gpg & g_, const int K,
+            const int lane, const int grp) {
+        Pp = &P; j0 = j0_; nj = nj_;
+        bpr = K/QK_K; cpr = 8*bpr;
+        g = g_;
+        const int q = g.q;
+        qlane = lane*GR + grp; slane = (lane/T::IPB)*GR + grp;
+        // load cursor at the first step of the range (no steps: some valid step, never computed)
+        const int st = g.e > g.b ? g.b : 0;
+        const int gu = g.nu > 0 ? g.ub0 + (st/q)*g.us : 0;
+        lk = g.nu > 0 ? st - (st/q)*q : 0;
+        lj = 0;
+        for (int k = 1; k < nj; ++k) lj += gu >= Pp->j[j0 + k].u0;
+        lun = gu - Pp->j[j0 + lj].u0;
+        lgu = gu;
+        ls = st;
+        set_job();
+        cs = g.b; ck = g.nu > 0 ? g.b - (g.b/q)*q : 0; cl = g.luf;
+        acc = 0.0f;
+    }
+    __device__ __forceinline__ void load(raw & r) {
+        const soa s = {Q, S};
+        r = T::load_c(s, (lun*cpr + lk*L)*GR + qlane, (lun*bpr + lk*(L/T::IPB))*GR + slane, boff);
+        // branch-free cursor advance (selects, like the round-robin kernel); only a job switch branches (rare, uniform)
+        const int adv  = ls < g.e - 1 ? 1 : 0;
+        const bool wrap = adv && lk + 1 == g.q;
+        ls  += adv;
+        lk   = wrap ? 0 : lk + adv;
+        lgu += wrap ? g.us : 0;
+        lun += wrap ? g.us : 0;
+        if (lgu >= jnext) {
+            do { lun = lgu - jnext; ++lj; set_job(); } while (lgu >= jnext);
+        }
+    }
+    __device__ __forceinline__ void compute(const raw & r, const uint32_t * ys, const typename T::lc & c, float * part, const int PP,
+            const int lane, const int grp) {
+        acc += T::compute(r, ys + lane*T::YW + ck*(L*T::YW), c);
+        if (ck == g.q - 1 || cs == g.e - 1) {
+            if (cs < g.e) {
+                const float v = group_sum<L>(acc);
+                const int p = cl == g.luf ? g.pf : 0;
+                if (lane == 0) part[(cl*PP + p)*GR + grp] = v;
+            }
+            acc = 0.0f;
+        }
+        ++cs; if (++ck == g.q) { ck = 0; ++cl; }
+    }
+    __device__ __forceinline__ void run(raw & X0, raw & X1, const uint32_t * ys, const typename T::lc & c, float * part, const int PP,
+            const int lane, const int grp) {
+        const int nst = g.e - g.b;
+        for (int st = 0; st < nst; st += 2) {
+            load(X1);                                   // step st+1 (clamped)
+            compute(X0, ys, c, part, PP, lane, grp);    // step st
+            load(X0);                                   // step st+2 (clamped)
+            compute(X1, ys, c, part, PP, lane, grp);    // step st+1 (past the end: not stored)
+        }
+    }
+    // sum of the parts of local unit lu, row r, in wave order (deterministic)
+    __device__ __forceinline__ float part_sum(const float * part, const int PP, const int lu, const int r) const {
+        const int w0 = (lu*g.q)/g.Tw, w1 = (lu*g.q + g.q - 1)/g.Tw;
+        float v = part[(lu*PP)*GR + r];
+        for (int p = 1; p <= w1 - w0; ++p) v += part[(lu*PP + p)*GR + r];
+        return v;
+    }
+    // epilogue: per job (uniform loop), the units of this workgroup that belong to it
+    __device__ __forceinline__ void store(const float * part, const int PP, const int tid, const int nt) const {
+        for (int k = 0; k < nj; ++k) {
+            const gjob & J = Pp->j[j0 + k];
+            // local units lu with ub0 + lu*us in [J.u0, J.u0 + J.nu)
+            const int lo = J.u0 > g.ub0 ? (J.u0 - g.ub0 + g.us - 1)/g.us : 0;
+            const int hi = min(g.nu, J.u0 + J.nu > g.ub0 ? (J.u0 + J.nu - g.ub0 + g.us - 1)/g.us : 0);
+            float * dst = J.dst;
+            const float * res = J.res;
+            for (int i = tid; i < (hi - lo)*GR; i += nt) {
+                const int lu = lo + i / GR, r = i % GR;
+                const int row = (g.ub0 + lu*g.us - J.u0)*GR + r;
+                float v = part_sum(part, PP, lu, r);
+                if (res) v += res[row];
+                dst[row] = v;
+            }
+        }
+    }
+};
+
+template <class TA, class TB, int L, bool RRM>
+__launch_bounds__(1024, 1)
+__global__ void gemv_g(const gargs P) {
+    extern __shared__ __align__(16) uint32_t gsm[];
+    constexpr bool HB = !std::is_same<TB, none_t>::value;
+    constexpr bool SY = std::is_same<TA, TB>::value;
+    typedef typename std::conditional<HB, TB, TA>::type TBX;
+    constexpr int GR = 64/L;
+    const int K = P.K;
+    const int NW = blockDim.y, nt = NW*64;
+    const int tid = threadIdx.y*64 + threadIdx.x;
+    const int lane = threadIdx.x % L, grp = threadIdx.x / L;
+    const int wy = __builtin_amdgcn_readfirstlane(threadIdx.y);
+    const int ywA = (K/32/TA::YPI)*TA::YW;
+    const int ywB = (HB && !SY) ? (K/32/TBX::YPI)*TBX::YW : 0;
+    uint32_t * yA = gsm;
+    uint32_t * yB = (HB && !SY) ? gsm + ywA : gsm;
+    float * partA = (float *) (gsm + ywA + ywB);
+    float * partB = partA + (RRM ? NW : 1)*P.MA*P.PA*GR;
+    if constexpr (RRM) { partA += wy*P.MA*GR; partB += wy*P.MB*GR; }   // per-wave result slots
+    const int gw = wy*(int) gridDim.x + (int) blockIdx.x, NWV = (int) gridDim.x*NW;
+
+    gph<TA, L> pa;
+    {
+        const int q = gph<TA, L>::steps_per_unit(K);
+        pa.init(P, 0, P.na, RRM ? g_geo_rr(P.UA, q, gw, NWV, 0) : g_geo(P.UA, q, wy, NW), K, lane, grp);
+    }
+    typename TA::raw A0, A1;
+    pa.load(A0);
+    gph<TBX, L> pb;
+    typename TBX::raw B0, B1;
+    if constexpr (HB) {
+        const int q = gph<TBX, L>::steps_per_unit(K);
+        pb.init(P, P.na, P.nb, RRM ? g_geo_rr(P.UB, q, gw, NWV, P.glu ? 0 : P.UA) : g_geo(P.UB, q, wy, NW), K, lane, grp);
+        pb.load(B0);
+    }
+    const typename TA::lc ca = TA::lane_consts(lane);
+
+    for (int b = tid; b < K/32; b += nt) {
+        const uint8_t * p = (const uint8_t *) (P.y + b);
+        const uint32_t ds = *(const uint32_t *) p;
+        const uint4 q0 = *(const uint4 *) (p + 4);
+        const uint4 q1 = *(const uint4 *) (p + 20);
+        const float d = h2f(ds);
+        TA::put_y(yA, b, q0, q1, d);
+        if constexpr (HB && !SY) TBX::put_y(yB, b, q0, q1, d);
+    }
+    __syncthreads();
+
+    pa.run(A0, A1, yA, ca, partA, P.PA, lane, grp);
+    if constexpr (HB) {
+        const typename TBX::lc cb = TBX::lane_consts(lane);
+        pb.run(B0, B1, yB, cb, partB, P.PB, lane, grp);
+    }
+    // RRM: every wave stores its own complete units (no barrier); else the workgroup combines the parts
+    const int et = RRM ? (int) threadIdx.x : tid, ent = RRM ? 64 : nt;
+    if constexpr (!RRM) __syncthreads();
+
+    if constexpr (HB) {
+        if (P.glu) {   // gate = phase A job 0, up = phase B job 0 (same units)
+            float * dst = GSEL(P.na, dst);
+            for (int i = et; i < pa.g.nu*GR; i += ent) {
+                const int lu = i / GR, r = i % GR;
+                const float gv = pa.part_sum(partA, P.PA, lu, r);
+                const float uv = pb.part_sum(partB, P.PB, lu, r);
+                dst[(pa.g.ub0 + lu*pa.g.us)*GR + r] = uv*silu_f(gv);
+            }
+            return;
+        }
+    }
+    pa.store(partA, P.PA, et, ent);
+    if constexpr (HB) pb.store(partB, P.PB, et, ent);
+}
+
+// ---------------------------------------------------------------- host side of the g kernel
+struct gcfg { int L, NW, grid; bool rr = true; };   // rr: round-robin complete units per wave (RRM), else balanced split
+struct gjob_h { ggml_type type; const void * soa; float * dst; const float * res; int N; };
+
+static inline int g_ipb(ggml_type t) { return t == GGML_TYPE_Q4_K ? 4 : 8; }
+// LDS partial slots of a phase: max units per workgroup, max parts per unit
+static inline void g_slots(const int U, const int q, const int grid, const int NW, int & M, int & PP) {
+    M = 1; PP = 1;
+    for (int k = 0; k < 2; ++k) {
+        const int nu = k == 0 ? U/grid : (U + grid - 1)/grid;
+        if (nu == 0) continue;
+        const int S = nu*q, Tw = (S + NW - 1)/NW;
+        M = nu > M ? nu : M;
+        for (int lu = 0; lu < nu; ++lu) { const int np = (lu*q + q - 1)/Tw - (lu*q)/Tw + 1; PP = np > PP ? np : PP; }
+    }
+}
+static inline size_t g_ywords(ggml_type t, int K) { return t == GGML_TYPE_Q4_K ? (size_t) (K/64)*20 : (size_t) (K/32)*12; }
+
+// jobs: plain mode - any order, IQ4_XS and Q4_K may be mixed (grouped by type into the two phases);
+// glu mode - jobs[0] = gate, jobs[1] = up (same N, any of the two types), dst = jobs[1].dst.
+// soa = row-interleaved copy with IL = 64/c.L (iq4k::repack_il). Returns false if unsupported (caller falls back).
+static inline bool g_supported(const gjob_h * jobs, int nj, int K, bool glu, const gcfg & c) {
+    if (nj < 1 || nj > G_MAXJ || K % QK_K != 0 || (glu && nj != 2) || (c.L != 16 && c.L != 32) || c.NW < 1 || c.NW > 16 || c.grid < 1) return false;
+    const int GR = 64/c.L;
+    int n4 = 0, nq = 0;
+    for (int i = 0; i < nj; ++i) {
+        const ggml_type t = jobs[i].type;
+        if (t != GGML_TYPE_IQ4_XS && t != GGML_TYPE_Q4_K) return false;
+        if (((K/QK_K)*g_ipb(t)) % c.L != 0 || jobs[i].N % GR != 0 || jobs[i].N <= 0) return false;
+        if ((size_t) jobs[i].N*(K/QK_K)*144 >= (1ull << 32)) return false;
+        if (t == GGML_TYPE_IQ4_XS) n4++; else nq++;
+    }
+    if (glu) return jobs[0].N == jobs[1].N && !jobs[0].res && !jobs[1].res && c.L == 16;
+    return n4 <= 3 && nq <= 3 && (c.L == 16 || n4 == 0 || nq == 0);
+}
+
+template <class TA, class TB, int L>
+static inline void g_launch_k(const gargs & a, const gcfg & c, size_t lds, hipStream_t st) {
+    if (c.rr) hipLaunchKernelGGL((gemv_g<TA, TB, L, true>),  dim3(c.grid), dim3(64, c.NW), lds, st, a);
+    else      hipLaunchKernelGGL((gemv_g<TA, TB, L, false>), dim3(c.grid), dim3(64, c.NW), lds, st, a);
+}
+
+static inline bool launch_g(const gjob_h * jobs, int nj, const block_q8_1 * y, int K, hipStream_t st, bool glu, const gcfg & c) {
+    if (!g_supported(jobs, nj, K, glu, c)) return false;
+    const int GR = 64/c.L, bpr = K/QK_K;
+    // phase order: glu -> (gate, up); plain -> IQ4_XS jobs first, then Q4_K jobs
+    int ord[G_MAXJ]; int na = 0, nb = 0;
+    ggml_type tA, tB = GGML_TYPE_COUNT;
+    if (glu) { ord[0] = 0; ord[1] = 1; na = 1; nb = 1; tA = jobs[0].type; tB = jobs[1].type; }
+    else {
+        int k = 0;
+        for (int i = 0; i < nj; ++i) if (jobs[i].type == GGML_TYPE_IQ4_XS) ord[k++] = i;
+        na = k;
+        for (int i = 0; i < nj; ++i) if (jobs[i].type == GGML_TYPE_Q4_K) ord[k++] = i;
+        nb = k - na;
+        if (na == 0) { na = nb; nb = 0; }
+        tA = jobs[ord[0]].type; tB = nb > 0 ? jobs[ord[na]].type : GGML_TYPE_COUNT;
+    }
+    gargs a{};
+    a.y = y; a.K = K; a.na = na; a.nb = nb; a.glu = glu ? 1 : 0;
+    int U[2] = {0, 0};
+    for (int k = 0; k < na + nb; ++k) {
+        const gjob_h & J = jobs[ord[k]];
+        const int ph = k < na ? 0 : 1;
+        const size_t nbk = (size_t) J.N*bpr;
+        a.j[k].Q = (const uint8_t *) J.soa; a.j[k].S = (const uint8_t *) J.soa + nbk*128;
+        a.j[k].dst = J.dst; a.j[k].res = J.res;
+        a.j[k].u0 = U[ph]; a.j[k].nu = J.N/GR; U[ph] += J.N/GR;
+        a.j[k].boff = (uint32_t) (4*bpr*GR);
+    }
+    a.UA = U[0]; a.UB = U[1];
+    const int qA = (bpr*g_ipb(tA))/c.L;
+    const int NWV = c.grid*c.NW;
+    if (c.rr) { a.MA = (a.UA + NWV - 1)/NWV; a.PA = 1; } else g_slots(a.UA, qA, c.grid, c.NW, a.MA, a.PA);
+    size_t yw = g_ywords(tA, K);
+    if (nb > 0) {
+        const int qB = (bpr*g_ipb(tB))/c.L;
+        if (c.rr) { a.MB = (a.UB + NWV - 1)/NWV; a.PB = 1; } else g_slots(a.UB, qB, c.grid, c.NW, a.MB, a.PB);
+        if (tB != tA) yw += g_ywords(tB, K);
+    } else { a.MB = 0; a.PB = 0; }
+    const size_t lds = yw*4 + (size_t) (a.MA*a.PA + a.MB*a.PB)*GR*4*(c.rr ? c.NW : 1);
+    if (lds > 65536) return false;
+    const bool A4 = tA == GGML_TYPE_IQ4_XS;
+    if (c.L == 16) {
+        if (nb == 0) { if (A4) g_launch_k<iq4xs_t, none_t, 16>(a, c, lds, st); else g_launch_k<q4k_t, none_t, 16>(a, c, lds, st); }
+        else if (A4 && tB == GGML_TYPE_Q4_K) g_launch_k<iq4xs_t, q4k_t, 16>(a, c, lds, st);
+        else if (!A4 && tB == GGML_TYPE_IQ4_XS) g_launch_k<q4k_t, iq4xs_t, 16>(a, c, lds, st);
+        else if (A4) g_launch_k<iq4xs_t, iq4xs_t, 16>(a, c, lds, st);
+        else g_launch_k<q4k_t, q4k_t, 16>(a, c, lds, st);
+        return true;
+    }
+    // L = 32: single-type plain only
+    if (nb != 0) return false;
+    if (A4) g_launch_k<iq4xs_t, none_t, 32>(a, c, lds, st); else g_launch_k<q4k_t, none_t, 32>(a, c, lds, st);
+    return true;
+}
+
+
+// ================================================================================================
+// Small-N multi-job GEMV ("sn" kernel, iq4k-r3), for the 1024-row attn_k / attn_v GEMVs. These are latency bound, and
+// the LDS-staged kernels above lose ~2 us to the y staging there, so this is exactly the mul_mat_vec_q structure of
+// llama.cpp for ncols = 1 on GCN/CDNA (2 waves per row, y read from global memory, original GGUF block layout,
+// vec_dot_*_q8_1, the same shared-memory + warp reduction -> bit-identical to the stock path), but the rows of up to
+// G_MAXJ jobs (IQ4_XS and/or Q4_K) that share the activation are concatenated over blockIdx.x: k and v take one
+// launch instead of two. The job (and its type) is uniform per workgroup.
+struct snjob { const void * w; float * dst; int r0; int q4k; };
+struct snargs { snjob j[G_MAXJ]; const block_q8_1 * y; int bpr, nj; };
+
+template <ggml_type type>
+static __device__ __forceinline__ float sn_rowdot(const void * __restrict__ vx, const block_q8_1 * __restrict__ y, const int bpr,
+        const int row, const int tid) {
+    constexpr int qk  = ggml_cuda_type_traits<type>::qk, qi = ggml_cuda_type_traits<type>::qi;
+    constexpr int vdr = type == GGML_TYPE_Q4_K ? VDR_Q4_K_Q8_1_MMVQ : VDR_IQ4_XS_Q8_1_MMVQ;
+    constexpr int bpi = vdr*2*64/qi;   // blocks per iteration of the 128 threads
+    float tmp = 0.0f;
+    for (int kbx = tid/(qi/vdr); kbx < bpr; kbx += bpi) {
+        const int kby = kbx*(qk/QK8_1);
+        const int kqs = vdr*(tid % (qi/vdr));
+        if constexpr (type == GGML_TYPE_Q4_K) {
+            tmp += vec_dot_q4_K_q8_1(vx, &y[kby], row*bpr + kbx, kqs);
+        } else {
+            tmp += vec_dot_iq4_xs_q8_1(vx, &y[kby], row*bpr + kbx, kqs);
+        }
+    }
+    return tmp;
+}
+
+// keeps a kernarg value in SGPRs: stops the compiler from turning a select between kernarg values into a load from a
+// selected kernarg address (a second, dependent round of scalar loads before the first weight load)
+template <typename V> static __device__ __forceinline__ V sreg(V v) {
+#if defined(__HIP_DEVICE_COMPILE__)
+    asm volatile("" : "+s"(v));
+#endif
+    return v;
+}
+
+__launch_bounds__(128, 1)
+static __global__ void gemv_sn(const snargs a) {
+    const int b = blockIdx.x;
+    const int j = (a.nj > 1 && b >= a.j[1].r0 ? 1 : 0) + (a.nj > 2 && b >= a.j[2].r0 ? 1 : 0) + (a.nj > 3 && b >= a.j[3].r0 ? 1 : 0);
+    const void * w0 = sreg(a.j[0].w), * w1 = sreg(a.j[1].w), * w2 = sreg(a.j[2].w), * w3 = sreg(a.j[3].w);
+    float * d0 = sreg(a.j[0].dst), * d1 = sreg(a.j[1].dst), * d2 = sreg(a.j[2].dst), * d3 = sreg(a.j[3].dst);
+    const int s0 = sreg(a.j[0].r0), s1 = sreg(a.j[1].r0), s2 = sreg(a.j[2].r0), s3 = sreg(a.j[3].r0);
+    const int k0 = sreg(a.j[0].q4k), k1 = sreg(a.j[1].q4k), k2 = sreg(a.j[2].q4k), k3 = sreg(a.j[3].q4k);
+    const void * w   = j == 0 ? w0 : j == 1 ? w1 : j == 2 ? w2 : w3;
+    float      * dst = j == 0 ? d0 : j == 1 ? d1 : j == 2 ? d2 : d3;
+    const int    r0  = j == 0 ? s0 : j == 1 ? s1 : j == 2 ? s2 : s3;
+    const int    q4k = j == 0 ? k0 : j == 1 ? k1 : j == 2 ? k2 : k3;
+    const int row = b - r0;
+    const int tid = threadIdx.y*64 + threadIdx.x;
+    const float t = q4k ? sn_rowdot<GGML_TYPE_Q4_K>(w, a.y, a.bpr, row, tid) : sn_rowdot<GGML_TYPE_IQ4_XS>(w, a.y, a.bpr, row, tid);
+    __shared__ float sh[64];
+    if (threadIdx.y == 1) {
+        sh[threadIdx.x] = t;
+    }
+    __syncthreads();
+    if (threadIdx.y == 0) {
+        float v = t + sh[threadIdx.x];
+        v = warp_reduce_sum<64>(v);
+        if (threadIdx.x == 0) {
+            dst[row] = v;
+        }
+    }
+}
+
+// jobs[k].soa = the ORIGINAL ggml tensor data (no re-layout); all jobs share y (K/32 block_q8_1). false: unsupported.
+static inline bool launch_sn(const gjob_h * jobs, int nj, const block_q8_1 * y, int K, hipStream_t st) {
+    if (nj < 1 || nj > G_MAXJ || K % QK_K != 0) return false;
+    snargs a{};
+    int r = 0;
+    for (int k = 0; k < nj; ++k) {
+        if (jobs[k].type != GGML_TYPE_IQ4_XS && jobs[k].type != GGML_TYPE_Q4_K) return false;
+        if ((int64_t) r + jobs[k].N > (1 << 30) || (int64_t) jobs[k].N*(K/QK_K) >= (1ll << 31)) return false;
+        a.j[k] = { jobs[k].soa, jobs[k].dst, r, jobs[k].type == GGML_TYPE_Q4_K ? 1 : 0 };
+        r += jobs[k].N;
+    }
+    a.y = y; a.bpr = K/QK_K; a.nj = nj;
+    hipLaunchKernelGGL(gemv_sn, dim3(r), dim3(64, 2), 0, st, a);
+    return true;
 }
 
 } // namespace iq4k
