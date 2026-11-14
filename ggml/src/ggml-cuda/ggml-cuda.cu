@@ -2322,7 +2322,10 @@ static bool ggml_cuda_match_shared_expert(const ggml_cgraph * graph, int routed_
     if (input->op != GGML_OP_RESHAPE || input->src[0] != shared_up->src[1] ||
             input->ne[1] != 1 || input->ne[3] != 1 || !ggml_is_contiguous(input) ||
             !ggml_is_contiguous(shared_up->src[1]) || !ggml_is_matrix(shared_up->src[1]) ||
-            weight->type != shared_weight->type || weight->ne[0] != shared_weight->ne[0] ||
+            // same type for routed up, shared up and shared gate: the shared-expert kernel decodes all of them with one
+            // type (the mixed IQ3 gate/up exception of ggml_cuda_should_fuse_mul_mat must not leak into this match)
+            weight->type != shared_weight->type || shared_gate->src[0]->type != shared_weight->type ||
+            weight->ne[0] != shared_weight->ne[0] ||
             weight->ne[1] != shared_weight->ne[1] || weight->nb[1] != shared_weight->nb[1] || weight->ne[3] != 1 ||
             !ggml_is_matrix(shared_weight) || !ggml_is_contiguous(shared_weight) ||
             !ggml_is_contiguous(shared_gate->src[0]) || !ggml_is_contiguous(routed) || !ggml_is_contiguous(shared)) {
