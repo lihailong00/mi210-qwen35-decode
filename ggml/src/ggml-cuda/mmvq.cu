@@ -1570,17 +1570,22 @@ static __global__ void codex_iq3_packed_gemv(const uint32_t * up, const codex_iq
 
 // (rows per workgroup, threads per workgroup) for the packed IQ3 GEMV; tuned on MI210, env-overridable
 struct codex_cfg { int R, NT; };
-static codex_cfg codex_get_cfg(const bool xxs, const bool fused) {
-    static const codex_cfg cfg[2][2] = {
-        { { 2, 256 }, { 1, 128 } },   // IQ3_S:   single, fused gate+up
-        { { 2,  64 }, { 1,  64 } },   // IQ3_XXS: single, fused gate+up
-    };
-    codex_cfg c = cfg[xxs][fused];
+static codex_cfg codex_get_cfg(const bool xxs, const bool fused, const int K) {
+    codex_cfg c;
+    if (!xxs) {
+        c = fused ? codex_cfg{ 1, 128 } : codex_cfg{ 2, 256 };
+    } else if (fused) {
+        c = codex_cfg{ 1, 64 };
+    } else {
+        // IQ3_XXS (VALU-heavier decode): thread count by row length (MI210 harness: 17408x5120 46.4 us @64,
+        // 5120x6144 18.0 us @192, 5120x17408 46.1 us @256)
+        c = K <= 5120 ? codex_cfg{ 2, 64 } : (K <= 8192 ? codex_cfg{ 2, 192 } : codex_cfg{ 2, 256 });
+    }
     const char * names[2][2] = { { "GGML_CODEX_S", "GGML_CODEX_S_FUSED" }, { "GGML_CODEX_XXS", "GGML_CODEX_XXS_FUSED" } };
     const char * v = getenv(names[xxs][fused]);   // format "R,NT"
     if (v) {
         int r = 0, nt = 0;
-        if (sscanf(v, "%d,%d", &r, &nt) == 2 && (r == 1 || r == 2 || r == 4) && (nt == 64 || nt == 128 || nt == 256)) {
+        if (sscanf(v, "%d,%d", &r, &nt) == 2 && (r == 1 || r == 2 || r == 4) && (nt == 64 || nt == 128 || nt == 192 || nt == 256)) {
             c = { r, nt };
         }
     }
@@ -1601,7 +1606,7 @@ static void codex_iq3_launch_packed(ggml_backend_cuda_context & ctx,
     }
     const auto * up_meta   = reinterpret_cast<const codex_iq3_meta *>(up+count*32);
     const auto * gate_meta = gate ? reinterpret_cast<const codex_iq3_meta *>(gate+count*32) : nullptr;
-    codex_cfg c = codex_get_cfg(xxs, gate != nullptr);
+    codex_cfg c = codex_get_cfg(xxs, gate != nullptr, groups*32);
     while (rows % c.R != 0) {
         c.R /= 2;
     }
@@ -1617,6 +1622,7 @@ static void codex_iq3_launch_packed(ggml_backend_cuda_context & ctx,
     else if (c.R == 1 && c.NT == 256) { CODEX_LAUNCH(1, 256) }
     else if (c.R == 2 && c.NT ==  64) { CODEX_LAUNCH(2,  64) }
     else if (c.R == 2 && c.NT == 128) { CODEX_LAUNCH(2, 128) }
+    else if (c.R == 2 && c.NT == 192) { CODEX_LAUNCH(2, 192) }
     else if (c.R == 2 && c.NT == 256) { CODEX_LAUNCH(2, 256) }
     else if (c.R == 4 && c.NT ==  64) { CODEX_LAUNCH(4,  64) }
     else if (c.R == 4 && c.NT == 128) { CODEX_LAUNCH(4, 128) }
