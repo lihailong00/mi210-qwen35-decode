@@ -5011,7 +5011,8 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
 
     ggml_tensor * node = cgraph->nodes[i];
 
-    if (node->op == GGML_OP_FLASH_ATTN_EXT) {
+    // like the other fusions added with it: not with concurrent stream regions (GGML_CUDA_GRAPH_OPT)
+    if (node->op == GGML_OP_FLASH_ATTN_EXT && cuda_ctx->stream_context().concurrent_events.empty()) {
         const int nodes_to_skip = ggml_cuda_try_fattn_gate_fusion(cuda_ctx, cgraph, i);
         if (nodes_to_skip > 0) {
             return nodes_to_skip;
@@ -5055,8 +5056,9 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     }
 #endif
 
-    // full-attention prep chain (q/k norm + rope, gate copy, k/v cache stores) as one kernel
-    if (node->op == GGML_OP_RMS_NORM) {
+    // full-attention prep chain (q/k norm + rope, gate copy, k/v cache stores) as one kernel. Not inside concurrent
+    // stream regions (GGML_CUDA_GRAPH_OPT): the kernel reads k/v, which other streams of the region may still produce.
+    if (node->op == GGML_OP_RMS_NORM && cuda_ctx->stream_context().concurrent_events.empty()) {
         ggml_tensor * prep_nodes[9];
         const int nodes_to_skip = ggml_cuda_try_attn_prep_fusion(cgraph, i, prep_nodes);
         if (nodes_to_skip > 0) {
