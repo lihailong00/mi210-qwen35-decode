@@ -630,8 +630,98 @@ static void mul_mat_vec_f_cuda(
         stride_channel_dst, nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, stream);
 }
 
+// Single-token BF16 GEMV for thin matrices (e.g. 48 x 5120 ssm_alpha / ssm_beta): one workgroup per row,
+// every thread does one 16-byte weight load (8 values) per K/8 chunk, so the kernel is a single memory round trip.
+template <int NT>
+__launch_bounds__(NT, 1)
+static __global__ void mmvf_bf16_thin(const nv_bfloat16 * __restrict__ x, const float * __restrict__ y, float * __restrict__ dst,
+        const float * __restrict__ bias, const int K, const int64_t stride_row) {
+    const int row = blockIdx.x;
+    const int tid = threadIdx.x;
+    const uint4  * xr = (const uint4  *)(x + row*stride_row);
+    const float4 * y4 = (const float4 *) y;
+    float sum = 0.0f;
+    for (int c = tid; c < K/8; c += NT) {
+        const uint4  w  = xr[c];
+        const float4 a  = y4[2*c + 0];
+        const float4 b  = y4[2*c + 1];
+        const uint32_t wv[4] = {w.x, w.y, w.z, w.w};
+        const float yv[8] = {a.x, a.y, a.z, a.w, b.x, b.y, b.z, b.w};
+#pragma unroll
+        for (int k = 0; k < 4; ++k) {
+            sum += __uint_as_float(wv[k] << 16)         * yv[2*k + 0];
+            sum += __uint_as_float(wv[k] & 0xFFFF0000u) * yv[2*k + 1];
+        }
+    }
+    sum = warp_reduce_sum<64>(sum);
+    __shared__ float part[NT/64];
+    if (tid % 64 == 0) {
+        part[tid/64] = sum;
+    }
+    __syncthreads();
+    if (tid == 0) {
+        float r = 0.0f;
+#pragma unroll
+        for (int i = 0; i < NT/64; ++i) {
+            r += part[i];
+        }
+        if (bias) {
+            r += bias[row];
+        }
+        dst[row] = r;
+    }
+}
+
+static bool ggml_cuda_mul_mat_vec_f_bf16_thin(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids,
+        ggml_tensor * dst, const ggml_cuda_mm_fusion_args_host * fusion) {
+#if defined(GGML_USE_HIP)
+    if (src0->type != GGML_TYPE_BF16 || ids || src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32) {
+        return false;
+    }
+    const int64_t K = src0->ne[0];
+    const int64_t N = src0->ne[1];
+    if (src1->ne[1] != 1 || src1->ne[2] != 1 || src1->ne[3] != 1 || src0->ne[2] != 1 || src0->ne[3] != 1 ||
+            K % 8 != 0 || K > 16384 || N > 4096 || ggml_cuda_info().devices[ggml_cuda_get_device()].warp_size != 64) {
+        return false;
+    }
+    if (!ggml_is_contiguous(src1) || !ggml_is_contiguous(dst) || src0->nb[0] != sizeof(nv_bfloat16) ||
+            src0->nb[1] % 16 != 0 || ((uintptr_t) src0->data) % 16 != 0 || ((uintptr_t) src1->data) % 16 != 0) {
+        return false;
+    }
+    const float * bias = nullptr;
+    if (fusion) {
+        if (fusion->gate || fusion->gate_bias || fusion->x_scale || fusion->gate_scale || fusion->shared_up) {
+            return false;
+        }
+        if (fusion->x_bias) {
+            if (fusion->x_bias->type != GGML_TYPE_F32 || fusion->x_bias->ne[0] != N || !ggml_is_contiguous(fusion->x_bias)) {
+                return false;
+            }
+            bias = (const float *) fusion->x_bias->data;
+        }
+    }
+    const int64_t stride_row = src0->nb[1] / sizeof(nv_bfloat16);
+    const nv_bfloat16 * x = (const nv_bfloat16 *) src0->data;
+    const float * y = (const float *) src1->data;
+    float * d = (float *) dst->data;
+    if (K/8 >= 512) {
+        mmvf_bf16_thin<640><<<N, 640, 0, ctx.stream()>>>(x, y, d, bias, (int) K, stride_row);
+    } else {
+        mmvf_bf16_thin<256><<<N, 256, 0, ctx.stream()>>>(x, y, d, bias, (int) K, stride_row);
+    }
+    CUDA_CHECK(cudaGetLastError());
+    return true;
+#else
+    GGML_UNUSED_VARS(ctx, src0, src1, ids, dst, fusion);
+    return false;
+#endif
+}
+
 void ggml_cuda_mul_mat_vec_f(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst,
     const ggml_cuda_mm_fusion_args_host * fusion) {
+    if (ggml_cuda_mul_mat_vec_f_bf16_thin(ctx, src0, src1, ids, dst, fusion)) {
+        return;
+    }
     GGML_ASSERT(        src1->type == GGML_TYPE_F32);
     GGML_ASSERT(!ids ||  ids->type == GGML_TYPE_I32);
     GGML_ASSERT(         dst->type == GGML_TYPE_F32);

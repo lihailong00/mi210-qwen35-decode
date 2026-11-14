@@ -8,6 +8,7 @@
 #include "quantize.cuh"
 #include "unary.cuh"
 #include "iq3-repack.cuh"
+#include "mmvq-fused-host.cuh"
 
 #include <cstdint>
 #include <type_traits>
@@ -1646,6 +1647,12 @@ void ggml_cuda_mul_mat_vec_q(
         }
         fusion_local.glu_op = fusion->glu_op;
         fusion_local.glu_limit = fusion->glu_limit;
+    }
+
+    // single token: GEMV kernels that quantize the activation in-kernel (no quantize_q8_1 / sum launches)
+    if (!ids && ne11 == 1 && ggml_backend_buffer_get_usage(src0->buffer) != GGML_BACKEND_BUFFER_USAGE_COMPUTE &&
+            ggml_cuda_mmvq_fused(ctx, src0, src1, dst, fusion)) {
+        return;
     }
 
     // If src0 is a temporary compute buffer, clear any potential padding.
