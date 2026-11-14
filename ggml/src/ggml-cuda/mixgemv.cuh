@@ -113,7 +113,7 @@ static inline size_t lds_bytes(const int K, const int N4, const int nwv4) {
 // first; rot = (units of the first job) % (waves).
 // na > 0 ("split"): waves 0..na-1 of every workgroup run only IQ3 units, waves na..NW-1 only IQ4 units (both jobs run
 // concurrently on every SIMD: the IQ3 decode is VALU/LDS bound, the IQ4 stream mostly waits for memory).
-template <class T3, class T4, int SM, bool FIRST3>
+template <class T3, class T4, int SM, bool FIRST3, bool ORD = false>   // ORD: iq3g::pro_load load order (grid words first)
 __launch_bounds__(NW*64, 1)
 __global__ void gemv_pair(const uint8_t * __restrict__ w3, float * __restrict__ d3, const int N3,
         const iq4k::soa s4, float * __restrict__ d4, const int N4,
@@ -136,7 +136,7 @@ __global__ void gemv_pair(const uint8_t * __restrict__ w3, float * __restrict__ 
     // prologue: owner threads load their q8_1 block once and write it in both record layouts; IQ3 codebook table
     {
         iq3g::pro_regs<T3, iq3g::none_t, false> pr;
-        iq3g::pro_load<T3, iq3g::none_t, false, NW*64, true>(pr, yg, K, tid);
+        iq3g::pro_load<T3, iq3g::none_t, false, NW*64, true, ORD>(pr, yg, K, tid);
         iq3g::pro_store<T3, iq3g::none_t, false, NW*64>(pr, smem, 0, T3::TAB_WORDS*4, K, tid);
         if (tid < K/32) {
             T4::put_y(ys4, tid, pr.q0, pr.q1, iq4k::h2f(pr.ds));
