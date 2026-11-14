@@ -389,6 +389,18 @@ static __device__ __forceinline__ void tab_store(uint32_t * tab, const uint32_t 
 // the grid-word load only after the activation loads have returned (it moves pro_store's fp16 -> fp32 conversion of the
 // owner's d into the conditional load block, with a wait there) and loads the activation pointer only inside that block:
 // kernel args -> activation pointer -> activation -> grid word = four serialized round trips at every kernel start.
+// diet-gemv: the same pointer, opaque to the load/store vectorizer. Merged with the two 16-byte qs loads of a q8_1 block,
+// the 4-byte ds load made the backend split the 36 bytes at 16-byte boundaries of the block ({ds, qs0..2}, {qs3..6},
+// {qs7}), so the qs words had to be shuffled into place (8 v_mov) for the ds_write_b128 of the activation record.
+// The load goes through an explicit global (addrspace 1) pointer: the laundered generic pointer would become a flat load.
+static __device__ __forceinline__ uint32_t ld_u32_opaque(const uint8_t * p) {
+#if defined(__HIP_DEVICE_COMPILE__)
+    asm("" : "+v"(p));
+    return *(const __attribute__((address_space(1))) uint32_t *) (size_t) p;
+#else
+    return *(const uint32_t *) p;
+#endif
+}
 template <class TA, class TB, bool TWO, int NT, bool CY = false, bool ORD = false>
 static __device__ __forceinline__ void pro_load(pro_regs<TA, TB, TWO> & r, const block_q8_1 * __restrict__ yg, const int K, const int tid) {
     constexpr int GA = TA::TAB_WORDS/16;
@@ -408,7 +420,7 @@ static __device__ __forceinline__ void pro_load(pro_regs<TA, TB, TWO> & r, const
         if (!CY || tid < nrec) {
             r.q0 = *(const uint4 *) (b + 4);
             r.q1 = *(const uint4 *) (b + 20);
-            r.ds = *(const uint32_t *) b;
+            r.ds = ld_u32_opaque(b);   // not merged with the qs loads: qs stays in ds_write_b128 order
         }
         return;
     }

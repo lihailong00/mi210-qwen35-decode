@@ -331,12 +331,22 @@ struct q4k_t {
 };
 
 // ---------------------------------------------------------------- y staging (global block_q8_1 -> LDS records)
+// diet-gemv: the same pointer, opaque to the load/store vectorizer - the ds load is not merged with the two qs loads, so
+// the qs words arrive in the register order of the record writes (no v_mov shuffle, see iq3g::ld_u32_opaque)
+static __device__ __forceinline__ uint32_t ld_u32_opaque(const uint8_t * p) {
+#if defined(__HIP_DEVICE_COMPILE__)
+    asm("" : "+v"(p));
+    return *(const __attribute__((address_space(1))) uint32_t *) (size_t) p;
+#else
+    return *(const uint32_t *) p;
+#endif
+}
 template <class T>
 static __device__ __forceinline__ void stage_y(uint32_t * __restrict__ ys, const block_q8_1 * __restrict__ yg, const int K,
         const int tid, const int nt) {
     for (int b = tid; b < K/32; b += nt) {
         const uint8_t * p = (const uint8_t *) (yg + b);
-        const uint32_t ds = *(const uint32_t *) p;
+        const uint32_t ds = ld_u32_opaque(p);
         const uint4 q0 = *(const uint4 *) (p + 4);
         const uint4 q1 = *(const uint4 *) (p + 20);
         T::put_y(ys, b, q0, q1, h2f(ds));
