@@ -364,16 +364,18 @@ static void mixg_launch(const bool first3, const int na, const uint8_t * w3, flo
     const size_t lds = mixg::lds_bytes<T3, T4>(K, N4, na > 0 ? (mixg::NW - na)*ncu : nwv);
     const int y4off = (int) mixg::y4_offset<T3, T4>(K);
     const int rot = (first3 ? N3/mixg::RG : N4/mixg::RG) % nwv;
+    const int nwv4 = na > 0 ? (mixg::NW - na)*ncu : nwv;
+    const int maxu4 = (N4/mixg::RG + nwv4 - 1)/nwv4;   // the kernel's IQ4 units per wave (= lds_bytes' maxu)
     // r4-ffndown: the prologue load order of the iq3g kernels (grid words first) also for the pair kernel
     // (old order: GGML_MMVQ_IQ3_PF=5 for all iq3g kernels, GGML_MMVQ_MIX_ORD=0 for the pair kernel only)
     static const bool ord_env = iq3g_env_on("GGML_MMVQ_MIX_ORD");
     const bool ord = ord_env && iq3g_pf_mode() >= 7;
     if (first3) {
-        if (ord) mixg::gemv_pair<T3, T4, IQ3G_SM, true,  true ><<<ncu, dim3(64, mixg::NW), lds, stream>>>(w3, d3, N3, s4, d4, N4, y, K, y4off, rot, na, ga);
-        else     mixg::gemv_pair<T3, T4, IQ3G_SM, true,  false><<<ncu, dim3(64, mixg::NW), lds, stream>>>(w3, d3, N3, s4, d4, N4, y, K, y4off, rot, na, ga);
+        if (ord) mixg::gemv_pair<T3, T4, IQ3G_SM, true,  true ><<<ncu, dim3(64, mixg::NW), lds, stream>>>(w3, d3, N3, s4, d4, N4, y, K, y4off, rot, na, maxu4, ga);
+        else     mixg::gemv_pair<T3, T4, IQ3G_SM, true,  false><<<ncu, dim3(64, mixg::NW), lds, stream>>>(w3, d3, N3, s4, d4, N4, y, K, y4off, rot, na, maxu4, ga);
     } else {
-        if (ord) mixg::gemv_pair<T3, T4, IQ3G_SM, false, true ><<<ncu, dim3(64, mixg::NW), lds, stream>>>(w3, d3, N3, s4, d4, N4, y, K, y4off, rot, na, ga);
-        else     mixg::gemv_pair<T3, T4, IQ3G_SM, false, false><<<ncu, dim3(64, mixg::NW), lds, stream>>>(w3, d3, N3, s4, d4, N4, y, K, y4off, rot, na, ga);
+        if (ord) mixg::gemv_pair<T3, T4, IQ3G_SM, false, true ><<<ncu, dim3(64, mixg::NW), lds, stream>>>(w3, d3, N3, s4, d4, N4, y, K, y4off, rot, na, maxu4, ga);
+        else     mixg::gemv_pair<T3, T4, IQ3G_SM, false, false><<<ncu, dim3(64, mixg::NW), lds, stream>>>(w3, d3, N3, s4, d4, N4, y, K, y4off, rot, na, maxu4, ga);
     }
 }
 

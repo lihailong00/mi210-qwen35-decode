@@ -49,7 +49,7 @@ static __device__ __forceinline__ void part4(const iq4k::soa s4, float * __restr
     const int ipr = bpr*T4::IPB;
     const int q   = ipr / L;                       // steps per unit (host: ipr % L == 0)
     const int nunits = N4 / GR;
-    const int myu = w < nunits ? (nunits - 1 - w)/nwv + 1 : 0;
+    const int myu = w < nunits ? (int) ((uint32_t) (nunits - 1 - w)/(uint32_t) nwv) + 1 : 0;   // operands >= 0
     if (myu == 0) {
         return;
     }
@@ -57,7 +57,7 @@ static __device__ __forceinline__ void part4(const iq4k::soa s4, float * __restr
     const typename T4::lc c = T4::lane_consts(lane);
     typedef typename T4::raw raw;
     raw A, B;
-    const int ue = (e - 1)/q, ke = (e - 1) % q;   // last real step
+    const int ue = myu - 1, ke = q - 1;           // last real step (= (e - 1)/q, (e - 1) % q with e = myu*q, myu >= 1)
     int ls = 0, lu = 0, lk = 0;                   // load cursor
     const uint32_t qlane = lane*GR + grp, slane = (lane/T4::IPB)*GR + grp;
     const uint32_t boff = 4*bpr*GR;
@@ -206,7 +206,7 @@ template <class T3, class T4, int SM, bool FIRST3, bool ORD = false>   // ORD: i
 __launch_bounds__(NW*64, 1)
 __global__ void gemv_pair(const uint8_t * __restrict__ w3, float * __restrict__ d3, const int N3,
         const iq4k::soa s4, float * __restrict__ d4, const int N4,
-        const block_q8_1 * __restrict__ yg, const int K, const int y4off, const int rot, const int na, const glu_args ga) {
+        const block_q8_1 * __restrict__ yg, const int K, const int y4off, const int rot, const int na, const int maxu4, const glu_args ga) {
     extern __shared__ __align__(16) uint32_t smem[];
 #if defined(__HIP_DEVICE_COMPILE__)
     if ((uint32_t) (size_t) (__attribute__((address_space(3))) uint32_t *) smem != 0) __builtin_trap();
@@ -237,7 +237,7 @@ __global__ void gemv_pair(const uint8_t * __restrict__ w3, float * __restrict__ 
     }
 
     const int nwv4 = na > 0 ? (NW - na)*gridDim.x : nwv;
-    const int nunits4 = N4/RG, maxu4 = (nunits4 + nwv4 - 1)/nwv4;
+    // maxu4 = (N4/RG + nwv4 - 1)/nwv4 (IQ4 units per wave = the per-wave LDS slot stride) comes from the host (no division here)
     float * ow = (float *) (ys4 + (K/32/T4::YPI)*T4::YW) + wy*maxu4*RG;
     if (na > 0) {
         if (wy < na) {
@@ -247,7 +247,7 @@ __global__ void gemv_pair(const uint8_t * __restrict__ w3, float * __restrict__ 
         }
         return;
     }
-    const int w2 = (w + nwv - rot) % nwv;
+    const int w2 = w >= rot ? w - rot : w + nwv - rot;   // = (w + nwv - rot) % nwv for 0 <= w, rot < nwv (host: rot = x % nwv)
     if (na < 0) {
         // alternating: the wave's IQ3 units (w, w + nwv, ..) and IQ4 units (w2, w2 + nwv, ..) one after the other, so that
         // compute-heavy IQ3 units and memory-bound IQ4 units are mixed on every SIMD all the time
