@@ -20,6 +20,8 @@ bool ggml_cuda_mmvq_cache_produce(ggml_backend_cuda_context & ctx, const ggml_te
 bool ggml_cuda_rms_norm_mul_q8(ggml_backend_cuda_context & ctx, const ggml_tensor * rms_norm, ggml_tensor * mul_node);
 bool ggml_cuda_swiglu_q8(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
 bool ggml_cuda_unary_mul_q8(ggml_backend_cuda_context & ctx, ggml_tensor * unary_node, ggml_tensor * mul_node);
+// CONT(strided view) -> UNARY(SILU/SIGMOID) -> MUL in one kernel: the unary input is read through the view (no copy)
+bool ggml_cuda_cont_unary_mul_q8(ggml_backend_cuda_context & ctx, const ggml_tensor * cont_node, ggml_tensor * unary_node, ggml_tensor * mul_node);
 
 // Single-token GEMV for IQ2_S/IQ2_XS/IQ2_XXS/Q2_K/IQ1_M on SoA re-laid-out weights (activation already quantized to q8_1).
 // Gated output norm of the linear-attention layers in one kernel (+ q8_1 of the result for the following GEMV):

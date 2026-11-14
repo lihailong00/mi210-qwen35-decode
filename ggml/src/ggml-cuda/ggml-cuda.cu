@@ -4375,6 +4375,18 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     ggml_tensor * node = cgraph->nodes[i];
 
 #if defined(GGML_USE_HIP)
+    // CONT(strided view) -> UNARY(SIGMOID/SILU) -> MUL (attention output gate): read the gate through the view
+    if (node->op == GGML_OP_CONT && i + 2 < cgraph->n_nodes && cuda_ctx->stream_context().concurrent_events.empty()) {
+        ggml_tensor * un = cgraph->nodes[i + 1];
+        ggml_tensor * mu = cgraph->nodes[i + 2];
+        const int out = i + 2;
+        if (un->op == GGML_OP_UNARY && un->src[0] == node && mu->op == GGML_OP_MUL && (mu->src[0] == un || mu->src[1] == un) &&
+                ggml_can_fuse_subgraph(cgraph, i, { GGML_OP_CONT, GGML_OP_UNARY, GGML_OP_MUL }, { out }) &&
+                ggml_cuda_check_fusion_memory_ranges(cgraph, i, 3, &out, 1) &&
+                ggml_cuda_cont_unary_mul_q8(*cuda_ctx, node, un, mu)) {
+            return 2;
+        }
+    }
     if (node->op == GGML_OP_RMS_NORM && cuda_ctx->stream_context().concurrent_events.empty()) {
         const int nodes_to_skip = ggml_cuda_try_fuse_gated_norm(cuda_ctx, cgraph, i);
         if (nodes_to_skip > 0) {

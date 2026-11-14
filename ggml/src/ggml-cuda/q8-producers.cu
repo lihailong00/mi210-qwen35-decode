@@ -67,13 +67,13 @@ static __global__ void __launch_bounds__(256) gated_q8_kernel(const float * __re
 
 // rms_norm(x) * w for one row (+ q8_1), same arithmetic as rms_norm_f32<1024, 4, true, true>. The q8_1 epilogue is
 // VALU-heavy, so the row is split over gridDim.x workgroups of 1024 threads: every workgroup computes the identical
-// full-row reduction (bit-identical scale), then outputs its own slice of 128 float4 (16 q8_1 blocks) with threads
-// 0..127. (One workgroup doing all 1280 float4 of a 5120 row spent ~4 us in situ on the q8 math of 16 waves on one CU.)
+// full-row reduction (bit-identical scale), then outputs its own slice of 64 float4 (8 q8_1 blocks) with threads
+// 0..63. (One workgroup doing all 1280 float4 of a 5120 row spent ~4 us in situ on the q8 math of 16 waves on one CU.)
 template <int VPT>
 static __global__ void __launch_bounds__(1024) rms_norm_mul_q8_kernel(const float * __restrict__ x, const float * __restrict__ w,
         float * __restrict__ dst, block_q8_1 * __restrict__ y, int * __restrict__ ysum, const int ncols, const float eps) {
     constexpr int block_size = 1024;
-    constexpr int per_wg     = 128;   // float4 per workgroup slice
+    constexpr int per_wg     = 64;    // float4 per workgroup slice
     __shared__ float s_sum[32];
     const int tid = threadIdx.x;
     const int ncols4 = ncols / 4;
@@ -194,6 +194,29 @@ static __global__ void __launch_bounds__(32) rms_norm_gated_q8_kernel(const floa
     }
 }
 
+// dst = op(x) * g with x read through a strided view (row length ne0, row strides s1/s2 in floats), + q8_1 of dst;
+// same arithmetic as CONT + gated_q8_kernel
+template <int OP>
+static __global__ void __launch_bounds__(256) gated_q8_strided_kernel(const float * __restrict__ x, const uint32_t ne0, const uint32_t ne1,
+        const int64_t s1, const int64_t s2, const float * __restrict__ g, float * __restrict__ dst,
+        block_q8_1 * __restrict__ y, int * __restrict__ ysum, const uint32_t k) {
+    const uint32_t i = blockDim.x*blockIdx.x + threadIdx.x;   // k <= 65536
+    if (i >= k) {
+        return;
+    }
+    const uint32_t i0 = i % ne0;
+    const uint32_t ir = i / ne0;
+    const uint32_t i1 = ir % ne1;
+    const uint32_t i2 = ir / ne1;
+    const float xv = x[i0 + i1*s1 + i2*s2];
+    const float a  = OP == 0 ? ggml_cuda_op_silu_single(xv) : q8p_sigmoid(xv);
+    const float r  = a * g[i];
+    dst[i] = r;
+    if (y) {
+        q8p_quantize_1(r, i, y, ysum);
+    }
+}
+
 static bool q8p_single_row_f32(const ggml_tensor * t) {
     return t->type == GGML_TYPE_F32 && ggml_is_contiguous(t) && t->ne[1] == 1 && t->ne[2] == 1 && t->ne[3] == 1 &&
            t->ne[0] % 512 == 0 && ((uintptr_t) t->data) % 16 == 0;
@@ -240,8 +263,8 @@ bool ggml_cuda_rms_norm_mul_q8(ggml_backend_cuda_context & ctx, const ggml_tenso
     float eps;
     memcpy(&eps, rms_norm->op_params, sizeof(float));
     // VPT only bounds the per-thread loop (elements beyond ncols are skipped), so 2 and 4 give identical results;
-    // one workgroup per 128 float4 (ne0 % 512 == 0)
-    const int nwg = (int) (x->ne[0] / 512);
+    // one workgroup per 64 float4 (ne0 % 512 == 0)
+    const int nwg = (int) (x->ne[0] / 256);
     if (x->ne[0] <= 8192) {
         rms_norm_mul_q8_kernel<2><<<nwg, 1024, 0, ctx.stream()>>>((const float *) x->data, (const float *) w->data, (float *) mul_node->data,
                 y, ysum, (int) x->ne[0], eps);
@@ -318,6 +341,53 @@ bool ggml_cuda_swiglu_q8(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     return gated_q8_launch(ctx, src0, src1, dst, 0);
 }
 
+bool ggml_cuda_cont_unary_mul_q8(ggml_backend_cuda_context & ctx, const ggml_tensor * cont_node, ggml_tensor * unary_node, ggml_tensor * mul_node) {
+    if (!q8p_enabled() || ggml_cuda_info().devices[ctx.device].warp_size != 64) {
+        return false;
+    }
+    static const bool enabled = [] {
+        const char * v = getenv("GGML_Q8_PRODUCERS_CONT");
+        return v == nullptr || v[0] != '0';
+    }();
+    const ggml_unary_op uop = ggml_get_unary_op(unary_node);
+    if (!enabled || (uop != GGML_UNARY_OP_SILU && uop != GGML_UNARY_OP_SIGMOID) || unary_node->src[0] != cont_node) {
+        return false;
+    }
+    const ggml_tensor * v = cont_node->src[0];   // strided source of the copy
+    const ggml_tensor * g = mul_node->src[0] == unary_node ? mul_node->src[1] : mul_node->src[0];
+    if (v->type != GGML_TYPE_F32 || cont_node->type != GGML_TYPE_F32 || v->nb[0] != sizeof(float) || v->ne[3] != 1 ||
+            v->nb[1] % sizeof(float) != 0 || v->nb[2] % sizeof(float) != 0 || ggml_nelements(v) != ggml_nelements(cont_node) ||
+            !ggml_is_contiguous(cont_node) || !q8p_flat_f32(g) || !q8p_flat_f32(mul_node) ||
+            ggml_nelements(g) != ggml_nelements(mul_node) || ggml_nelements(cont_node) != ggml_nelements(mul_node) ||
+            !ggml_are_same_shape(g, mul_node) || !ggml_are_same_shape(unary_node, cont_node)) {
+        return false;
+    }
+    // the elementwise index of the copy output must match the flattened mul index: same element count, and the unary
+    // output has the copy's shape; the mul operands are contiguous with the mul's shape (no broadcasting)
+    if (ggml_nelements(unary_node) != ggml_nelements(mul_node)) {
+        return false;
+    }
+    block_q8_1 * y = nullptr;
+    int * ysum = nullptr;
+    if (!ggml_cuda_mmvq_cache_produce(ctx, mul_node, &y, &ysum)) {
+        y = nullptr;
+        ysum = nullptr;
+    }
+    const int64_t k = ggml_nelements(mul_node);
+    const int64_t nblk = (k + 255) / 256;
+    const int64_t s1 = v->nb[1] / sizeof(float);
+    const int64_t s2 = v->nb[2] / sizeof(float);
+    if (uop == GGML_UNARY_OP_SILU) {
+        gated_q8_strided_kernel<0><<<nblk, 256, 0, ctx.stream()>>>((const float *) v->data, (uint32_t) v->ne[0], (uint32_t) v->ne[1], s1, s2,
+                (const float *) g->data, (float *) mul_node->data, y, ysum, (uint32_t) k);
+    } else {
+        gated_q8_strided_kernel<1><<<nblk, 256, 0, ctx.stream()>>>((const float *) v->data, (uint32_t) v->ne[0], (uint32_t) v->ne[1], s1, s2,
+                (const float *) g->data, (float *) mul_node->data, y, ysum, (uint32_t) k);
+    }
+    CUDA_CHECK(cudaGetLastError());
+    return true;
+}
+
 bool ggml_cuda_unary_mul_q8(ggml_backend_cuda_context & ctx, ggml_tensor * unary_node, ggml_tensor * mul_node) {
     const ggml_unary_op uop = ggml_get_unary_op(unary_node);
     if (uop != GGML_UNARY_OP_SILU && uop != GGML_UNARY_OP_SIGMOID) {
@@ -335,5 +405,6 @@ bool ggml_cuda_rms_norm_gated_q8_supported(const ggml_tensor *, const ggml_tenso
 void ggml_cuda_rms_norm_gated_q8(ggml_backend_cuda_context &, const ggml_tensor *, const ggml_tensor *, float, const ggml_tensor *, ggml_tensor *) {}
 bool ggml_cuda_swiglu_q8(ggml_backend_cuda_context &, ggml_tensor *) { return false; }
 bool ggml_cuda_unary_mul_q8(ggml_backend_cuda_context &, ggml_tensor *, ggml_tensor *) { return false; }
+bool ggml_cuda_cont_unary_mul_q8(ggml_backend_cuda_context &, const ggml_tensor *, ggml_tensor *, ggml_tensor *) { return false; }
 
 #endif
