@@ -416,6 +416,10 @@ static ggml_tensor * qwen35_build_gdn_fused_decode(
 
     ggml_context * ctx0 = g.ctx0;
 
+    // compute both input projections (same input) back to back, before the fused ops
+    ggml_build_forward_expand(g.gf, qkv_mixed);
+    ggml_build_forward_expand(g.gf, z);
+
     // zero a cleared state row first, like build_rs does (no-op view when rs_z < 0);
     // the zeroing nodes are passed as dependencies of the fused ops so they run before them
     const int32_t rs_z = mctx->get_rs_z();
@@ -426,15 +430,15 @@ static ggml_tensor * qwen35_build_gdn_fused_decode(
 
     const int dst_row = (int) mctx->get_head();
 
-    ggml_tensor * prep = ggml_gdn_decode_prep(ctx0,
-            ggml_reshape_1d(ctx0, qkv_mixed, ggml_nelements(qkv_mixed)), x,
+    ggml_tensor * qkv_1d = ggml_reshape_1d(ctx0, qkv_mixed, ggml_nelements(qkv_mixed));
+
+    ggml_tensor * prep = ggml_gdn_decode_prep(ctx0, qkv_1d, x,
             layer.ssm_alpha, layer.ssm_beta, layer.ssm_dt, layer.ssm_a, layer.ssm_conv1d,
             conv_states_all, inp->s_copy, zero_row(conv_states_all),
             dst_row, (int) num_k_heads, (int) num_v_heads, (int) head_k_dim,
             hparams.f_norm_rms_eps / (float) head_k_dim); // == build_gdn_l2_norm eps
 
-    ggml_tensor * out = ggml_gdn_decode_out(ctx0, prep,
-            ggml_reshape_1d(ctx0, qkv_mixed, ggml_nelements(qkv_mixed)), layer.ssm_conv1d, conv_states_all,
+    ggml_tensor * out = ggml_gdn_decode_out(ctx0, prep, qkv_1d, layer.ssm_conv1d, conv_states_all,
             ggml_reshape_1d(ctx0, z, ggml_nelements(z)), layer.ssm_norm,
             ssm_states_all, inp->s_copy, zero_row(ssm_states_all),
             dst_row, (int) num_k_heads, (int) num_v_heads, (int) head_v_dim,
