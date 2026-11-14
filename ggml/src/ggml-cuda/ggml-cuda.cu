@@ -4228,8 +4228,13 @@ static int ggml_cuda_bf16_epi_chain(const ggml_cgraph * cgraph, const int k, con
     if (rs->op != GGML_OP_RESHAPE || rs->src[0] != mm) {
         return 0;
     }
+    // contiguous f32 with N elements (any shape, e.g. the [1, N] beta reshape)
     auto vec_ok = [N](const ggml_tensor * t) {
-        return t != nullptr && t->type == GGML_TYPE_F32 && ggml_is_contiguous(t) && t->ne[0] == N && ggml_nelements(t) == N;
+        return t != nullptr && t->type == GGML_TYPE_F32 && ggml_is_contiguous(t) && ggml_nelements(t) == N;
+    };
+    // operands of the elementwise ADD / MUL: additionally ne0 == N, so there is no broadcasting
+    auto row_ok = [N, &vec_ok](const ggml_tensor * t) {
+        return vec_ok(t) && t->ne[0] == N;
     };
     ggml_tensor * n2 = cgraph->nodes[k + 2];
     if (n2->op == GGML_OP_UNARY && ggml_get_unary_op(n2) == GGML_UNARY_OP_SIGMOID && n2->src[0] == rs && vec_ok(n2)) {
@@ -4245,12 +4250,12 @@ static int ggml_cuda_bf16_epi_chain(const ggml_cgraph * cgraph, const int k, con
         const ggml_tensor * b  = n2->src[0] == rs ? n2->src[1] : (n2->src[1] == rs ? n2->src[0] : nullptr);
         const ggml_tensor * n3 = cgraph->nodes[k + 3];
         ggml_tensor       * n4 = cgraph->nodes[k + 4];
-        if (!vec_ok(b) || !vec_ok(n2) || n3->op != GGML_OP_UNARY || ggml_get_unary_op(n3) != GGML_UNARY_OP_SOFTPLUS ||
-                n3->src[0] != n2 || !vec_ok(n3) || n4->op != GGML_OP_MUL || !vec_ok(n4)) {
+        if (!row_ok(b) || !row_ok(n2) || n3->op != GGML_OP_UNARY || ggml_get_unary_op(n3) != GGML_UNARY_OP_SOFTPLUS ||
+                n3->src[0] != n2 || !row_ok(n3) || n4->op != GGML_OP_MUL || !row_ok(n4)) {
             return 0;
         }
         const ggml_tensor * a = n4->src[0] == n3 ? n4->src[1] : (n4->src[1] == n3 ? n4->src[0] : nullptr);
-        if (!vec_ok(a)) {
+        if (!row_ok(a)) {
             return 0;
         }
         const int out = k + 4;

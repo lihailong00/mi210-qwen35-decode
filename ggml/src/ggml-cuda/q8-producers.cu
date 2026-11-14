@@ -78,12 +78,21 @@ static __global__ void __launch_bounds__(1024) rms_norm_mul_q8_kernel(const floa
     float4       * dst4 = (float4 *) dst;
 
     float4 xs[VPT];
+    float4 ms[VPT];
     float  tmp = 0.0f;
+    // the weights are loaded together with x (before the reduction) to shorten the dependent latency chain
 #pragma unroll
     for (int k = 0; k < VPT; k++) {
         const int i = tid + k*block_size;
         if (i < ncols4) {
             xs[k] = x4[i];
+            ms[k] = mul4[i];
+        }
+    }
+#pragma unroll
+    for (int k = 0; k < VPT; k++) {
+        const int i = tid + k*block_size;
+        if (i < ncols4) {
             tmp += xs[k].x*xs[k].x + xs[k].y*xs[k].y + xs[k].z*xs[k].z + xs[k].w*xs[k].w;
         }
     }
@@ -95,7 +104,7 @@ static __global__ void __launch_bounds__(1024) rms_norm_mul_q8_kernel(const floa
         const int i = tid + k*block_size;
         if (i < ncols4) {
             float4 r = make_float4(scale*xs[k].x, scale*xs[k].y, scale*xs[k].z, scale*xs[k].w);
-            const float4 m = mul4[i];
+            const float4 m = ms[k];
             r.x *= m.x;
             r.y *= m.y;
             r.z *= m.z;
@@ -169,8 +178,14 @@ bool ggml_cuda_rms_norm_mul_q8(ggml_backend_cuda_context & ctx, const ggml_tenso
     }
     float eps;
     memcpy(&eps, rms_norm->op_params, sizeof(float));
-    rms_norm_mul_q8_kernel<4><<<1, 1024, 0, ctx.stream()>>>((const float *) x->data, (const float *) w->data, (float *) mul_node->data,
-            y, ysum, (int) x->ne[0], eps);
+    // VPT only bounds the per-thread loop (elements beyond ncols are skipped), so 2 and 4 give identical results
+    if (x->ne[0] <= 8192) {
+        rms_norm_mul_q8_kernel<2><<<1, 1024, 0, ctx.stream()>>>((const float *) x->data, (const float *) w->data, (float *) mul_node->data,
+                y, ysum, (int) x->ne[0], eps);
+    } else {
+        rms_norm_mul_q8_kernel<4><<<1, 1024, 0, ctx.stream()>>>((const float *) x->data, (const float *) w->data, (float *) mul_node->data,
+                y, ysum, (int) x->ne[0], eps);
+    }
     CUDA_CHECK(cudaGetLastError());
     return true;
 }
