@@ -32,6 +32,8 @@ struct params {
     coop_state  * coop;      // nullptr: every workgroup quantizes x itself
     char        * q8;        // global q8 buffer for the cooperative / pre-quantized modes
     int           q8_pre;    // 1: q8 already holds the quantized activation (SoA): just copy it to LDS
+    const block_q8_1 * q8aos;  // optional: activation already quantized (AoS block_q8_1, from the activation cache)
+    const int        * q8sums; //           + per-block int sums
     const char  * vx;        // weights
     const char  * vg;        // gate weights (same type/layout as vx) for the fused swiglu, or nullptr
     const char  * mx;        // side data of vx (packed IQ3 meta)
@@ -118,6 +120,20 @@ static __device__ __forceinline__ void quantize_x_lds(const float * __restrict__
 template <bool SOA>
 static constexpr __host__ __device__ int lds_y_bytes(int K) {
     return SOA ? K + 8*(K/32) : (K/32)*int(sizeof(block_q8_1));
+}
+
+// Stage an already-quantized activation (AoS block_q8_1 + int sums) into the SoA LDS layout.
+template <int NT>
+static __device__ __forceinline__ void stage_q8_aos_to_lds(const block_q8_1 * __restrict__ y, const int * __restrict__ sums,
+        char * __restrict__ smem, const int K, const int tid) {
+    // qs: one int per thread per step (8 ints per block)
+    for (int i = tid; i < K/4; i += NT) {
+        ((int *) smem)[i] = ((const int *) y[i/8].qs)[i%8];
+    }
+    for (int b = tid; b < K/32; b += NT) {
+        ((half2 *)(smem + K))[b]          = y[b].ds;
+        ((int   *)(smem + K + 4*(K/32)))[b] = sums[b];
+    }
 }
 
 // Quantize chunks [c0, c1) (8 floats each) of x into the SoA layout at dst (global memory).
@@ -1000,7 +1016,11 @@ static __global__ void mmvqf_pp_kernel(const params p) {
 
     const int tid = threadIdx.y*64 + threadIdx.x;
     D::load_table(tab, tid, NT);
-    quantize_x_lds<NT, D::soa_y>(p.x, smem, K);
+    if (D::soa_y && p.q8aos) {
+        stage_q8_aos_to_lds<NT>(p.q8aos, p.q8sums, smem, K, tid);
+    } else {
+        quantize_x_lds<NT, D::soa_y>(p.x, smem, K);
+    }
     if (p.residual || p.other) {
         const float * src = p.residual ? p.residual : p.other;
         for (int i = tid; i < niter*RW; i += NT) {
