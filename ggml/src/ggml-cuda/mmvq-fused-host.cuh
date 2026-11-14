@@ -7,6 +7,10 @@ bool ggml_cuda_mmvq_fused_supported(const ggml_tensor * src0, const ggml_tensor 
 bool ggml_cuda_mmvq_fused(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst,
         const ggml_cuda_mm_fusion_args_host * fusion, const float * other = nullptr, int epi = 0);
 
+// Q4_K single-token GEMV with a pre-quantized activation (q8_1 blocks + int sums from the activation cache)
+bool ggml_cuda_mmvq_fused_preq(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const block_q8_1 * q8, const int * sums,
+        ggml_tensor * dst, const ggml_cuda_mm_fusion_args_host * fusion);
+
 // invalidate the per-stream cache of the quantized single-token activation (call at the start of every graph evaluation)
 void ggml_cuda_mmvq_cache_reset(ggml_backend_cuda_context & ctx);
 // producer API (mmvq.cu): get the cache buffer for the q8_1 blocks + int sums of the single-row activation t

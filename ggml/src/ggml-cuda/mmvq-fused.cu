@@ -245,6 +245,50 @@ bool ggml_cuda_mmvq_fused_supported(const ggml_tensor * src0, const ggml_tensor 
     return true;
 }
 
+// Q4_K single-token GEMV on the persistent pipelined kernel with the activation already quantized (activation cache):
+// the prologue only stages q8_1 into LDS. Used for all Q4_K shapes with enough rows.
+bool ggml_cuda_mmvq_fused_preq(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const block_q8_1 * q8, const int * sums,
+        ggml_tensor * dst, const ggml_cuda_mm_fusion_args_host * fusion) {
+    static const bool enabled = [] {
+        const char * v = getenv("GGML_MMVQF_Q4K");
+        return v == nullptr || v[0] != '0';
+    }();
+    if (!enabled || !mmvqf_enabled() || src0->type != GGML_TYPE_Q4_K || !q8 || !sums) {
+        return false;
+    }
+    const int64_t K = src0->ne[0];
+    const int64_t N = src0->ne[1];
+    if (K % 1024 != 0 || K > 32768 || N < 4096 || N > INT32_MAX/2 || !ggml_is_matrix(src0) || !ggml_is_contiguous(src0) ||
+            !ggml_is_contiguous(dst) || dst->ne[1] != 1 || ggml_cuda_info().devices[ggml_cuda_get_device()].warp_size != 64) {
+        return false;
+    }
+    const float * residual = nullptr;
+    if (fusion) {
+        if (fusion->gate || fusion->gate_bias || fusion->x_scale || fusion->gate_scale || fusion->shared_up) {
+            return false;
+        }
+        if (fusion->x_bias) {
+            if (fusion->x_bias->type != GGML_TYPE_F32 || !ggml_are_same_shape(fusion->x_bias, dst) || !ggml_is_contiguous(fusion->x_bias)) {
+                return false;
+            }
+            residual = (const float *) fusion->x_bias->data;
+        }
+    }
+    const int device = ggml_cuda_get_device();
+    params p{};
+    p.q8aos      = q8;
+    p.q8sums     = sums;
+    p.residual   = residual;
+    p.dst        = (float *) dst->data;
+    p.K          = (int) K;
+    p.N          = (int) N;
+    p.vx         = (const char *) src0->data;
+    p.stride_row = (int) (src0->nb[1] / ggml_type_size(src0->type));
+    launch_pp<pipe_q4k, 8, 16, 1, false>(p, ggml_cuda_info().devices[device].nsm, 2, ctx.stream());
+    CUDA_CHECK(cudaGetLastError());
+    return true;
+}
+
 bool ggml_cuda_mmvq_fused(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst,
         const ggml_cuda_mm_fusion_args_host * fusion, const float * other, const int epi) {
     if (!ggml_cuda_mmvq_fused_supported(src0, src1, dst)) {

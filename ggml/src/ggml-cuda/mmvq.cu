@@ -1847,9 +1847,11 @@ void ggml_cuda_mul_mat_vec_q(
         fusion_local.glu_limit = fusion->glu_limit;
     }
 
-    // single token: GEMV kernels that quantize the activation in-kernel (no quantize_q8_1 / sum launches)
-    // (not for IQ4_XS/Q4_K GEMVs taken by the iq4k path below, which is faster incl. the LM head)
+    // single token: GEMV kernels that quantize the activation in-kernel (no quantize_q8_1 / sum launches).
+    // Q4_K is handled below on the same kernel with the cached quantized activation when the cache is usable;
+    // IQ4_XS/Q4_K GEMVs taken by the iq4k path below skip this (iq4k is faster, incl. the LM head).
     if (!ids && ne11 == 1 && ggml_backend_buffer_get_usage(src0->buffer) != GGML_BACKEND_BUFFER_USAGE_COMPUTE &&
+            (src0->type != GGML_TYPE_Q4_K || mmvq_q8_cache_disabled()) &&
             !ggml_cuda_mmvq_iq4k_wants(src0) &&
             ggml_cuda_mmvq_fused(ctx, src0, src1, dst, fusion)) {
         return;
@@ -1893,6 +1895,11 @@ void ggml_cuda_mul_mat_vec_q(
     }
     if (!ids && ne11 == 1 && ne12 == 1 && ne13 == 1 &&
             ggml_cuda_mmvq_iq4k(ctx, src0, src1_q8_1_ptr, dst, fusion)) {
+        return;
+    }
+    if (!ids && ne11 == 1 && ne12 == 1 && ne13 == 1 && use_q8_cache &&
+            ggml_backend_buffer_get_usage(src0->buffer) != GGML_BACKEND_BUFFER_USAGE_COMPUTE &&
+            ggml_cuda_mmvq_fused_preq(ctx, src0, src1_q8_1_ptr, src1_sums, dst, fusion)) {
         return;
     }
 #endif
