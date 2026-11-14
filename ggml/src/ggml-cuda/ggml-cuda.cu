@@ -415,6 +415,28 @@ static ggml_cuda_device_info ggml_cuda_init() {
         info.default_tensor_split[id] /= total_vram;
     }
 
+#if defined(GGML_USE_HIP)
+    // On CDNA2 (gfx90a) rocBLAS's own Tensile kernel selection is poor for several large f16->f32
+    // GEMM shapes used by prefill (e.g. m=5120 n=4096 k=17408 runs at ~48 TFLOPS), while the
+    // hipBLASLt backend picks ~140-160 TFLOPS kernels (prefill pp8192 +27%, pp2048 +38%).
+    // rocBLAS reads ROCBLAS_USE_HIPBLASLT when the first handle is created, which happens lazily
+    // after this point. Only applied when every device is CDNA2 and the user has not set it;
+    // set ROCBLAS_USE_HIPBLASLT=0 to keep the rocBLAS kernels.
+    {
+        bool all_cdna2 = info.device_count > 0;
+        for (int id = 0; id < info.device_count; ++id) {
+            all_cdna2 = all_cdna2 && GGML_CUDA_CC_IS_CDNA2(info.devices[id].cc);
+        }
+        if (all_cdna2 && getenv("ROCBLAS_USE_HIPBLASLT") == nullptr) {
+#if defined(_WIN32)
+            _putenv_s("ROCBLAS_USE_HIPBLASLT", "1");
+#else
+            setenv("ROCBLAS_USE_HIPBLASLT", "1", 0);
+#endif
+        }
+    }
+#endif // defined(GGML_USE_HIP)
+
     // configure logging to stdout
     // CUBLAS_CHECK(cublasLoggerConfigure(1, 1, 0, nullptr));
 
