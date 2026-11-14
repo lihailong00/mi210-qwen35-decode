@@ -5,6 +5,8 @@
 #include "fattn-vec.cuh"
 #include "fattn.cuh"
 
+thread_local ggml_cuda_fattn_gate_epilogue * ggml_cuda_fattn_epilogue = nullptr;
+
 #if !defined(GGML_USE_MUSA)
 
 // one list per group of ncols1 queries: a column is selected if any query of the group can see it
@@ -736,6 +738,20 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
     if ((amd_wmma_available(cc) && gqa_opt_applies && Q->ne[0] <= 256) && Q->ne[0] != 40 && Q->ne[0] != 72 &&
             Q->ne[1] * gqa_ratio_eff > (Q->ne[0] <= 128 ? 8 : 16)) {
         return BEST_FATTN_KERNEL_MMA_F16;
+    }
+
+    // experiment override: GGML_CUDA_FA_FORCE=vec|tile
+    {
+        static const char * force = getenv("GGML_CUDA_FA_FORCE");
+        if (force && strcmp(force, "vec") == 0 && can_use_vector_kernel) {
+            return BEST_FATTN_KERNEL_VEC;
+        }
+        if (force && strcmp(force, "tile") == 0) {
+            return BEST_FATTN_KERNEL_TILE;
+        }
+        if (force && strcmp(force, "mma") == 0 && amd_mfma_available(cc)) {
+            return BEST_FATTN_KERNEL_MMA_F16;
+        }
     }
 
     // If there are no tensor cores available, use the generic tile kernel:

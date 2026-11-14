@@ -724,8 +724,35 @@ void ggml_cuda_op_rope_fused(ggml_backend_cuda_context & ctx, ggml_tensor * rope
     ggml_cuda_op_rope_impl<true>(ctx, rope, set_rows);
 }
 
+// position index (0..3) used by multi-section rope (mrope / imrope) for rotary pair i (= i0/2),
+// identical to the section selection in rope_multi
+static __device__ __forceinline__ int rope_multi_pos_idx(const int i, const mrope_sections sections, const bool is_imrope) {
+    const int sect_dims = sections.v[0] + sections.v[1] + sections.v[2] + sections.v[3];
+    const int sec_w     = sections.v[1] + sections.v[0];
+    const int sector    = i % sect_dims;
+    if (is_imrope) {
+        if (sector % 3 == 1 && sector < 3 * sections.v[1]) {         // h
+            return 1;
+        } else if (sector % 3 == 2 && sector < 3 * sections.v[2]) {  // w
+            return 2;
+        } else if (sector % 3 == 0 && sector < 3 * sections.v[0]) {  // t
+            return 0;
+        }
+        return 3;
+    }
+    if (sector < sections.v[0]) {
+        return 0;
+    } else if (sector < sec_w) {
+        return 1;
+    } else if (sector < sec_w + sections.v[2]) {
+        return 2;
+    }
+    return 3;
+}
+
 // fused RMS_NORM + MUL + ROPE (+ VIEW + SET_ROWS)
 // one block per row: block_reduce gives the norm scale, then each thread applies mul and rope to the elements it owns
+// is_multi: mrope/imrope (neox-style pairs, per-section positions pos[channel + nchannels*k])
 template <int block_size, bool has_ff, typename D>
 static __global__ void rms_norm_mul_rope_f32(
         const float * x, D * dst, const int ncols, const int nchannels, const int nsamples,
@@ -741,7 +768,7 @@ static __global__ void rms_norm_mul_rope_f32(
         const rope_corr_dims corr_dims, const float theta_scale,
         const float * freq_factors,
         const int64_t * row_indices, const int set_rows_stride,
-        const bool is_neox) {
+        const bool is_neox, const bool is_multi, const bool is_imrope, const mrope_sections sections) {
     ggml_cuda_pdl_lc();
     const int row = blockIdx.x;
     const int tid = threadIdx.x;
@@ -780,7 +807,7 @@ static __global__ void rms_norm_mul_rope_f32(
             for (int i0 = 2*tid; i0 < ncols; i0 += 2*block_size) {
                 int ix0;
                 int ix1;
-                if (is_neox && i0 < n_dims) {
+                if ((is_neox || is_multi) && i0 < n_dims) {
                     ix0 = i0/2;
                     ix1 = i0/2 + n_dims/2;
                 } else {
@@ -797,7 +824,8 @@ static __global__ void rms_norm_mul_rope_f32(
                     continue;
                 }
 
-                const float theta_base  = pos[channel]*powf(theta_scale, i0/2.0f);
+                const int   p_idx       = is_multi ? rope_multi_pos_idx(i0/2, sections, is_imrope) : 0;
+                const float theta_base  = pos[channel + nchannels*p_idx]*powf(theta_scale, i0/2.0f);
                 const float freq_factor = has_ff ? freq_factors[i0/2] : 1.0f;
 
                 float cos_theta;
@@ -832,7 +860,7 @@ static void rms_norm_mul_rope_cuda(
         const rope_corr_dims corr_dims,
         const float * freq_factors,
         const int64_t * row_indices, const int set_rows_stride,
-        const bool is_neox, cudaStream_t stream) {
+        const bool is_neox, const bool is_multi, const bool is_imrope, const mrope_sections sections, cudaStream_t stream) {
     GGML_ASSERT(ncols % 2 == 0);
 
     const dim3 blocks_num(nrows, MIN(nchannels, UINT16_MAX), MIN(nsamples, UINT16_MAX));
@@ -852,13 +880,13 @@ static void rms_norm_mul_rope_cuda(
                 x, dst, ncols, nchannels, nsamples, s01, s02, s03, s1, s2, s3, eps, mul, mul_s01, mul_s02, mul_s03,
                 mul_ncols_packed, mul_nrows_packed, mul_nchannels_packed, mul_nsamples_packed,
                 n_dims, pos, freq_scale, ext_factor, attn_factor, corr_dims, theta_scale,
-                freq_factors, row_indices, set_rows_stride, is_neox);
+                freq_factors, row_indices, set_rows_stride, is_neox, is_multi, is_imrope, sections);
         } else {
             ggml_cuda_kernel_launch(rms_norm_mul_rope_f32<256, true, D>, launch_params,
                 x, dst, ncols, nchannels, nsamples, s01, s02, s03, s1, s2, s3, eps, mul, mul_s01, mul_s02, mul_s03,
                 mul_ncols_packed, mul_nrows_packed, mul_nchannels_packed, mul_nsamples_packed,
                 n_dims, pos, freq_scale, ext_factor, attn_factor, corr_dims, theta_scale,
-                freq_factors, row_indices, set_rows_stride, is_neox);
+                freq_factors, row_indices, set_rows_stride, is_neox, is_multi, is_imrope, sections);
         }
     } else {
         const dim3 block_dims(1024, 1, 1);
@@ -868,13 +896,13 @@ static void rms_norm_mul_rope_cuda(
                 x, dst, ncols, nchannels, nsamples, s01, s02, s03, s1, s2, s3, eps, mul, mul_s01, mul_s02, mul_s03,
                 mul_ncols_packed, mul_nrows_packed, mul_nchannels_packed, mul_nsamples_packed,
                 n_dims, pos, freq_scale, ext_factor, attn_factor, corr_dims, theta_scale,
-                freq_factors, row_indices, set_rows_stride, is_neox);
+                freq_factors, row_indices, set_rows_stride, is_neox, is_multi, is_imrope, sections);
         } else {
             ggml_cuda_kernel_launch(rms_norm_mul_rope_f32<1024, true, D>, launch_params,
                 x, dst, ncols, nchannels, nsamples, s01, s02, s03, s1, s2, s3, eps, mul, mul_s01, mul_s02, mul_s03,
                 mul_ncols_packed, mul_nrows_packed, mul_nchannels_packed, mul_nsamples_packed,
                 n_dims, pos, freq_scale, ext_factor, attn_factor, corr_dims, theta_scale,
-                freq_factors, row_indices, set_rows_stride, is_neox);
+                freq_factors, row_indices, set_rows_stride, is_neox, is_multi, is_imrope, sections);
         }
     }
 }
@@ -922,7 +950,13 @@ void ggml_cuda_op_rms_norm_mul_rope_fused(ggml_backend_cuda_context & ctx,
     memcpy(&beta_fast,   (const int32_t *) rope->op_params +  9, sizeof(float));
     memcpy(&beta_slow,   (const int32_t *) rope->op_params + 10, sizeof(float));
 
-    const bool is_neox = mode & GGML_ROPE_TYPE_NEOX;
+    const bool is_neox   = mode & GGML_ROPE_TYPE_NEOX;
+    const bool is_multi  = (mode & GGML_ROPE_TYPE_MROPE) && mode != GGML_ROPE_TYPE_VISION;
+    const bool is_imrope = mode == GGML_ROPE_TYPE_IMROPE;
+    GGML_ASSERT(mode != GGML_ROPE_TYPE_VISION);
+
+    mrope_sections sections;
+    memcpy(&sections.v, (const int32_t *) rope->op_params + 11, sizeof(int)*4);
 
     const int32_t * pos = (const int32_t *) rope->src[1]->data;
 
@@ -956,15 +990,408 @@ void ggml_cuda_op_rms_norm_mul_rope_fused(ggml_backend_cuda_context & ctx,
             (const float *) mul_src->data, mul_s01, mul_s02, mul_s03,
             mul_src->ne[0], mul_src->ne[1], mul_src->ne[2], mul_src->ne[3],
             n_dims, pos, freq_scale, freq_base, ext_factor, attn_factor, corr_dims,
-            freq_factors, row_indices, set_rows_stride, is_neox, stream);
+            freq_factors, row_indices, set_rows_stride, is_neox, is_multi, is_imrope, sections, stream);
     } else if (dst_type == GGML_TYPE_F16) {
         rms_norm_mul_rope_cuda((const float *) x->data, (half *) dst_d,
             x->ne[0], x->ne[1], x->ne[2], x->ne[3], s01, s02, s03, s1, s2, s3, eps,
             (const float *) mul_src->data, mul_s01, mul_s02, mul_s03,
             mul_src->ne[0], mul_src->ne[1], mul_src->ne[2], mul_src->ne[3],
             n_dims, pos, freq_scale, freq_base, ext_factor, attn_factor, corr_dims,
-            freq_factors, row_indices, set_rows_stride, is_neox, stream);
+            freq_factors, row_indices, set_rows_stride, is_neox, is_multi, is_imrope, sections, stream);
     } else {
         GGML_ABORT("fatal error");
+    }
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
+// fused full-attention prep (qwen3.5 / qwen3-next style), one launch for the whole chain after the q/k/v projections:
+//   q_out           = rope(rms_norm(q_view) * wq)          (q_view: q half of the joint q+gate projection, strided)
+//   gate_out        = cont(gate_view)                      (gate half of the joint projection)
+//   k_cache[k_idx]  = rope(rms_norm(k) * wk)               (f16 or f32 cache rows, all kv heads of a token per row)
+//   v_cache[v_idx]  = v
+// grid = (2*n_head + 2*n_head_kv, n_tokens), one wave (64 threads) per head row: blocks [0, nh) q, [nh, nh+nkv) k,
+// [nh+nkv, nh+2nkv) v, [nh+2nkv, 2nh+2nkv) gate. The rope arithmetic (theta, yarn, pair order) is identical to
+// rope_norm / rope_neox / rope_multi, so results only differ from the unfused path by the norm reduction order.
+struct ggml_cuda_attn_prep {
+    const float * q_src; int64_t q_s1, q_s2;
+    const float * g_src; int64_t g_s1, g_s2;
+    const float * k_src; int64_t k_s1, k_s2;
+    const float * v_src; int64_t v_s1;
+    const float * wq;
+    const float * wk;
+    float * q_dst; int64_t qd_s1, qd_s2;
+    float * g_dst; int64_t gd_s1;
+    ggml_type k_type; void * k_dst; int64_t kd_s1; const int64_t * k_idx;
+    ggml_type v_type; void * v_dst; int64_t vd_s1; const int64_t * v_idx;
+    int n_head, n_head_kv, n_tokens;
+    float eps_q, eps_k;
+    int n_dims;
+    const int32_t * pos;
+    int rope_kind; // 0 norm, 1 neox, 2 mrope/imrope
+    bool is_imrope;
+    mrope_sections sections;
+    float freq_scale, ext_factor, attn_factor;
+    rope_corr_dims corr_dims;
+    float theta_scale;
+    const float * freq_factors;
+};
+
+// device-side cache of theta_scale^i for attn_prep_f32 (written by the first launch with the same powf; a key
+// mismatch, e.g. another model in the process, just falls back to powf)
+static __device__ float              g_attn_prep_pow[256];
+static __device__ unsigned long long g_attn_prep_pow_key = 0;
+
+static __device__ __forceinline__ unsigned long long attn_prep_pow_key(const float theta_scale, const int n_pairs) {
+    if (n_pairs <= 0 || n_pairs > 256) {
+        return 0;
+    }
+    return (1ull << 63) | ((unsigned long long) n_pairs << 32) | __float_as_uint(theta_scale);
+}
+
+// half(fma(a, b, c)) rounded once, like the v_fma_mixlo_f16 the compiler forms for ggml_cuda_cast<half>(x0*c - x1*s)
+// in rope_multi<float, half> on gfx9 (a plain fmaf + conversion rounds twice and differs by 1 ulp now and then)
+static __device__ __forceinline__ half attn_prep_fma_f16(const float a, const float b, const float c) {
+#if defined(__gfx906__) || defined(__gfx908__) || defined(__gfx90a__) || defined(__gfx942__) || defined(__gfx950__)
+    uint32_t r;
+    asm("v_fma_mixlo_f16 %0, %1, %2, %3" : "=v"(r) : "v"(a), "v"(b), "v"(c));
+    const uint16_t r16 = (uint16_t) r;
+    half h;
+    memcpy(&h, &r16, sizeof(h));
+    return h;
+#else
+    return __float2half(fmaf(a, b, c));
+#endif
+}
+
+template <int EPT>
+static __device__ __forceinline__ void attn_prep_load(const float * src, float * x) {
+    if constexpr (EPT == 4) {
+        const float4 t = *(const float4 *) src;
+        x[0] = t.x; x[1] = t.y; x[2] = t.z; x[3] = t.w;
+    } else if constexpr (EPT == 2) {
+        const float2 t = *(const float2 *) src;
+        x[0] = t.x; x[1] = t.y;
+    } else {
+#pragma unroll
+        for (int j = 0; j < EPT; ++j) {
+            x[j] = src[j];
+        }
+    }
+}
+
+template <int EPT, typename D>
+static __device__ __forceinline__ void attn_prep_store(D * dst, const float * x) {
+    if constexpr (std::is_same_v<D, float> && EPT == 4) {
+        *(float4 *) dst = make_float4(x[0], x[1], x[2], x[3]);
+    } else if constexpr (std::is_same_v<D, float> && EPT == 2) {
+        *(float2 *) dst = make_float2(x[0], x[1]);
+    } else if constexpr (std::is_same_v<D, half> && EPT == 4) {
+        half2 h[2] = { make_half2(x[0], x[1]), make_half2(x[2], x[3]) };
+        ggml_cuda_memcpy_1<8>(dst, h);
+    } else if constexpr (std::is_same_v<D, half> && EPT == 2) {
+        half2 h = make_half2(x[0], x[1]);
+        ggml_cuda_memcpy_1<4>(dst, &h);
+    } else {
+#pragma unroll
+        for (int j = 0; j < EPT; ++j) {
+            dst[j] = ggml_cuda_cast<D>(x[j]);
+        }
+    }
+}
+
+template <int HD, bool has_ff, typename DK, typename DV>
+__launch_bounds__(64, 1)
+static __global__ void attn_prep_f32(
+        const float * __restrict__ q_src, const int64_t q_s1, const int64_t q_s2,
+        const float * __restrict__ g_src, const int64_t g_s1, const int64_t g_s2,
+        const float * __restrict__ k_src, const int64_t k_s1, const int64_t k_s2,
+        const float * __restrict__ v_src, const int64_t v_s1,
+        const float * __restrict__ wq, const float * __restrict__ wk,
+        float * __restrict__ q_dst, const int64_t qd_s1, const int64_t qd_s2,
+        float * __restrict__ g_dst, const int64_t gd_s1,
+        DK * __restrict__ k_dst, const int64_t kd_s1, const int64_t * __restrict__ k_idx,
+        DV * __restrict__ v_dst, const int64_t vd_s1, const int64_t * __restrict__ v_idx,
+        const int n_head, const int n_head_kv, const int n_tokens,
+        const float eps_q, const float eps_k,
+        const int n_dims, const int32_t * __restrict__ pos, const int rope_kind, const bool is_imrope,
+        const mrope_sections sections,
+        const float freq_scale, const float ext_factor, const float attn_factor,
+        const rope_corr_dims corr_dims, const float theta_scale,
+        const float * __restrict__ freq_factors) {
+    constexpr int EPT = HD / 64;
+    static_assert(HD % 64 == 0, "bad head size");
+
+    const int tid = threadIdx.x;
+    const int t   = blockIdx.y;
+    const int b   = blockIdx.x;
+    const int e0  = tid * EPT;
+
+    float x[EPT];
+
+    if (b < n_head + n_head_kv) {
+        // q or k head: rms_norm * w, then rope
+        const bool    is_q = b < n_head;
+        const int     h    = is_q ? b : b - n_head;
+        const float * src  = is_q ? q_src + t*q_s2 + h*q_s1 : k_src + t*k_s2 + h*k_s1;
+        const float * w    = is_q ? wq : wk;
+        const int64_t krow = is_q ? 0 : k_idx[t]; // uniform, issued early
+        // speculative load of the cached theta_scale^i of this lane (first pass), validated by the key below
+        const unsigned long long pow_key_seen = __atomic_load_n(&g_attn_prep_pow_key, __ATOMIC_RELAXED);
+        const float pw_pref = g_attn_prep_pow[tid];
+
+        float wv[EPT];
+        attn_prep_load<EPT>(src + e0, x);
+        attn_prep_load<EPT>(w + e0, wv);
+
+        // cos/sin of every rotary pair, one lane per pair (instead of one per element), computed while the row loads
+        // are in flight: this kernel is latency bound, and the transcendental chain dominated it. The arithmetic
+        // (powf/cosf/sinf, rope_yarn, pair order) is the one of rope_multi/rope_neox/rope_norm, bit for bit.
+        const int n_pairs = n_dims / 2;
+        int p4[4];
+        p4[0] = pos[t];
+        if (rope_kind == 2) {
+            p4[1] = pos[t + n_tokens];
+            p4[2] = pos[t + 2*n_tokens];
+            p4[3] = pos[t + 3*n_tokens];
+        }
+        // theta_scale^i depends only on the model: after the first launch it comes from a device-side table written
+        // with the same powf (bit-identical); powf was ~1/3 of this latency-bound kernel
+        const unsigned long long pow_key = attn_prep_pow_key(theta_scale, n_pairs);
+        const bool pow_cached = pow_key != 0 && pow_key_seen == pow_key;
+        const bool pow_writer = pow_key != 0 && !pow_cached && b == 0 && t == 0;
+        __shared__ float s_cos[HD/2];
+        __shared__ float s_sin[HD/2];
+        for (int i = tid; i < n_pairs; i += 64) {
+            int p;
+            if (rope_kind == 2) {
+                const int p_idx = rope_multi_pos_idx(i, sections, is_imrope);
+                p = p_idx == 0 ? p4[0] : (p_idx == 1 ? p4[1] : (p_idx == 2 ? p4[2] : p4[3]));
+            } else {
+                p = p4[0];
+            }
+            const int   iw          = 2*i;
+            const float pw          = pow_cached ? (i == tid ? pw_pref : g_attn_prep_pow[i]) : powf(theta_scale, iw/2.0f);
+            if (pow_writer) {
+                g_attn_prep_pow[i] = pw;
+            }
+            const float theta_base  = p*pw;
+            const float freq_factor = has_ff ? freq_factors[i] : 1.0f;
+            float cos_theta;
+            float sin_theta;
+            rope_yarn<true>(theta_base/freq_factor, freq_scale, corr_dims, 2*i, ext_factor, attn_factor, cos_theta, sin_theta);
+            s_cos[i] = cos_theta;
+            s_sin[i] = sin_theta;
+        }
+        if (pow_writer) {
+            __threadfence(); // table entries visible before the key (published after the barrier below)
+        }
+
+        // sum of squares in the order of rms_norm_f32<128, 1, true> for 256 columns (float4 per thread, 32-lane
+        // trees, then the two halves), so that the fused result matches the unfused rms_norm + mul bit for bit
+        float sum = 0.0f;
+        if constexpr (EPT == 4) {
+            sum += x[0]*x[0] + x[1]*x[1] + x[2]*x[2] + x[3]*x[3];
+        } else {
+#pragma unroll
+            for (int j = 0; j < EPT; ++j) {
+                sum += x[j] * x[j];
+            }
+        }
+        sum = warp_reduce_sum<32>(sum);
+        if constexpr (ggml_cuda_get_physical_warp_size() == 64) {
+            sum += __shfl_xor_sync(0xffffffff, sum, 32, 64);
+        } else {
+            __shared__ float s_red[2];
+            if (tid % 32 == 0) {
+                s_red[tid / 32] = sum;
+            }
+            __syncthreads();
+            sum = s_red[0] + s_red[1];
+        }
+        const float scale = rsqrtf(sum / HD + (is_q ? eps_q : eps_k));
+
+        __shared__ float ys[HD];
+#pragma unroll
+        for (int j = 0; j < EPT; ++j) {
+            x[j] = scale * x[j] * wv[j];
+            ys[e0 + j] = x[j];
+        }
+        __syncthreads();
+        if (pow_writer && tid == 0) {
+            __atomic_store_n(&g_attn_prep_pow_key, pow_key, __ATOMIC_RELAXED);
+        }
+
+        // rotated element e of pair (ia, ib): fma(P, cos, M*sin) with (P, M) = (x0, -x1) for ia and (x1, x0) for ib.
+        // This is the exact contraction the compiler emits for rope_multi/rope_neox (x0*cos - x1*sin ->
+        // fma(x0, cos, -(x1*sin)), x0*sin + x1*cos -> fma(x1, cos, x0*sin)); for an f16 destination the fma is
+        // converted directly so that it becomes the same single-rounding v_fma_mixlo_f16 as in rope_multi<float, half>.
+        float P[EPT];
+        float M[EPT];
+        float C[EPT];
+        float S[EPT];
+#pragma unroll
+        for (int j = 0; j < EPT; ++j) {
+            const int e = e0 + j;
+            int i, ia, ib; // rotary pair index, element indices of the pair (first, second)
+            if (rope_kind == 0) {
+                i  = e / 2;
+                ia = 2*i;
+                ib = ia + 1;
+            } else {
+                const int half_dims = n_dims / 2;
+                i  = e < half_dims ? e : e - half_dims;
+                ia = i;
+                ib = i + half_dims;
+            }
+            const bool rot = e < n_dims;
+            i  = rot ? i  : 0;
+            ia = rot ? ia : 0;
+            ib = rot ? ib : 0;
+            const float x0 = ys[ia];
+            const float x1 = ys[ib];
+            P[j] = e == ia ? x0 : x1;
+            M[j] = e == ia ? -x1 : x0;
+            C[j] = s_cos[i];
+            S[j] = s_sin[i];
+        }
+
+        if (is_q) {
+            float out[EPT];
+#pragma unroll
+            for (int j = 0; j < EPT; ++j) {
+                out[j] = e0 + j < n_dims ? fmaf(P[j], C[j], M[j]*S[j]) : x[j];
+            }
+            attn_prep_store<EPT>(q_dst + t*qd_s2 + h*qd_s1 + e0, out);
+        } else if constexpr (std::is_same_v<DK, half>) {
+            half out[EPT];
+#pragma unroll
+            for (int j = 0; j < EPT; ++j) {
+                out[j] = e0 + j < n_dims ? attn_prep_fma_f16(P[j], C[j], M[j]*S[j]) : __float2half(x[j]);
+            }
+            ggml_cuda_memcpy_1<EPT*sizeof(half)>(k_dst + krow*kd_s1 + h*HD + e0, out);
+        } else {
+            float out[EPT];
+#pragma unroll
+            for (int j = 0; j < EPT; ++j) {
+                out[j] = e0 + j < n_dims ? fmaf(P[j], C[j], M[j]*S[j]) : x[j];
+            }
+            attn_prep_store<EPT>(k_dst + krow*kd_s1 + h*HD + e0, out);
+        }
+    } else if (b < n_head + 2*n_head_kv) {
+        // v head: copy (convert) into the cache row
+        const int h = b - n_head - n_head_kv;
+        const int64_t vrow = v_idx[t];
+        attn_prep_load<EPT>(v_src + t*v_s1 + h*HD + e0, x);
+        attn_prep_store<EPT>(v_dst + vrow*vd_s1 + h*HD + e0, x);
+    } else {
+        // gate head: make contiguous
+        const int h = b - n_head - 2*n_head_kv;
+        attn_prep_load<EPT>(g_src + t*g_s2 + h*g_s1 + e0, x);
+        attn_prep_store<EPT>(g_dst + t*gd_s1 + h*HD + e0, x);
+    }
+}
+
+template <int HD, typename DK, typename DV>
+static void attn_prep_launch(const ggml_cuda_attn_prep & p, cudaStream_t stream) {
+    const dim3 block_nums(2*p.n_head + 2*p.n_head_kv, p.n_tokens, 1);
+    const dim3 block_dims(64, 1, 1);
+    if (p.freq_factors == nullptr) {
+        attn_prep_f32<HD, false, DK, DV><<<block_nums, block_dims, 0, stream>>>(
+            p.q_src, p.q_s1, p.q_s2, p.g_src, p.g_s1, p.g_s2, p.k_src, p.k_s1, p.k_s2, p.v_src, p.v_s1,
+            p.wq, p.wk, p.q_dst, p.qd_s1, p.qd_s2, p.g_dst, p.gd_s1,
+            (DK *) p.k_dst, p.kd_s1, p.k_idx, (DV *) p.v_dst, p.vd_s1, p.v_idx,
+            p.n_head, p.n_head_kv, p.n_tokens, p.eps_q, p.eps_k,
+            p.n_dims, p.pos, p.rope_kind, p.is_imrope, p.sections,
+            p.freq_scale, p.ext_factor, p.attn_factor, p.corr_dims, p.theta_scale, p.freq_factors);
+    } else {
+        attn_prep_f32<HD, true, DK, DV><<<block_nums, block_dims, 0, stream>>>(
+            p.q_src, p.q_s1, p.q_s2, p.g_src, p.g_s1, p.g_s2, p.k_src, p.k_s1, p.k_s2, p.v_src, p.v_s1,
+            p.wq, p.wk, p.q_dst, p.qd_s1, p.qd_s2, p.g_dst, p.gd_s1,
+            (DK *) p.k_dst, p.kd_s1, p.k_idx, (DV *) p.v_dst, p.vd_s1, p.v_idx,
+            p.n_head, p.n_head_kv, p.n_tokens, p.eps_q, p.eps_k,
+            p.n_dims, p.pos, p.rope_kind, p.is_imrope, p.sections,
+            p.freq_scale, p.ext_factor, p.attn_factor, p.corr_dims, p.theta_scale, p.freq_factors);
+    }
+}
+
+template <int HD>
+static void attn_prep_launch_types(const ggml_cuda_attn_prep & p, cudaStream_t stream) {
+    if (p.k_type == GGML_TYPE_F16 && p.v_type == GGML_TYPE_F16) {
+        attn_prep_launch<HD, half, half>(p, stream);
+    } else if (p.k_type == GGML_TYPE_F32 && p.v_type == GGML_TYPE_F32) {
+        attn_prep_launch<HD, float, float>(p, stream);
+    } else if (p.k_type == GGML_TYPE_F16 && p.v_type == GGML_TYPE_F32) {
+        attn_prep_launch<HD, half, float>(p, stream);
+    } else {
+        attn_prep_launch<HD, float, half>(p, stream);
+    }
+}
+
+bool ggml_cuda_attn_prep_supported(const int64_t head_dim, const ggml_type k_type, const ggml_type v_type) {
+    return (head_dim == 128 || head_dim == 256) &&
+        (k_type == GGML_TYPE_F16 || k_type == GGML_TYPE_F32) && (v_type == GGML_TYPE_F16 || v_type == GGML_TYPE_F32);
+}
+
+// nodes: rms_q, mul_q, rope_q, cont_gate, rms_k, mul_k, rope_k, set_rows_k, set_rows_v (validated by the caller)
+void ggml_cuda_op_attn_prep_fused(ggml_backend_cuda_context & ctx, ggml_tensor * const * nodes) {
+    const ggml_tensor * rms_q  = nodes[0];
+    const ggml_tensor * mul_q  = nodes[1];
+    const ggml_tensor * rope_q = nodes[2];
+    const ggml_tensor * cont   = nodes[3];
+    const ggml_tensor * rms_k  = nodes[4];
+    const ggml_tensor * mul_k  = nodes[5];
+    const ggml_tensor * sr_k   = nodes[7];
+    const ggml_tensor * sr_v   = nodes[8];
+
+    const ggml_tensor * q  = rms_q->src[0];
+    const ggml_tensor * k  = rms_k->src[0];
+    const ggml_tensor * g  = cont->src[0];
+    const ggml_tensor * v  = sr_v->src[0];
+    const ggml_tensor * wq = mul_q->src[0] == rms_q ? mul_q->src[1] : mul_q->src[0];
+    const ggml_tensor * wk = mul_k->src[0] == rms_k ? mul_k->src[1] : mul_k->src[0];
+
+    ggml_cuda_attn_prep p;
+    p.q_src = (const float *) q->data; p.q_s1 = q->nb[1]/sizeof(float); p.q_s2 = q->nb[2]/sizeof(float);
+    p.g_src = (const float *) g->data; p.g_s1 = g->nb[1]/sizeof(float); p.g_s2 = g->nb[2]/sizeof(float);
+    p.k_src = (const float *) k->data; p.k_s1 = k->nb[1]/sizeof(float); p.k_s2 = k->nb[2]/sizeof(float);
+    p.v_src = (const float *) v->data; p.v_s1 = v->nb[1]/sizeof(float);
+    p.wq = (const float *) wq->data;
+    p.wk = (const float *) wk->data;
+    p.q_dst = (float *) rope_q->data; p.qd_s1 = rope_q->nb[1]/sizeof(float); p.qd_s2 = rope_q->nb[2]/sizeof(float);
+    p.g_dst = (float *) cont->data;   p.gd_s1 = cont->nb[1]/sizeof(float);
+    p.k_type = sr_k->type; p.k_dst = sr_k->data; p.kd_s1 = sr_k->nb[1]/ggml_type_size(sr_k->type);
+    p.k_idx  = (const int64_t *) sr_k->src[1]->data;
+    p.v_type = sr_v->type; p.v_dst = sr_v->data; p.vd_s1 = sr_v->nb[1]/ggml_type_size(sr_v->type);
+    p.v_idx  = (const int64_t *) sr_v->src[1]->data;
+    p.n_head    = q->ne[1];
+    p.n_head_kv = k->ne[1];
+    p.n_tokens  = q->ne[2];
+    memcpy(&p.eps_q, rms_q->op_params, sizeof(float));
+    memcpy(&p.eps_k, rms_k->op_params, sizeof(float));
+
+    const int32_t * op = (const int32_t *) rope_q->op_params;
+    p.n_dims = op[1];
+    const int mode       = op[2];
+    const int n_ctx_orig = op[4];
+    float freq_base, beta_fast, beta_slow;
+    memcpy(&freq_base,     op +  5, sizeof(float));
+    memcpy(&p.freq_scale,  op +  6, sizeof(float));
+    memcpy(&p.ext_factor,  op +  7, sizeof(float));
+    memcpy(&p.attn_factor, op +  8, sizeof(float));
+    memcpy(&beta_fast,     op +  9, sizeof(float));
+    memcpy(&beta_slow,     op + 10, sizeof(float));
+    memcpy(&p.sections.v,  op + 11, sizeof(int)*4);
+    p.rope_kind    = (mode & GGML_ROPE_TYPE_MROPE) ? 2 : ((mode & GGML_ROPE_TYPE_NEOX) ? 1 : 0);
+    p.is_imrope    = mode == GGML_ROPE_TYPE_IMROPE;
+    p.pos          = (const int32_t *) rope_q->src[1]->data;
+    p.freq_factors = rope_q->src[2] ? (const float *) rope_q->src[2]->data : nullptr;
+    p.theta_scale  = powf(freq_base, -2.0f/p.n_dims); // same as ggml_cuda_op_rope_impl
+    ggml_rope_yarn_corr_dims(p.n_dims, n_ctx_orig, freq_base, beta_fast, beta_slow, p.corr_dims.v);
+
+    cudaStream_t stream = ctx.stream();
+    switch (q->ne[0]) {
+        case 128: attn_prep_launch_types<128>(p, stream); break;
+        case 256: attn_prep_launch_types<256>(p, stream); break;
+        default: GGML_ABORT("unsupported head size");
     }
 }
