@@ -1214,7 +1214,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "A X = B, A triangular, solve X",
     "gated_delta_net(q, k, v, g, beta, s)",
     "gdn_decode_prep(qkv, x, wa, wb, dt, a, cw, cs)",
-    "gdn_decode_out(prep, z, nw, ss)",
+    "gdn_decode_out(prep, qkv, cw, cs, z, nw, ss)",
     "lightning_indexer(q, k, weights, mask)",
     "dsv4_hc_comb(mixes, scale, base)",
     "dsv4_hc_pre(x, weights)",
@@ -6558,7 +6558,7 @@ struct ggml_tensor * ggml_gdn_decode_prep(
     GGML_ASSERT(dst_row >= 0 && dst_row < conv_state->ne[1]);
     GGML_ASSERT(s_copy->type == GGML_TYPE_I32 && ggml_nelements(s_copy) >= 1);
 
-    struct ggml_tensor * result = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, conv_dim + 2*H_v);
+    struct ggml_tensor * result = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, (int64_t) 2*H_k*S + 3*H_v);
 
     ggml_set_op_params_i32(result, 0, dst_row);
     ggml_set_op_params_i32(result, 1, H_k);
@@ -6586,6 +6586,9 @@ struct ggml_tensor * ggml_gdn_decode_prep(
 struct ggml_tensor * ggml_gdn_decode_out(
         struct ggml_context * ctx,
         struct ggml_tensor  * prep,
+        struct ggml_tensor  * qkv,
+        struct ggml_tensor  * conv_w,
+        struct ggml_tensor  * conv_state,
         struct ggml_tensor  * z,
         struct ggml_tensor  * norm_w,
         struct ggml_tensor  * ssm_state,
@@ -6597,7 +6600,13 @@ struct ggml_tensor * ggml_gdn_decode_out(
         int                   S,
         float                 eps) {
     GGML_ASSERT(H_k > 0 && H_v > 0 && S > 0 && H_v % H_k == 0);
-    GGML_ASSERT(prep->type == GGML_TYPE_F32 && ggml_is_contiguous(prep) && ggml_nelements(prep) == (int64_t) (2*H_k + H_v)*S + 2*H_v);
+    const int64_t conv_dim = (int64_t) (2*H_k + H_v) * S;
+    const int64_t d_conv   = conv_w->ne[0];
+    GGML_ASSERT(prep->type == GGML_TYPE_F32 && ggml_is_contiguous(prep) && ggml_nelements(prep) == (int64_t) 2*H_k*S + 3*H_v);
+    GGML_ASSERT(qkv->type == GGML_TYPE_F32 && ggml_is_contiguous(qkv) && ggml_nelements(qkv) == conv_dim);
+    GGML_ASSERT(conv_w->type == GGML_TYPE_F32 && conv_w->ne[1] == conv_dim && ggml_is_contiguous(conv_w) && d_conv >= 2);
+    GGML_ASSERT(conv_state->type == GGML_TYPE_F32 && conv_state->ne[0] == (d_conv - 1)*conv_dim);
+    GGML_ASSERT(conv_state->nb[0] == sizeof(float) && dst_row < conv_state->ne[1]);
     GGML_ASSERT(z->type == GGML_TYPE_F32 && ggml_is_contiguous(z) && ggml_nelements(z) == (int64_t) H_v*S);
     GGML_ASSERT(norm_w->type == GGML_TYPE_F32 && ggml_is_contiguous(norm_w) && ggml_nelements(norm_w) == S);
     GGML_ASSERT(ssm_state->type == GGML_TYPE_F32 && ssm_state->ne[0] == (int64_t) S*S*H_v);
@@ -6615,11 +6624,14 @@ struct ggml_tensor * ggml_gdn_decode_out(
 
     result->op     = GGML_OP_GDN_DECODE_OUT;
     result->src[0] = prep;
-    result->src[1] = z;
-    result->src[2] = norm_w;
-    result->src[3] = ssm_state;
-    result->src[4] = s_copy;
-    result->src[5] = dep;
+    result->src[1] = qkv;
+    result->src[2] = conv_w;
+    result->src[3] = conv_state;
+    result->src[4] = z;
+    result->src[5] = norm_w;
+    result->src[6] = ssm_state;
+    result->src[7] = s_copy;
+    result->src[8] = dep;
 
     return result;
 }

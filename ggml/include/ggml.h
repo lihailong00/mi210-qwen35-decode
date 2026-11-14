@@ -2708,18 +2708,19 @@ extern "C" {
     // read from row s_copy[0] and written back IN PLACE to row dst_row of the cache tensors.
     // v head h uses q/k head h % H_k (tiled, same as ggml_gated_delta_net).
     //
-    // ggml_gdn_decode_prep:
+    // ggml_gdn_decode_prep: conv1d + silu of the q/k channels, L2 norms, alpha/beta projections and gates
     //   qkv        : [conv_dim]                    f32, conv_dim = (2*H_k + H_v)*S channels: q | k | v
     //   x          : [n_embd]                      f32, input of the alpha/beta projections
     //   w_alpha    : [n_embd, H_v]                 bf16 or f32
     //   w_beta     : [n_embd, H_v]                 bf16 or f32
     //   dt_bias, a : [H_v]                         f32
     //   conv_w     : [d_conv, conv_dim]            f32
-    //   conv_state : [(d_conv - 1)*conv_dim, rows] f32 (updated in place)
+    //   conv_state : [(d_conv - 1)*conv_dim, rows] f32 (q/k channels updated in place)
     //   s_copy     : [n] i32, s_copy[0] = row to read the states from
     //   dep        : optional, computed before this op (e.g. the zeroing of a cleared state row)
-    // result: [(2*H_k + H_v)*S + 2*H_v] f32 = l2norm(q) | l2norm(k) | v | exp(gate) | sigmoid(beta)
-    //   with gate = softplus(x.w_alpha + dt_bias)*a, l2norm(t) = t/sqrt(sum(t^2) + eps_l2*S)
+    // result: [2*H_k*S + 3*H_v] f32 = l2norm(q) | l2norm(k) | exp(gate) | sigmoid(beta) | scratch[H_v]
+    //   with gate = softplus(x.w_alpha + dt_bias)*a, l2norm(t) = t/sqrt(sum(t^2) + eps_l2*S);
+    //   the scratch tail is zeroed here and used by the backend implementation of ggml_gdn_decode_out
     GGML_API struct ggml_tensor * ggml_gdn_decode_prep(
             struct ggml_context * ctx,
             struct ggml_tensor  * qkv,
@@ -2738,8 +2739,9 @@ extern "C" {
             int                   S,
             float                 eps_l2);
 
-    // ggml_gdn_decode_out:
+    // ggml_gdn_decode_out: conv1d + silu of the v channels, delta rule, gated output norm
     //   prep       : result of ggml_gdn_decode_prep
+    //   qkv, conv_w, conv_state : as for ggml_gdn_decode_prep (v channels of conv_state updated in place)
     //   z          : [H_v*S]                       f32, output gate
     //   norm_w     : [S]                           f32
     //   ssm_state  : [S*S*H_v, rows]               f32 (updated in place), per head the transposed state M[col][i]
@@ -2749,6 +2751,9 @@ extern "C" {
     GGML_API struct ggml_tensor * ggml_gdn_decode_out(
             struct ggml_context * ctx,
             struct ggml_tensor  * prep,
+            struct ggml_tensor  * qkv,
+            struct ggml_tensor  * conv_w,
+            struct ggml_tensor  * conv_state,
             struct ggml_tensor  * z,
             struct ggml_tensor  * norm_w,
             struct ggml_tensor  * ssm_state,

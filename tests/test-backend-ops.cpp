@@ -5337,28 +5337,28 @@ struct test_gdn_decode : public test_case {
         ggml_tensor * ss = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, S*S*H_v, n_rows);
         ggml_set_name(ss, "ssm_state");
 
+        ggml_tensor * qkv    = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, conv_dim);
+        ggml_tensor * conv_w = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, d_conv, conv_dim);
+        ggml_tensor * cs     = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, (d_conv - 1)*conv_dim, n_rows);
+        ggml_set_name(qkv, "qkv");
+        ggml_set_name(conv_w, "conv_w");
+        ggml_set_name(cs, "conv_state");
+
         ggml_tensor * prep;
-        ggml_tensor * cs = nullptr;
         if (out_only) {
-            prep = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, conv_dim + 2*H_v);
+            prep = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 2*H_k*S + 3*H_v);
             ggml_set_name(prep, "prep_in");
         } else {
-            ggml_tensor * qkv     = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, conv_dim);
             ggml_tensor * x       = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_embd);
             ggml_tensor * w_alpha = ggml_new_tensor_2d(ctx, type_w, n_embd, H_v);
             ggml_tensor * w_beta  = ggml_new_tensor_2d(ctx, type_w, n_embd, H_v);
             ggml_tensor * dt      = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, H_v);
             ggml_tensor * a       = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, H_v);
-            ggml_tensor * conv_w  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, d_conv, conv_dim);
-            cs                    = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, (d_conv - 1)*conv_dim, n_rows);
-            ggml_set_name(qkv, "qkv");
             ggml_set_name(x, "x");
             ggml_set_name(w_alpha, "w_alpha");
             ggml_set_name(w_beta, "w_beta");
             ggml_set_name(dt, "dt");
             ggml_set_name(a, "a");
-            ggml_set_name(conv_w, "conv_w");
-            ggml_set_name(cs, "conv_state");
             prep = ggml_gdn_decode_prep(ctx, qkv, x, w_alpha, w_beta, dt, a, conv_w, cs, s_copy, nullptr,
                     dst_row, (int) H_k, (int) H_v, (int) S, 1e-6f/S);
             ggml_set_name(prep, "prep");
@@ -5369,7 +5369,7 @@ struct test_gdn_decode : public test_case {
         ggml_set_name(z, "z");
         ggml_set_name(norm_w, "norm_w");
 
-        ggml_tensor * out = ggml_gdn_decode_out(ctx, prep, z, norm_w, ss, s_copy, nullptr,
+        ggml_tensor * out = ggml_gdn_decode_out(ctx, prep, qkv, conv_w, cs, z, norm_w, ss, s_copy, nullptr,
                 dst_row, (int) H_k, (int) H_v, (int) S, 1e-6f);
         ggml_set_name(out, "out");
 
@@ -5380,7 +5380,9 @@ struct test_gdn_decode : public test_case {
         // pull the updated state rows into the output (the concat depends on both ops, so it runs after them)
         ggml_tensor * ss_row = ggml_view_1d(ctx, ss, ss->ne[0], dst_row*ss->nb[1]);
         ggml_tensor * cs_row = ggml_view_1d(ctx, cs, cs->ne[0], dst_row*cs->nb[1]);
-        ggml_tensor * res = ggml_concat(ctx, ggml_concat(ctx, prep, out, 0), ggml_concat(ctx, cs_row, ss_row, 0), 0);
+        // (the scratch tail of prep is backend specific and modified by GDN_DECODE_OUT)
+        ggml_tensor * prep_v = ggml_view_1d(ctx, prep, 2*H_k*S + 2*H_v, 0);
+        ggml_tensor * res = ggml_concat(ctx, ggml_concat(ctx, prep_v, out, 0), ggml_concat(ctx, cs_row, ss_row, 0), 0);
         ggml_set_name(res, "res");
         return res;
     }
@@ -5399,6 +5401,9 @@ struct test_gdn_decode : public test_case {
                 init_tensor_uniform(t, -0.5f, 0.5f);
             } else if (strcmp(t->name, "prep_in") == 0) {
                 init_tensor_uniform(t, 0.0f, 0.5f);
+                // zero the scratch tail (arrival counters)
+                std::vector<float> zeros(H_v, 0.0f);
+                ggml_backend_tensor_set(t, zeros.data(), (2*H_k*S + 2*H_v)*sizeof(float), H_v*sizeof(float));
             } else {
                 init_tensor_uniform(t);
             }

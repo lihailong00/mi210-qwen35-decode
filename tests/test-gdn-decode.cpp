@@ -155,7 +155,7 @@ int main(int argc, char ** argv) {
 
     // ---- reference: the unfused chain of qwen35.cpp build_layer_attn_linear (n_seqs = n_seq_tokens = 1)
     ggml_cgraph * gf_ref = ggml_new_graph(ctx);
-    ggml_tensor * ref_q = nullptr, * ref_k = nullptr, * ref_v = nullptr, * ref_beta = nullptr, * ref_out = nullptr;
+    ggml_tensor * ref_q = nullptr, * ref_k = nullptr, * ref_beta = nullptr, * ref_out = nullptr;
     {
         ggml_tensor * qkv_mixed = ggml_reshape_3d(ctx, qkv_in, conv_dim, 1, 1);
         ggml_tensor * z = z_in;
@@ -241,13 +241,11 @@ int main(int argc, char ** argv) {
         ggml_set_output(ref_out);
         ggml_build_forward_expand(gf_ref, ref_out);
 
-        ref_q = q_conv; ref_k = k_conv; ref_v = v_conv; ref_beta = beta;
         // keep the intermediates readable (copies at the end do not change the fusion patterns above)
-        ref_q    = ggml_cpy(ctx, ref_q,    ggml_new_tensor_1d(ctx, GGML_TYPE_F32, (int64_t) S*H_k));
-        ref_k    = ggml_cpy(ctx, ref_k,    ggml_new_tensor_1d(ctx, GGML_TYPE_F32, (int64_t) S*H_k));
-        ref_v    = ggml_cpy(ctx, ref_v,    ggml_new_tensor_1d(ctx, GGML_TYPE_F32, (int64_t) S*H_v));
-        ref_beta = ggml_cpy(ctx, ref_beta, ggml_new_tensor_1d(ctx, GGML_TYPE_F32, H_v));
-        for (ggml_tensor * t : { ref_q, ref_k, ref_v, ref_beta }) {
+        ref_q    = ggml_cpy(ctx, q_conv, ggml_new_tensor_1d(ctx, GGML_TYPE_F32, (int64_t) S*H_k));
+        ref_k    = ggml_cpy(ctx, k_conv, ggml_new_tensor_1d(ctx, GGML_TYPE_F32, (int64_t) S*H_k));
+        ref_beta = ggml_cpy(ctx, beta,   ggml_new_tensor_1d(ctx, GGML_TYPE_F32, H_v));
+        for (ggml_tensor * t : { ref_q, ref_k, ref_beta }) {
             ggml_set_output(t);
             ggml_build_forward_expand(gf_ref, t);
         }
@@ -259,8 +257,8 @@ int main(int argc, char ** argv) {
     {
         fus_prep = ggml_gdn_decode_prep(ctx, qkv_in, ggml_reshape_1d(ctx, x_in, n_embd), w_alpha, w_beta, dt, a,
                 conv_w, cs_fus, s_copy, nullptr, dst_row, H_k, H_v, S, eps/(float) S);
-        fus_out = ggml_gdn_decode_out(ctx, fus_prep, ggml_reshape_1d(ctx, z_in, (int64_t) S*H_v), norm_w, ss_fus,
-                s_copy, nullptr, dst_row, H_k, H_v, S, eps);
+        fus_out = ggml_gdn_decode_out(ctx, fus_prep, qkv_in, conv_w, cs_fus,
+                ggml_reshape_1d(ctx, z_in, (int64_t) S*H_v), norm_w, ss_fus, s_copy, nullptr, dst_row, H_k, H_v, S, eps);
         ggml_set_output(fus_prep);
         ggml_set_output(fus_out);
         ggml_build_forward_expand(gf_fus, fus_out);
@@ -296,8 +294,7 @@ int main(int argc, char ** argv) {
         auto slice = [&](size_t off, size_t len) { return std::vector<float>(prep.begin() + off, prep.begin() + off + len); };
         report("q",      compare(get_f32(ref_q),    slice(0, (size_t) S*H_k)));
         report("k",      compare(get_f32(ref_k),    slice((size_t) S*H_k, (size_t) S*H_k)));
-        report("v",      compare(get_f32(ref_v),    slice((size_t) 2*S*H_k, (size_t) S*H_v)));
-        report("beta",   compare(get_f32(ref_beta), slice((size_t) conv_dim + H_v, H_v)));
+        report("beta",   compare(get_f32(ref_beta), slice((size_t) 2*S*H_k + H_v, H_v)));
         report("out",    compare(get_f32(ref_out),  get_f32(fus_out)));
         report("conv_st",compare(get_f32(cs_ref, dst_row*n_embd_r, n_embd_r), get_f32(cs_fus, dst_row*n_embd_r, n_embd_r)));
         report("ssm_st", compare(get_f32(ss_ref, dst_row*n_embd_s, n_embd_s), get_f32(ss_fus, dst_row*n_embd_s, n_embd_s)));

@@ -11405,11 +11405,13 @@ void ggml_compute_forward_gdn_decode_prep(
     const float * cw_d  = (const float *) conv_w->data;
     float * out = (float *) dst->data;
 
-    // conv1d over [state | x] + silu; the state shifts by one (in place safe: each channel is read before it is written)
+    // conv1d over [state | x] + silu of the q/k channels; the state shifts by one (in place safe: each channel is
+    // read before it is written)
+    GGML_UNUSED(conv_dim);
     const float * cs_src = (const float *) ((const char *) cs->data + src_row*cs->nb[1]);
     float       * cs_dst = (float       *) ((char       *) cs->data + dst_row*cs->nb[1]);
     std::vector<float> win(d_conv);
-    for (int64_t ch = 0; ch < conv_dim; ++ch) {
+    for (int64_t ch = 0; ch < (int64_t) 2*H_k*S; ++ch) {
         for (int64_t j = 0; j < d_conv - 1; ++j) {
             win[j] = cs_src[ch*(d_conv - 1) + j];
         }
@@ -11445,8 +11447,9 @@ void ggml_compute_forward_gdn_decode_prep(
         const float alpha = ggml_gdn_dec_row_dot(w_alpha, h, x_d, n_embd) + dt_d[h];
         const float beta  = ggml_gdn_dec_row_dot(w_beta,  h, x_d, n_embd);
         const float sp    = alpha > 20.0f ? alpha : log1pf(expf(alpha));
-        out[conv_dim + h]       = expf(sp*a_d[h]);
-        out[conv_dim + H_v + h] = 1.0f/(1.0f + expf(-beta));
+        out[2*H_k*S + h]       = expf(sp*a_d[h]);
+        out[2*H_k*S + H_v + h] = 1.0f/(1.0f + expf(-beta));
+        out[2*H_k*S + 2*H_v + h] = 0.0f; // scratch
     }
 }
 
@@ -11458,10 +11461,13 @@ void ggml_compute_forward_gdn_decode_out(
     }
 
     const ggml_tensor * prep   = dst->src[0];
-    const ggml_tensor * z      = dst->src[1];
-    const ggml_tensor * norm_w = dst->src[2];
-    ggml_tensor       * ss     = dst->src[3];
-    const ggml_tensor * s_copy = dst->src[4];
+    const ggml_tensor * qkv    = dst->src[1];
+    const ggml_tensor * conv_w = dst->src[2];
+    ggml_tensor       * cs     = dst->src[3];
+    const ggml_tensor * z      = dst->src[4];
+    const ggml_tensor * norm_w = dst->src[5];
+    ggml_tensor       * ss     = dst->src[6];
+    const ggml_tensor * s_copy = dst->src[7];
 
     const int   dst_row = ggml_get_op_params_i32(dst, 0);
     const int   H_k     = ggml_get_op_params_i32(dst, 1);
@@ -11475,9 +11481,34 @@ void ggml_compute_forward_gdn_decode_out(
     const float * p   = (const float *) prep->data;
     const float * q   = p;
     const float * k   = p + H_k*S;
-    const float * v   = p + 2*H_k*S;
-    const float * g   = p + (2*H_k + H_v)*S;
+    const float * g   = p + 2*H_k*S;
     const float * b   = g + H_v;
+
+    // conv1d + silu of the v channels, conv state shifted in place
+    const int64_t d_conv = conv_w->ne[0];
+    std::vector<float> v((size_t) H_v*S);
+    {
+        const float * qkv_d  = (const float *) qkv->data;
+        const float * cw_d   = (const float *) conv_w->data;
+        const float * cs_src = (const float *) ((const char *) cs->data + src_row*cs->nb[1]);
+        float       * cs_dst = (float       *) ((char       *) cs->data + dst_row*cs->nb[1]);
+        std::vector<float> win(d_conv);
+        for (int64_t i = 0; i < (int64_t) H_v*S; ++i) {
+            const int64_t ch = (int64_t) 2*H_k*S + i;
+            for (int64_t j = 0; j < d_conv - 1; ++j) {
+                win[j] = cs_src[ch*(d_conv - 1) + j];
+            }
+            win[d_conv - 1] = qkv_d[ch];
+            float sum = 0.0f;
+            for (int64_t j = 0; j < d_conv; ++j) {
+                sum += win[j]*cw_d[ch*d_conv + j];
+            }
+            v[i] = sum/(1.0f + expf(-sum));
+            for (int64_t j = 0; j < d_conv - 1; ++j) {
+                cs_dst[ch*(d_conv - 1) + j] = win[j + 1];
+            }
+        }
+    }
     const float * z_d = (const float *) z->data;
     const float * nw  = (const float *) norm_w->data;
     float * out = (float *) dst->data;
@@ -11490,7 +11521,7 @@ void ggml_compute_forward_gdn_decode_out(
         const int hk = h % H_k;
         const float * qh = q + hk*S;
         const float * kh = k + hk*S;
-        const float * vh = v + h*S;
+        const float * vh = v.data() + (size_t) h*S;
         const float * s_src = (const float *) ((const char *) ss->data + src_row*ss->nb[1]) + (size_t) h*S*S;
         float       * s_dst = (float       *) ((char       *) ss->data + dst_row*ss->nb[1]) + (size_t) h*S*S;
         memcpy(st.data(), s_src, sizeof(float)*S*S);

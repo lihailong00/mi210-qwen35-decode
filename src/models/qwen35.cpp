@@ -434,6 +434,7 @@ static ggml_tensor * qwen35_build_gdn_fused_decode(
             hparams.f_norm_rms_eps / (float) head_k_dim); // == build_gdn_l2_norm eps
 
     ggml_tensor * out = ggml_gdn_decode_out(ctx0, prep,
+            ggml_reshape_1d(ctx0, qkv_mixed, ggml_nelements(qkv_mixed)), layer.ssm_conv1d, conv_states_all,
             ggml_reshape_1d(ctx0, z, ggml_nelements(z)), layer.ssm_norm,
             ssm_states_all, inp->s_copy, zero_row(ssm_states_all),
             dst_row, (int) num_k_heads, (int) num_v_heads, (int) head_v_dim,
