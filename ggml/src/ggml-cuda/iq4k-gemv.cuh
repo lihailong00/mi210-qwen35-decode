@@ -228,7 +228,11 @@ struct iq4xs_t {
     static __device__ __forceinline__ raw load_c(const soa & s, const uint32_t qc, const uint32_t se, const uint32_t boff) {
         raw r; (void) boff;
         r.q = *(const uint4 *) (s.Q + qc*16u);
+#ifdef IQ4K_PROBE_NOS
+        r.h = *(const uint2 *) (s.S + (se & 7u)*8u);   // timing probe only: header loads hit one cached line
+#else
         r.h = *(const uint2 *) (s.S + se*8u);
+#endif
         return r;
     }
     static __device__ __forceinline__ void put_y(uint32_t * ys, const int b, const uint4 q0, const uint4 q1, const float d) {
@@ -282,7 +286,11 @@ struct q4k_t {
         raw r;
         r.a = *(const uint4 *) (s.Q + qc*16u);
         r.b = *(const uint4 *) (s.Q + (qc + boff)*16u);
+#ifdef IQ4K_PROBE_NOS
+        r.h = *(const uint4 *) (s.S + (se & 3u)*16u);   // timing probe only
+#else
         r.h = *(const uint4 *) (s.S + se*16u);
+#endif
         return r;
     }
     static __device__ __forceinline__ void put_y(uint32_t * ys, const int b, const uint4 q0, const uint4 q1, const float d) {
@@ -370,7 +378,10 @@ template <int L> static __device__ __forceinline__ float group_sum(float v) {
 // Results go to LDS during the loop and are written after it.
 // GLU: dst = (W_up . y) * silu(W_gate . y) (same type/shape); residual (optional): dst = W . y + residual.
 // Requirements: K % 256 == 0, N % (G*R) == 0.
-template <class T, int L, int R, bool GLU, bool SK, bool RT = false, bool EX = false, int U = 1>
+#ifndef IQ4K_PF2
+#define IQ4K_PF2 0   // 1: load both ping-pong buffers before the y staging (measured 0.1-2.5 us slower)
+#endif
+template <class T, int L, int R, bool GLU, bool SK, bool RT = false, bool EX = false, int U = 1, bool PF2 = IQ4K_PF2 != 0>
 __launch_bounds__(1024, 1)
 __global__ void gemv(const soa s, const soa sg, const block_q8_1 * __restrict__ yg, float * __restrict__ dst,
         const int K, const int N, const float * __restrict__ residual, float * __restrict__ scratch, unsigned int * __restrict__ cnt) {
@@ -462,7 +473,8 @@ __global__ void gemv(const soa s, const soa sg, const block_q8_1 * __restrict__ 
         ++ls; if (++lk == q) { lk = 0; ++lu; }
     };
 
-    if (e > b) load_step(A, Ag);
+    // PF2: both ping-pong buffers (steps 0 and 1) are loaded before the y staging, so the pipeline starts without a bubble
+    if (e > b) { load_step(A, Ag); if constexpr (PF2) load_step(B, Bg); }
     stage_y<T>(ysm, yg, K, tid, blockDim.y*64);
     __syncthreads();
     if (e <= b) return;
@@ -501,11 +513,20 @@ __global__ void gemv(const soa s, const soa sg, const block_q8_1 * __restrict__ 
     };
 
     const int nst = e - b;
-    for (int st = 0; st < nst; st += 2) {
-        load_step(B, Bg);       // step st+1 (clamped past the end)
-        compute_step(A, Ag);    // step st
-        load_step(A, Ag);       // step st+2
-        compute_step(B, Bg);    // step st+1
+    if constexpr (PF2) {
+        for (int st = 0; st < nst; st += 2) {
+            compute_step(A, Ag);    // step st
+            load_step(A, Ag);       // step st+2 (clamped past the end)
+            compute_step(B, Bg);    // step st+1
+            load_step(B, Bg);       // step st+3
+        }
+    } else {
+        for (int st = 0; st < nst; st += 2) {
+            load_step(B, Bg);       // step st+1 (clamped past the end)
+            compute_step(A, Ag);    // step st
+            load_step(A, Ag);       // step st+2
+            compute_step(B, Bg);    // step st+1
+        }
     }
 
     // ---- epilogue: complete units straight to dst, split units through the two-wave combine
