@@ -275,9 +275,55 @@ static void dequantize_block_q8_0_f16_cuda(const void * __restrict__ vx, half * 
     }
 }
 
+#if defined(GGML_USE_HIP)
+// Dequantize several super-blocks per 256-thread block: each G-thread group (G = the stock launch's
+// threads per super-block) expands one super-block into LDS with the stock per-thread math, then
+// copies it to global memory with 16-byte stores. The stock launch (one 32- or 64-thread block per
+// super-block, scattered 2-byte stores) leaves wave64 lanes idle and reaches only ~0.5 TB/s on MI210;
+// this reaches ~0.9 TB/s. Output is bit-identical. GGML_CUDA_DEQUANT_LDS=0 restores the stock launch.
+template <typename dst_t, int G, void (*deq)(const void *, const int64_t, dst_t *, const int)>
+static __global__ void __launch_bounds__(256) dequantize_block_lds(const void * __restrict__ vx, dst_t * __restrict__ yy, const int64_t nb) {
+    constexpr int NG = 256/G;
+    __shared__ __align__(16) dst_t buf[NG][QK_K];
+    const int     g = threadIdx.x / G;
+    const int     t = threadIdx.x % G;
+    const int64_t i = (int64_t) blockIdx.x*NG + g;
+    if (i < nb) {
+        deq(vx, i, buf[g], t);
+    }
+    __syncthreads();
+    if (i < nb) {
+        constexpr int n16 = QK_K*sizeof(dst_t)/16;
+        const uint4 * src = (const uint4 *) buf[g];
+        uint4       * dst = (uint4 *) (yy + i*QK_K);
+#pragma unroll
+        for (int k = t; k < n16; k += G) {
+            dst[k] = src[k];
+        }
+    }
+}
+
+static bool ggml_cuda_dequant_lds_enabled() {
+    static const bool enabled = [] {
+        const char * e = getenv("GGML_CUDA_DEQUANT_LDS");
+        return e == nullptr || atoi(e) != 0;
+    }();
+    return enabled;
+}
+
+#define GGML_CUDA_DEQUANT_LDS_LAUNCH(fn, G)                                                                  \
+    if (ggml_cuda_dequant_lds_enabled() && ((uintptr_t) y % 16) == 0) {                                    \
+        dequantize_block_lds<dst_t, G, fn<dst_t>><<<(nb + 256/G - 1)/(256/G), 256, 0, stream>>>(vx, y, nb); \
+        return;                                                                                             \
+    }
+#else
+#define GGML_CUDA_DEQUANT_LDS_LAUNCH(fn, G)
+#endif // defined(GGML_USE_HIP)
+
 template<typename dst_t>
 static void dequantize_row_q2_K_cuda(const void * vx, dst_t * y, const int64_t k, cudaStream_t stream) {
     const int nb = k / QK_K;
+    GGML_CUDA_DEQUANT_LDS_LAUNCH(dequantize_q2_K, 64)
     dequantize_block_q2_K<<<nb, 64, 0, stream>>>(vx, y);
 }
 
@@ -304,6 +350,7 @@ static void dequantize_row_q4_1_cuda(const void * vx, dst_t * y, const int64_t k
 template<typename dst_t>
 static void dequantize_row_q4_K_cuda(const void * vx, dst_t * y, const int64_t k, cudaStream_t stream) {
     const int nb = k / QK_K;
+    GGML_CUDA_DEQUANT_LDS_LAUNCH(dequantize_q4_K, 32)
     dequantize_block_q4_K<<<nb, 32, 0, stream>>>(vx, y);
 }
 
@@ -322,30 +369,35 @@ static void dequantize_row_q6_K_cuda(const void * vx, dst_t * y, const int64_t k
 template<typename dst_t>
 static void dequantize_row_iq2_xxs_cuda(const void * vx, dst_t * y, const int64_t k, cudaStream_t stream) {
     const int nb = k / QK_K;
+    GGML_CUDA_DEQUANT_LDS_LAUNCH(dequantize_iq2_xxs, 32)
     dequantize_block_iq2_xxs<<<nb, 32, 0, stream>>>(vx, y);
 }
 
 template<typename dst_t>
 static void dequantize_row_iq2_xs_cuda(const void * vx, dst_t * y, const int64_t k, cudaStream_t stream) {
     const int nb = k / QK_K;
+    GGML_CUDA_DEQUANT_LDS_LAUNCH(dequantize_iq2_xs, 32)
     dequantize_block_iq2_xs<<<nb, 32, 0, stream>>>(vx, y);
 }
 
 template<typename dst_t>
 static void dequantize_row_iq2_s_cuda(const void * vx, dst_t * y, const int64_t k, cudaStream_t stream) {
     const int nb = k / QK_K;
+    GGML_CUDA_DEQUANT_LDS_LAUNCH(dequantize_iq2_s, 32)
     dequantize_block_iq2_s<<<nb, 32, 0, stream>>>(vx, y);
 }
 
 template<typename dst_t>
 static void dequantize_row_iq3_xxs_cuda(const void * vx, dst_t * y, const int64_t k, cudaStream_t stream) {
     const int nb = k / QK_K;
+    GGML_CUDA_DEQUANT_LDS_LAUNCH(dequantize_iq3_xxs, 32)
     dequantize_block_iq3_xxs<<<nb, 32, 0, stream>>>(vx, y);
 }
 
 template<typename dst_t>
 static void dequantize_row_iq3_s_cuda(const void * vx, dst_t * y, const int64_t k, cudaStream_t stream) {
     const int nb = k / QK_K;
+    GGML_CUDA_DEQUANT_LDS_LAUNCH(dequantize_iq3_s, 32)
     dequantize_block_iq3_s<<<nb, 32, 0, stream>>>(vx, y);
 }
 
@@ -371,6 +423,7 @@ static void dequantize_row_iq1_m_cuda(const void * vx, dst_t * y, const int64_t 
 template<typename dst_t>
 static void dequantize_row_iq4_xs_cuda(const void * vx, dst_t * y, const int64_t k, cudaStream_t stream) {
     const int nb = (k + QK_K - 1) / QK_K;
+    GGML_CUDA_DEQUANT_LDS_LAUNCH(dequantize_iq4_xs, 32)
     dequantize_block_iq4_xs<<<nb, 32, 0, stream>>>(vx, y);
 }
 
