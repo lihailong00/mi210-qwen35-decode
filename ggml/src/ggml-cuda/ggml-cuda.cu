@@ -757,6 +757,10 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
     for (int i = 0; i < GGML_CUDA_MAX_DEVICES; ++i) {
         for (int j = 0; j < GGML_CUDA_MAX_STREAMS; ++j) {
             if (streams[i][j] != nullptr) {
+                // per-stream caches keyed by the stream handle: free them before the handle can be reused
+                ggml_cuda_set_device(i);
+                ggml_cuda_mmvq_cache_release(i, streams[i][j]);
+                ggml_cuda_mmvq_fused_release(i, streams[i][j]);
                 CUDA_CHECK(cudaStreamDestroy(streams[i][j]));
             }
             if (cublas_handles[i][j] != nullptr) {

@@ -15,6 +15,10 @@ bool ggml_cuda_mmvq_fused_preq(ggml_backend_cuda_context & ctx, const ggml_tenso
 void ggml_cuda_mmvq_cache_reset(ggml_backend_cuda_context & ctx);
 // producer API (mmvq.cu): get the cache buffer for the q8_1 blocks + int sums of the single-row activation t
 bool ggml_cuda_mmvq_cache_produce(ggml_backend_cuda_context & ctx, const ggml_tensor * t, block_q8_1 ** q8, int ** sums);
+// free the per-stream state of the activation cache (mmvq.cu) and of the cooperative quantizer (mmvq-fused.cu) of a
+// stream that is about to be destroyed (call from the backend context destructor; handles can be recycled)
+void ggml_cuda_mmvq_cache_release(int device, cudaStream_t stream);
+void ggml_cuda_mmvq_fused_release(int device, cudaStream_t stream);
 
 // q8-producing variants of activation kernels (q8-producers.cu); return false if not applicable (nothing launched)
 bool ggml_cuda_rms_norm_mul_q8(ggml_backend_cuda_context & ctx, const ggml_tensor * rms_norm, ggml_tensor * mul_node);
