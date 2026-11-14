@@ -124,13 +124,13 @@ bool ggml_cuda_mmvq_iq3(ggml_backend_cuda_context & ctx, const ggml_tensor * src
     using namespace iq3g;
     if (!gate) {
         ok = us ? iq3g_launch<iq3s_t,   none_t, 2, 0>(wu, nullptr, src1_q8_1, d, K, N, residual, ncu, stream)
-                : iq3g_launch<iq3xxs_t, none_t, 4, 0>(wu, nullptr, src1_q8_1, d, K, N, residual, ncu, stream);
+                : iq3g_launch<iq3xxs_t, none_t, 2, 0>(wu, nullptr, src1_q8_1, d, K, N, residual, ncu, stream);
     } else {
         // TA = gate (weights wg), TB = up (weights wu): dst = silu(gate.y) * (up.y)
         const bool gs = gate->type == GGML_TYPE_IQ3_S;
         if (gs && us)        ok = iq3g_launch<iq3s_t,   iq3s_t,   2, 0>(wg, wu, src1_q8_1, d, K, N, nullptr, ncu, stream);
         else if (gs && !us)  ok = iq3g_launch<iq3s_t,   iq3xxs_t, 2, 0>(wg, wu, src1_q8_1, d, K, N, nullptr, ncu, stream);
-        else if (!gs && us)  ok = iq3g_launch<iq3xxs_t, iq3s_t,   2, 1>(wg, wu, src1_q8_1, d, K, N, nullptr, ncu, stream);
+        else if (!gs && us)  ok = iq3g_launch<iq3xxs_t, iq3s_t,   2, 0>(wg, wu, src1_q8_1, d, K, N, nullptr, ncu, stream);
         else                 ok = iq3g_launch<iq3xxs_t, iq3xxs_t, 2, 0>(wg, wu, src1_q8_1, d, K, N, nullptr, ncu, stream);
     }
     if (ok) {
