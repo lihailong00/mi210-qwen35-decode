@@ -29,6 +29,7 @@
 #include "ggml-cuda/diagmask.cuh"
 #include "ggml-cuda/diag.cuh"
 #include "ggml-cuda/fattn.cuh"
+#include "ggml-cuda/fattn-dec.cuh"
 #include "ggml-cuda/fwht.cuh"
 #include "ggml-cuda/getrows.cuh"
 #include "ggml-cuda/im2col.cuh"
@@ -4646,6 +4647,11 @@ static int ggml_cuda_try_fattn_gate_fusion(ggml_backend_cuda_context * cuda_ctx,
         ggml_node_get_use_count(cgraph, i) != 1 || ggml_node_get_use_count(cgraph, iu) != 1 ||
         (un->flags & GGML_TENSOR_FLAG_OUTPUT)) {
         return 0;
+    }
+
+    // short KV: one-launch split-KV decode with the gate + q8_1 epilogue (fattn-dec.cu)
+    if (ggml_cuda_fattn_dec_gate(*cuda_ctx, fa, (const float *) gate->data, mul)) {
+        return im - i;
     }
 
     ggml_cuda_fattn_gate_epilogue ep;
