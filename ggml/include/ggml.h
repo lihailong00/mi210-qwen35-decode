@@ -585,8 +585,6 @@ extern "C" {
         GGML_OP_RWKV_WKV7,
         GGML_OP_SOLVE_TRI,
         GGML_OP_GATED_DELTA_NET,
-        GGML_OP_GDN_DECODE_PREP,
-        GGML_OP_GDN_DECODE_OUT,
         GGML_OP_LIGHTNING_INDEXER,
         GGML_OP_DSV4_HC_COMB,
         GGML_OP_DSV4_HC_PRE,
@@ -607,6 +605,9 @@ extern "C" {
         GGML_OP_OPT_STEP_SGD,
 
         GGML_OP_GLU,
+
+        GGML_OP_GDN_DECODE_PREP,
+        GGML_OP_GDN_DECODE_OUT,
 
         GGML_OP_COUNT,
     };

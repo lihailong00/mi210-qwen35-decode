@@ -1095,8 +1095,6 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "RWKV_WKV7",
     "SOLVE_TRI",
     "GATED_DELTA_NET",
-    "GDN_DECODE_PREP",
-    "GDN_DECODE_OUT",
     "LIGHTNING_INDEXER",
     "DSV4_HC_COMB",
     "DSV4_HC_PRE",
@@ -1117,6 +1115,9 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "OPT_STEP_SGD",
 
     "GLU",
+
+    "GDN_DECODE_PREP",
+    "GDN_DECODE_OUT",
 };
 
 static_assert(GGML_OP_COUNT == 104, "GGML_OP_COUNT != 104");
@@ -1213,8 +1214,6 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "rwkv_wkv7(r, w, k, v, a, b, s)",
     "A X = B, A triangular, solve X",
     "gated_delta_net(q, k, v, g, beta, s)",
-    "gdn_decode_prep(qkv, x, wa, wb, dt, a, cw, cs)",
-    "gdn_decode_out(prep, qkv, cw, cs, z, nw, ss)",
     "lightning_indexer(q, k, weights, mask)",
     "dsv4_hc_comb(mixes, scale, base)",
     "dsv4_hc_pre(x, weights)",
@@ -1235,6 +1234,9 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "sgd(x)",
 
     "glu(x)",
+
+    "gdn_decode_prep(qkv, x, wa, wb, dt, a, cw, cs)",
+    "gdn_decode_out(prep, qkv, cw, cs, z, nw, ss)",
 };
 
 static_assert(GGML_OP_COUNT == 104, "GGML_OP_COUNT != 104");
