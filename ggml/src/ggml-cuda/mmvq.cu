@@ -12,6 +12,8 @@
 
 #include <cstdint>
 #include <type_traits>
+#include <map>
+#include <mutex>
 
 // only enabled on DGX Spark, where it is a gain on every type below. On the higher-bandwidth parts the kernel
 // has little exposed latency left to hide and the extra requests cost more than they save.
@@ -1542,24 +1544,121 @@ static __global__ void codex_iq3_packed_gemv(const uint32_t * up, const codex_iq
 template<bool xxs>
 static void codex_iq3_launch_packed(ggml_backend_cuda_context & ctx,
         const uint32_t * up, const uint32_t * gate, const block_q8_1 * q8, float * dst,
-        const float * residual, size_t count, int groups, int rows, cudaStream_t stream) {
-    ggml_cuda_pool_alloc<int> sums(ctx.pool());
+        const float * residual, size_t count, int groups, int rows, cudaStream_t stream, const int * sums_pre = nullptr) {
+    ggml_cuda_pool_alloc<int> sums_alloc(ctx.pool());
+    const int * sums = sums_pre;
     if constexpr (!xxs) {
-        sums.alloc(groups);
-        codex_iq3_sum_q8<<<(groups+127)/128,128,0,stream>>>(q8,sums.get(),groups);
+        if (!sums) {
+            sums_alloc.alloc(groups);
+            codex_iq3_sum_q8<<<(groups+127)/128,128,0,stream>>>(q8,sums_alloc.get(),groups);
+            sums = sums_alloc.get();
+        }
     }
     const auto * up_meta = reinterpret_cast<const codex_iq3_meta *>(up+count*32);
     if (gate) {
         const auto * gate_meta = reinterpret_cast<const codex_iq3_meta *>(gate+count*32);
         codex_iq3_packed_gemv<true,false,xxs><<<rows,128,0,stream>>>(
-                up,up_meta,gate,gate_meta,q8,sums.get(),dst,groups,nullptr);
+                up,up_meta,gate,gate_meta,q8,sums,dst,groups,nullptr);
     } else if (residual) {
         codex_iq3_packed_gemv<false,true,xxs><<<rows,128,0,stream>>>(
-                up,up_meta,nullptr,nullptr,q8,sums.get(),dst,groups,residual);
+                up,up_meta,nullptr,nullptr,q8,sums,dst,groups,residual);
     } else {
         codex_iq3_packed_gemv<false,false,xxs><<<rows,128,0,stream>>>(
-                up,up_meta,nullptr,nullptr,q8,sums.get(),dst,groups,nullptr);
+                up,up_meta,nullptr,nullptr,q8,sums,dst,groups,nullptr);
     }
+}
+
+// Per-stream cache of the q8_1-quantized single-token activation (+ per-block int sums for the packed IQ3 path).
+// Consecutive GEMVs of one graph evaluation that consume the same src1 tensor (qkv/z, q/k/v, gate/up) quantize it once.
+// Invalidated at the start of every graph evaluation (ggml_cuda_mmvq_cache_reset). The buffer is dedicated (not from
+// the pool), so a cached activation cannot be overwritten by intermediate ops.
+static __global__ void quantize_q8_1_sums(const float * __restrict__ x, block_q8_1 * __restrict__ y, int * __restrict__ sums,
+        const int64_t ne10, const int64_t ne10_padded) {
+    const int64_t i = (int64_t) blockIdx.x*blockDim.x + threadIdx.x;
+    if (i >= ne10_padded) {
+        return;
+    }
+    const float xi = i < ne10 ? x[i] : 0.0f;
+    float amax = fabsf(xi);
+    amax = warp_reduce_max<QK8_1>(amax);
+    const float  d = amax / 127.0f;
+    const int8_t q = amax == 0.0f ? 0 : roundf(xi / d);
+    const int sum = warp_reduce_sum<QK8_1>((int) q);
+    y[i/QK8_1].qs[i%QK8_1] = q;
+    if (i % QK8_1 == 0) {
+        y[i/QK8_1].ds = make_half2(d, d * sum);
+        sums[i/QK8_1] = sum;
+    }
+}
+
+struct mmvq_q8_cache_entry {
+    char              * buf  = nullptr;
+    size_t              size = 0;
+    const ggml_tensor * src  = nullptr;
+    const void        * data = nullptr;
+    int64_t             ne10 = 0;
+    bool                valid = false;
+};
+static std::mutex mmvq_q8_cache_mutex;
+static std::map<std::pair<int, cudaStream_t>, mmvq_q8_cache_entry> mmvq_q8_caches;
+
+static bool mmvq_q8_cache_disabled() {
+    static const bool disabled = [] {
+        const char * v = getenv("GGML_MMVQ_Q8_CACHE");
+        return v != nullptr && v[0] == '0';
+    }();
+    return disabled;
+}
+
+void ggml_cuda_mmvq_cache_reset(ggml_backend_cuda_context & ctx) {
+    std::lock_guard<std::mutex> lock(mmvq_q8_cache_mutex);
+    for (auto & e : mmvq_q8_caches) {
+        if (e.first.first == ctx.device) {
+            e.second.valid = false;
+        }
+    }
+}
+
+// returns false if the cache cannot be used (then the caller quantizes into a pool buffer)
+static bool mmvq_q8_cache_get(ggml_backend_cuda_context & ctx, const ggml_tensor * src1, const int64_t ne10, const int64_t ne10_padded,
+        const block_q8_1 ** q8, const int ** sums) {
+    if (mmvq_q8_cache_disabled()) {
+        return false;
+    }
+    cudaStream_t stream = ctx.stream();
+    const size_t q8_bytes = ne10_padded/QK8_1*sizeof(block_q8_1);
+    const size_t need = q8_bytes + ne10_padded/QK8_1*sizeof(int) + 256;
+    std::lock_guard<std::mutex> lock(mmvq_q8_cache_mutex);
+    mmvq_q8_cache_entry & e = mmvq_q8_caches[{ctx.device, stream}];
+    if (e.size < need) {
+        hipStreamCaptureStatus status;
+        CUDA_CHECK(hipStreamIsCapturing(stream, &status));
+        if (status != hipStreamCaptureStatusNone) {
+            return false;
+        }
+        if (e.buf) {
+            CUDA_CHECK(cudaStreamSynchronize(stream));
+            CUDA_CHECK(cudaFree(e.buf));
+        }
+        e.size = std::max(need, (size_t) 1 << 20);
+        CUDA_CHECK(cudaMalloc(&e.buf, e.size));
+        e.valid = false;
+    }
+    const size_t sums_off = (q8_bytes + 255) & ~(size_t) 255;
+    *q8   = (const block_q8_1 *) e.buf;
+    *sums = (const int *) (e.buf + sums_off);
+    if (e.valid && e.src == src1 && e.data == src1->data && e.ne10 == ne10) {
+        return true;
+    }
+    const int64_t nblk = (ne10_padded + CUDA_QUANTIZE_BLOCK_SIZE - 1) / CUDA_QUANTIZE_BLOCK_SIZE;
+    quantize_q8_1_sums<<<nblk, CUDA_QUANTIZE_BLOCK_SIZE, 0, stream>>>((const float *) src1->data, (block_q8_1 *) e.buf,
+            (int *) (e.buf + sums_off), ne10, ne10_padded);
+    CUDA_CHECK(cudaGetLastError());
+    e.src   = src1;
+    e.data  = src1->data;
+    e.ne10  = ne10;
+    e.valid = true;
+    return true;
 }
 
 #endif
@@ -1667,17 +1766,28 @@ void ggml_cuda_mul_mat_vec_q(
     }
 
     const int64_t ne10_padded = GGML_PAD(ne10, MATRIX_ROW_PADDING);
-    ggml_cuda_pool_alloc<char> src1_q8_1(ctx.pool(), ne13*ne12 * ne11*ne10_padded * sizeof(block_q8_1)/QK8_1);
-    {
+    ggml_cuda_pool_alloc<char> src1_q8_1_alloc(ctx.pool());
+    const block_q8_1 * src1_q8_1_ptr = nullptr;
+    const int * src1_sums = nullptr;
+#if defined(GGML_USE_HIP)
+    const bool use_q8_cache = !ids && ne11 == 1 && ne12 == 1 && ne13 == 1 && ggml_is_contiguous(src1) &&
+            mmvq_q8_cache_get(ctx, src1, ne10, ne10_padded, &src1_q8_1_ptr, &src1_sums);
+#else
+    const bool use_q8_cache = false;
+#endif
+    if (!use_q8_cache) {
+        src1_q8_1_alloc.alloc(ne13*ne12 * ne11*ne10_padded * sizeof(block_q8_1)/QK8_1);
         const int64_t s11 = src1->nb[1] / ts_src1;
         const int64_t s12 = src1->nb[2] / ts_src1;
         const int64_t s13 = src1->nb[3] / ts_src1;
-        quantize_row_q8_1_cuda(src1_d, nullptr, src1_q8_1.get(), src0->type, ne10, s11, s12, s13, ne10_padded, ne11, ne12, ne13, stream);
+        quantize_row_q8_1_cuda(src1_d, nullptr, src1_q8_1_alloc.get(), src0->type, ne10, s11, s12, s13, ne10_padded, ne11, ne12, ne13, stream);
+        src1_q8_1_ptr = (const block_q8_1 *) src1_q8_1_alloc.get();
+        src1_sums = nullptr;
     }
 
 #if defined(GGML_USE_HIP)
     if (!ids && ne11 == 1 && ne12 == 1 && ne13 == 1 &&
-            ggml_cuda_mmvq_lowbit(ctx, src0, (const block_q8_1 *) src1_q8_1.get(), dst, fusion)) {
+            ggml_cuda_mmvq_lowbit(ctx, src0, src1_q8_1_ptr, dst, fusion)) {
         return;
     }
 #endif
@@ -1700,12 +1810,12 @@ void ggml_cuda_mul_mat_vec_q(
         if (up && (!swiglu || gate)) {
             const size_t count = ggml_nelements(src0)/256;
             const int groups = ne00/32;
-            const auto * q8 = reinterpret_cast<const block_q8_1 *>(src1_q8_1.get());
+            const auto * q8 = src1_q8_1_ptr;
             const auto * residual = add_residual ? static_cast<const float *>(fusion->x_bias->data) : nullptr;
             if (src0->type == GGML_TYPE_IQ3_XXS) {
                 codex_iq3_launch_packed<true>(ctx,up,gate,q8,dst_d,residual,count,groups,ne01,stream);
             } else {
-                codex_iq3_launch_packed<false>(ctx,up,gate,q8,dst_d,residual,count,groups,ne01,stream);
+                codex_iq3_launch_packed<false>(ctx,up,gate,q8,dst_d,residual,count,groups,ne01,stream,src1_sums);
             }
             CUDA_CHECK(hipGetLastError());
             return;
@@ -1736,7 +1846,7 @@ void ggml_cuda_mul_mat_vec_q(
     const int64_t ids_stride = ids ? ids->nb[1] / ggml_type_size(ids->type) : 0;
 
     mul_mat_vec_q_switch_type(
-        src0->data, src0->type, src1_q8_1.get(), ids_d, fusion_local, dst_d, ne00,
+        src0->data, src0->type, src1_q8_1_ptr, ids_d, fusion_local, dst_d, ne00,
         ne01,              ncols_dst,     s01, stride_col_y,     stride_col_dst,
         ne02, nchannels_y, nchannels_dst, s02, stride_channel_y, stride_channel_dst,
         ne03,              ne3,           s03, s13,              s3,               ids_stride, stream);
