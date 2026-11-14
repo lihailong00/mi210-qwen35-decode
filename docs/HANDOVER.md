@@ -15,7 +15,7 @@
 | decode tg128，上下文 0 | 45.63 token/s | 80.33 token/s | +76.0% |
 | decode tg128，上下文 8192 | 44.23 token/s | 74.57 token/s | +68.6% |
 | decode tg128，上下文 32768 | 40.65 token/s | 64.43 token/s | +58.5% |
-| prefill pp8192 | 1220 token/s | 1245 token/s | +2%（未退化） |
+| prefill pp8192 | 1220 token/s | 1578 token/s | +29%（第十三节的 GEMM 选核修正；只做 decode 优化时为 1245） |
 | llama-server 单请求（-np 1） | 45.6 token/s | 79.1 token/s | +73% |
 | 每 token kernel 启动数 | 1933 | 601 | −69% |
 | 显存峰值（llama-bench） | 24.1 GB | 28.1–31.9 GB | +4–8 GB |
@@ -454,6 +454,68 @@ docker exec mi210-opt bash -lc "PAR=12 /lab/build-wt.sh /lab/wt-mybranch /lab/wt
 - 服务器上还有其他业务容器：不要按镜像名批量 `docker stop`（曾因此误停 mi210-opt），测试容器请用固定名字。
 - GPU 与其他作业共享时噪声约 ±1%：只信交替进行的 A/B。
 - `llama-completion` 不加 `-c` 会按模型最大上下文 262144 分配 KV，显存峰值会到 40 GB，属正常。
+
+## 十三、追加：本机性能上限与 prefill GEMM 修正
+
+### 1. 硬件峰值（实测）
+
+| 项目 | 实测 | 说明 |
+|---|---|---|
+| HBM 读带宽（单 kernel） | 1446 GB/s（48 MB）、1433（256 MB）、1399（1 GB）、1361（4 GB） | 标称 1638 GB/s 的约 88% |
+| MFMA FP16→FP32 | 170.9 TFLOPS | 循环 kernel；1700 MHz 下标称 181 |
+| MFMA INT8→INT32 | 171.4 TOPS | gfx90a 上与 FP16 同速，INT8 没有算力优势 |
+| prefill 时的频率 | 1565–1700 MHz | 功耗上限 300 W |
+
+### 2. decode 上限
+
+每 token 读取 11.35 GB 权重（不含 token_embd 和 MTP 层），另有 0.30 GB DeltaNet 状态读写（48 层 × 3.15 MB f32，读一次写一次）。KV cache 每个上下文位置 64 KB。
+
+| 上限 | ms/token | token/s |
+|---|---|---|
+| 物理上限：全部字节以 1446 GB/s 读取，上下文 0 | 8.06 | 124（只算权重为 127） |
+| 纯读取，每个 ≥1 MB 权重一次 launch（401 个），HIP graph，无计算 | 8.87 | 112.8 |
+| 同上，加状态读写 | 9.25 | 108 |
+| 同上，每个张量一次 launch（含 norm，共 850 个） | 9.39 | 106.5 |
+| 当前版本 | 12.45 | 80.3 |
+
+上下文 8192 时物理上限约 119 token/s（当前 74.6），32768 时约 105（当前 64.4）。只要每个权重张量单独 launch，约 108 就是实际天花板；要超过它，必须让读取跨越张量边界连续进行（持久 kernel 或融合 kernel）。
+
+### 3. prefill 上限
+
+每 token 计算量：GEMM 48.65 GFLOP（按层形状精确计算），注意力约 1.61 GFLOP（平均因果上下文 4096），DeltaNet 约 0.2 GFLOP，合计约 50.5 GFLOP。
+
+| 上限 | token/s |
+|---|---|
+| 物理上限：50.5 GFLOP 以 171 TFLOPS 计算 | 约 3390 |
+| GEMM 全部用最优库 kernel（hipBLASLt 平均约 150 TFLOPS），其余开销为零 | 约 3000 |
+| 修正后的当前版本（pp8192） | 1578 |
+
+修正前，rocprofv3 测得每 token 0.804 ms：GEMM 0.577 ms（权重先反量化为 f16，再走 rocBLAS，平均只有 84 TFLOPS），非 GEMM 0.227 ms（逐 token 递推的 DeltaNet kernel 0.065，flash attention 0.047、只有 34 TFLOPS，反量化 0.031，其余小算子约 0.08）。
+
+### 4. prefill GEMM 修正（`ggml-cuda.cu` 的 `ggml_cuda_init`）
+
+- **问题**：rocBLAS 自带的 Tensile 选核启发式在 gfx90a 上对 ffn_down 形状（m=5120、n=4096、k=17408，f16 输入、f32 输出）选了 64×64 宏块 kernel，只有 47.5 TFLOPS，而 rocBLAS 自己的 227 个候选里最好的能到 148。这一个形状就占了修正前 prefill GPU 时间的约 30%。其他形状也慢 10–25%。
+- **修正**：设 `ROCBLAS_USE_HIPBLASLT=1` 后，rocBLAS 把 GEMM 交给 hipBLASLt，其默认选核在所有 prefill 形状上达到 140–160 TFLOPS；每个 4096-token ubatch 的 GEMM 时间从 2197 ms 降到 1364 ms，比 rocBLAS 逐形状调优的最好结果（1414 ms）还快。
+- **实现**：在 `ggml_cuda_init` 中，如果所有设备都是 CDNA2、用户没有设置这个环境变量，就设置 `ROCBLAS_USE_HIPBLASLT=1`。rocBLAS 在第一次创建 handle 时读取它，而 handle 是之后才按需创建的。要恢复原来的 rocBLAS kernel，设 `ROCBLAS_USE_HIPBLASLT=0`。
+- **结果**（A→B→B→A，ub 4096）：
+
+  | 测试 | 修正前 | 修正后 | 变化 |
+  |---|---|---|---|
+  | pp512 | 918 | 1000 | +9% |
+  | pp2048 | 1135 | 1538 | +36% |
+  | pp8192 | 1248 | 1578 | +26% |
+  | pp2048，上下文 8192 | 988 | 1335 | +35% |
+  | pp8192，上下文 8192 | 1083 | 1364 | +26% |
+  | decode（上下文 0 / 8192） | 79.5 / 74.0 | 79.8 / 74.2 | 不变 |
+
+- **正确性**：prefill 路径（`-c 512 -b 2048 -ub 2048`，8 块）与原 rocBLAS kernel 相比，平均 KLD 0.000002，top-1 100%。这与只改 ubatch 大小、仍用原 kernel 时的差异相同（0.000002，top-1 99.95%）。
+
+### 5. 剩余 prefill 方向
+
+- 非 GEMM 部分：DeltaNet 改为分块（chunked）算法，flash attention 提高 MFMA 利用率，反量化与小算子融合。估计可再到约 2400 token/s。
+- GEMM 部分：直接对量化权重做 MFMA（避免反量化写回），或逐形状为 hipBLASLt 选最优解（再快约 5%）。
+
+微基准源码在 `mi210-tools/peak-bench/`：`peak_bench.hip`（带宽、MFMA、方阵 GEMM）、`bound_bench.hip`（逐张量读取 graph、实际形状 GEMM 全候选扫描）、`gemm_sweep.hip`（不同 token 数下的选核对比）。编译：`hipcc -O3 --offload-arch=gfx90a -std=c++17 <file> -lrocblas`。
 
 ## 附录：开关、文件、分支
 
