@@ -7,12 +7,15 @@
 // GGML_MMVQ_IQ3=0 disables this path (then the retained codex packed path / stock mmvq is used as before);
 // GGML_MMVQ_IQ3_MULTI=0 disables only the multi-job grouping, GGML_MMVQ_IQ3_PF=0 selects the previous prologue,
 // GGML_MMVQ_IQ3_SM=0 the previous (unit-major) weight layout.
+// Mixed pairs (r4-mixgroup, ggml_cuda_mmvq_mix): an IQ3 GEMV and an IQ4_XS/Q4_K GEMV on the same activation in one
+// launch (mixgemv.cuh); GGML_MMVQ_MIX=0 disables.
 #include "common.cuh"
 #include "iq3-repack.cuh"
 #include "mmvq-fused-host.cuh"
 
 #if defined(GGML_USE_HIP)
 #include "iq3gemv.cuh"
+#include "mixgemv.cuh"
 #include <cstdlib>
 #include <climits>
 
@@ -286,6 +289,133 @@ bool ggml_cuda_mmvq_iq3_multi(ggml_backend_cuda_context & ctx, const ggml_tensor
     CUDA_CHECK(cudaGetLastError());
     return true;
 }
+
+// ------------------------------------------------------------------------------------------------ mixed pairs (r4-mixgroup)
+// GGML_MMVQ_MIX: 0 = off (the members run one by one as before), 1 (default) = IQ3 job first, 2 = IQ4 job first
+static int mixg_mode() {
+    static const int mode = [] {
+        const char * v = getenv("GGML_MMVQ_MIX");
+        return v == nullptr ? 1 : atoi(v);
+    }();
+    return mode;
+}
+static bool mixg_is_iq3(const ggml_type t) { return t == GGML_TYPE_IQ3_S  || t == GGML_TYPE_IQ3_XXS; }
+static bool mixg_is_iq4(const ggml_type t) { return t == GGML_TYPE_IQ4_XS || t == GGML_TYPE_Q4_K; }
+
+bool ggml_cuda_mmvq_mix_member(const ggml_tensor * mm) {
+    if (mixg_mode() == 0 || !iq3g_enabled() || mm->op != GGML_OP_MUL_MAT) {
+        return false;
+    }
+    const ggml_tensor * w = mm->src[0];
+    const ggml_tensor * x = mm->src[1];
+    const bool i3 = mixg_is_iq3(w->type), i4 = mixg_is_iq4(w->type);
+    if ((!i3 && !i4) || x->type != GGML_TYPE_F32 || mm->type != GGML_TYPE_F32 || !ggml_is_contiguous(x) ||
+            x->ne[1] != 1 || x->ne[2] != 1 || x->ne[3] != 1 || x->ne[0] != w->ne[0] || !ggml_is_contiguous(mm) ||
+            ggml_nelements(mm) != w->ne[1]) {
+        return false;
+    }
+    const int64_t K = w->ne[0], N = w->ne[1];
+    // K: step-major IQ3 layout (K/128 % 8), exact IQ4 steps (K/32 resp. K/64 % 16), one q8_1 block per prologue thread
+    if (K % 1024 != 0 || K > 8192 || N % mixg::RG != 0 || N > (1 << 24)) {
+        return false;
+    }
+    if (i3) {
+        return iq3g_weight_ok(w);
+    }
+    // the 1024-row GEMVs stay with their own paths (stock mmvq / iq4k small-N groups)
+    return N >= 2048 && !w->view_src && ggml_is_matrix(w) && ggml_is_contiguous(w) && w->buffer &&
+        ggml_backend_buffer_get_usage(w->buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS &&
+        GGML_CUDA_CC_IS_CDNA2(ggml_cuda_info().devices[ggml_cuda_get_device()].cc);
+}
+
+// split mode (GGML_MMVQ_MIX=3): IQ3 waves per workgroup ~ the IQ3 job's share of the estimated time (bytes of the
+// copies / typical efficiency: IQ3 ~0.8, IQ4 ~0.92 of the streaming rate); GGML_MMVQ_MIX_NA=n forces n (1..15)
+static int mixg_na(const ggml_tensor * w3, const ggml_tensor * w4) {
+    static const int force = [] { const char * v = getenv("GGML_MMVQ_MIX_NA"); return v ? atoi(v) : 0; }();
+    if (force > 0 && force < mixg::NW) {
+        return force;
+    }
+    if (mixg_mode() != 3) {
+        return 0;
+    }
+    const double b3 = (double) w3->ne[1]*(w3->type == GGML_TYPE_IQ3_S ? 112.0 : 98.0)/0.80;
+    const double b4 = (double) w4->ne[1]*(w4->type == GGML_TYPE_IQ4_XS ? 136.0 : 144.0)/0.92;
+    const int na = (int) (mixg::NW*b3/(b3 + b4) + 0.5);
+    return std::min(mixg::NW - 1, std::max(1, na));
+}
+template <class T3, class T4>
+static size_t mixg_lds(const int K, const int N4, const int nwv4) {
+    return mixg::lds_bytes<T3, T4>(K, N4, nwv4);
+}
+template <class T3, class T4>
+static void mixg_launch(const bool first3, const int na, const uint8_t * w3, float * d3, const int N3, const iq4k::soa & s4, float * d4,
+        const int N4, const block_q8_1 * y, const int K, const int ncu, hipStream_t stream) {
+    const int nwv = ncu*mixg::NW;
+    const size_t lds = mixg::lds_bytes<T3, T4>(K, N4, na > 0 ? (mixg::NW - na)*ncu : nwv);
+    const int y4off = (int) mixg::y4_offset<T3, T4>(K);
+    const int rot = (first3 ? N3/mixg::RG : N4/mixg::RG) % nwv;
+    if (first3) {
+        mixg::gemv_pair<T3, T4, IQ3G_SM, true ><<<ncu, dim3(64, mixg::NW), lds, stream>>>(w3, d3, N3, s4, d4, N4, y, K, y4off, rot, na);
+    } else {
+        mixg::gemv_pair<T3, T4, IQ3G_SM, false><<<ncu, dim3(64, mixg::NW), lds, stream>>>(w3, d3, N3, s4, d4, N4, y, K, y4off, rot, na);
+    }
+}
+
+bool ggml_cuda_mmvq_mix(ggml_backend_cuda_context & ctx, ggml_tensor * const * mm, const int n) {
+    if (n != 2 || !ggml_cuda_mmvq_mix_member(mm[0]) || !ggml_cuda_mmvq_mix_member(mm[1]) || mm[0]->src[1] != mm[1]->src[1]) {
+        return false;
+    }
+    const bool a3 = mixg_is_iq3(mm[0]->src[0]->type), b3 = mixg_is_iq3(mm[1]->src[0]->type);
+    if (a3 == b3) {
+        return false;   // exactly one IQ3 job and one IQ4_XS/Q4_K job
+    }
+    ggml_tensor * m3 = a3 ? mm[0] : mm[1];
+    ggml_tensor * m4 = a3 ? mm[1] : mm[0];
+    const ggml_tensor * w3 = m3->src[0];
+    const ggml_tensor * w4 = m4->src[0];
+    const int K = (int) w3->ne[0];
+    if (w4->ne[0] != K || !iq3g_sm(K)) {
+        return false;
+    }
+    const int N3 = (int) w3->ne[1], N4 = (int) w4->ne[1];
+    // experiment knob GGML_MMVQ_MIX_CLASS: 1 = only pairs of different N (qkv + z), 2 = only equal N (gate + up), 3 = both
+    static const int cls = [] { const char * v = getenv("GGML_MMVQ_MIX_CLASS"); return v ? atoi(v) : 3; }();
+    if (!(cls & (N3 == N4 ? 2 : 1))) {
+        return false;
+    }
+    const int device = ggml_cuda_get_device();
+    hipStream_t stream = ctx.stream();
+    const int ncu = ggml_cuda_info().devices[device].nsm;
+    const int nwv = ncu*mixg::NW;
+    const bool s3 = w3->type == GGML_TYPE_IQ3_S, x4 = w4->type == GGML_TYPE_IQ4_XS;
+    const int na = mixg_na(w3, w4);
+    const int nwv4 = na > 0 ? (mixg::NW - na)*ncu : nwv;
+    using namespace iq3g;
+    const size_t lds = s3 ? (x4 ? mixg_lds<iq3s_t,   iq4k::iq4xs_t>(K, N4, nwv4) : mixg_lds<iq3s_t,   iq4k::q4k_t>(K, N4, nwv4))
+                          : (x4 ? mixg_lds<iq3xxs_t, iq4k::iq4xs_t>(K, N4, nwv4) : mixg_lds<iq3xxs_t, iq4k::q4k_t>(K, N4, nwv4));
+    if (lds > 65536) {
+        return false;
+    }
+    const uint8_t * soa3 = iq3g_get_soa(w3, device, stream);                 // nullptr during graph capture if not created yet
+    const void    * soa4 = ggml_cuda_mmvq_iq4k_soa_il4(w4, device, stream);  // = the single launcher's copy at K <= 8192
+    if (!soa3 || !soa4) {
+        return false;
+    }
+    const block_q8_1 * q8 = nullptr;
+    if (!ggml_cuda_mmvq_q8_cached(ctx, m3->src[1], &q8)) {
+        return false;
+    }
+    const iq4k::soa s4 = iq4k::soa_make(w4->type, soa4, (size_t) N4*(K/QK_K));
+    const bool first3 = mixg_mode() != 2;
+    float * d3 = (float *) m3->data;
+    float * d4 = (float *) m4->data;
+    if (s3 && x4)       mixg_launch<iq3s_t,   iq4k::iq4xs_t>(first3, na, soa3, d3, N3, s4, d4, N4, q8, K, ncu, stream);
+    else if (s3)        mixg_launch<iq3s_t,   iq4k::q4k_t  >(first3, na, soa3, d3, N3, s4, d4, N4, q8, K, ncu, stream);
+    else if (x4)        mixg_launch<iq3xxs_t, iq4k::iq4xs_t>(first3, na, soa3, d3, N3, s4, d4, N4, q8, K, ncu, stream);
+    else                mixg_launch<iq3xxs_t, iq4k::q4k_t  >(first3, na, soa3, d3, N3, s4, d4, N4, q8, K, ncu, stream);
+    CUDA_CHECK(cudaGetLastError());
+    return true;
+}
 #else
 bool ggml_cuda_mmvq_iq3_fuse_mixed_ok(const ggml_tensor *, const ggml_tensor *) {
     return false;
@@ -297,6 +427,12 @@ bool ggml_cuda_mmvq_iq3_multi_ok(const ggml_tensor * const *, int) {
     return false;
 }
 bool ggml_cuda_mmvq_iq3_multi(ggml_backend_cuda_context &, const ggml_tensor * const *, ggml_tensor * const *, int, const block_q8_1 *) {
+    return false;
+}
+bool ggml_cuda_mmvq_mix_member(const ggml_tensor *) {
+    return false;
+}
+bool ggml_cuda_mmvq_mix(ggml_backend_cuda_context &, ggml_tensor * const *, int) {
     return false;
 }
 #endif

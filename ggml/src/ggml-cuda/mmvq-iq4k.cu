@@ -111,6 +111,16 @@ static void iq4k_repack_il4(const void * src, void * dst, const ggml_tensor * t,
     iq4k::repack_il(t->type, src, dst, t->ne[1], (int) t->ne[0], 4, stream);
 }
 
+// r4-mixgroup: the row-interleaved IL = 4 copy (= the single launcher's copy at K <= 8192 with L = 16) for the mixed
+// IQ3 + IQ4_XS/Q4_K pair kernel (mixgemv.cuh); nullptr if the path is disabled or the copy cannot be made (capture)
+const void * ggml_cuda_mmvq_iq4k_soa_il4(const ggml_tensor * w, int device, cudaStream_t stream) {
+    if (!iq4k_enabled() || (w->type != GGML_TYPE_IQ4_XS && w->type != GGML_TYPE_Q4_K)) {
+        return nullptr;
+    }
+    const int kind = 0x200 + 16*(int) w->type + 4;
+    return ggml_cuda_get_repacked(w, device, stream, kind, ggml_nbytes(w), iq4k_repack_il4);
+}
+
 bool ggml_cuda_mmvq_iq4k_group_ok(const ggml_tensor * mm) {
     if (!iq4k_group_enabled() || mm->op != GGML_OP_MUL_MAT) {
         return false;
@@ -270,6 +280,9 @@ bool ggml_cuda_mmvq_iq4k(ggml_backend_cuda_context & ctx, const ggml_tensor * sr
     return true;
 }
 #else
+const void * ggml_cuda_mmvq_iq4k_soa_il4(const ggml_tensor *, int, cudaStream_t) {
+    return nullptr;
+}
 bool ggml_cuda_mmvq_iq4k_group_ok(const ggml_tensor *) {
     return false;
 }

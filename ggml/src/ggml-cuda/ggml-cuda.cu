@@ -4934,6 +4934,67 @@ static int ggml_cuda_try_iq4k_group(ggml_backend_cuda_context * cuda_ctx, ggml_c
     }
     return last - i;
 }
+
+// r4-mixgroup: exactly two consecutive single-token MUL_MATs (only views/no-ops in between) that read the same activation,
+// one with IQ3_S/IQ3_XXS and one with IQ4_XS/Q4_K weights (linear-attention qkv + z, mixed-type FFN gate + up; the SwiGLU
+// of a gate/up pair stays a separate node) -> one launch (ggml_cuda_mmvq_mix). Runs before the iq4k / iq3 same-module
+// groupings and claims only these mixed pairs: no group if a third GEMV on the activation follows (q/k/v triples keep
+// their k+v grouping) or if the next node consumes a member with ADD/MUL (residual / scale fusions keep priority).
+static int ggml_cuda_try_mix_group(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, const int i) {
+    ggml_tensor * n0 = cgraph->nodes[i];
+    if (!ggml_cuda_mmvq_mix_member(n0)) {
+        return 0;
+    }
+    int j = i + 1;
+    while (j < cgraph->n_nodes && ggml_cuda_is_view_or_noop(cgraph->nodes[j])) {
+        j++;
+    }
+    if (j >= cgraph->n_nodes) {
+        return 0;
+    }
+    ggml_tensor * n1 = cgraph->nodes[j];
+    if ((n1->flags & GGML_TENSOR_FLAG_COMPUTE) == 0 || n1->op != GGML_OP_MUL_MAT || n1->src[1] != n0->src[1] ||
+            !ggml_cuda_mmvq_mix_member(n1)) {
+        return 0;
+    }
+    int nx = j + 1;
+    while (nx < cgraph->n_nodes && ggml_cuda_is_view_or_noop(cgraph->nodes[nx])) {
+        nx++;
+    }
+    if (nx < cgraph->n_nodes) {
+        const ggml_tensor * t = cgraph->nodes[nx];
+        if (t->op == GGML_OP_MUL_MAT && t->src[1] == n0->src[1]) {
+            return 0;
+        }
+        auto is_member = [&](const ggml_tensor * s) {
+            for (; s; s = s->view_src) {
+                if (s == n0 || s == n1) {
+                    return true;
+                }
+                if (s->op != GGML_OP_VIEW && s->op != GGML_OP_RESHAPE) {
+                    break;
+                }
+            }
+            return false;
+        };
+        const bool uses = (t->src[0] && is_member(t->src[0])) || (t->src[1] && is_member(t->src[1]));
+        if (uses && (t->op == GGML_OP_ADD || t->op == GGML_OP_MUL)) {
+            return 0;
+        }
+        if (uses && t->op == GGML_OP_GLU && t->src[0] && t->src[1] && ggml_cuda_should_fuse_mul_mat(t->src[1], t->src[0], t)) {
+            return 0;   // a fusable gate/up pair: the fused SwiGLU GEMV is better
+        }
+    }
+    const int outs[2] = { i, j };
+    if (!ggml_cuda_check_fusion_memory_ranges(cgraph, i, j - i + 1, outs, 2)) {
+        return 0;
+    }
+    ggml_tensor * mm[2] = { n0, n1 };
+    if (!ggml_cuda_mmvq_mix(*cuda_ctx, mm, 2)) {
+        return 0;
+    }
+    return j - i;
+}
 #endif
 
 static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
@@ -4977,7 +5038,11 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         }
     }
     if (node->op == GGML_OP_MUL_MAT && cuda_ctx->stream_context().concurrent_events.empty()) {
-        const int nodes_to_skip = ggml_cuda_try_iq4k_group(cuda_ctx, cgraph, i);
+        int nodes_to_skip = ggml_cuda_try_mix_group(cuda_ctx, cgraph, i);   // mixed IQ3 + IQ4_XS/Q4_K pairs first
+        if (nodes_to_skip > 0) {
+            return nodes_to_skip;
+        }
+        nodes_to_skip = ggml_cuda_try_iq4k_group(cuda_ctx, cgraph, i);
         if (nodes_to_skip > 0) {
             return nodes_to_skip;
         }
