@@ -1872,8 +1872,9 @@ void ggml_cuda_mul_mat_vec_q(
             fusion_local.x_bias = fusion->x_bias->data;
         }
         if (fusion->gate) {
+            // mixed IQ3_S/IQ3_XXS gate/up: only the iq3gemv SwiGLU kernel (mmvq-iq3.cu) handles it
             GGML_ASSERT((fusion->gate->type == src0->type && ggml_are_same_stride(fusion->gate, src0)) ||
-                        ggml_cuda_mmvq_iq3_fuse_mixed_ok(src0, fusion->gate));   // mixed IQ3_S/IQ3_XXS: mmvq-iq3.cu
+                        (!ids && fusion->glu_op == GGML_GLU_OP_SWIGLU && ggml_cuda_mmvq_iq3_fuse_mixed_ok(src0, fusion->gate)));
             fusion_local.gate = fusion->gate->data;
         }
         if (fusion->gate_bias) {
@@ -1946,6 +1947,8 @@ void ggml_cuda_mul_mat_vec_q(
         return;
     }
 #endif
+    // a mixed-type gate must never reach the kernels below: they decode the gate with src0's type and row stride
+    GGML_ASSERT(!fusion || !fusion->gate || fusion->gate->type == src0->type);
 
 #if defined(GGML_USE_HIP)
     if (!ids && ne11 == 1 && ne12 == 1 && ne13 == 1 &&

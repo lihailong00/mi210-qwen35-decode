@@ -2195,8 +2195,10 @@ static bool ggml_cuda_should_fuse_mul_mat(const ggml_tensor * ffn_up,
     if (ffn_up->src[0]->type != ffn_gate->src[0]->type || !ggml_are_same_shape(ffn_up->src[0], ffn_gate->src[0]) ||
         !ggml_are_same_stride(ffn_up->src[0], ffn_gate->src[0])) {
 #if defined(GGML_USE_HIP)
-        // IQ3_S + IQ3_XXS gate/up pairs: fused by the single-token iq3gemv kernel (mmvq-iq3.cu)
-        if (!(is_mul_mat && !has_bias && !has_scale && ggml_cuda_mmvq_iq3_fuse_mixed_ok(ffn_up->src[0], ffn_gate->src[0]))) {
+        // IQ3_S + IQ3_XXS gate/up pairs: fused by the single-token iq3gemv kernel (mmvq-iq3.cu), which implements only
+        // plain (non-swapped) SwiGLU; every other GLU op would reach the generic kernel with the wrong gate type
+        if (!(is_mul_mat && !has_bias && !has_scale && ggml_get_glu_op(glu) == GGML_GLU_OP_SWIGLU &&
+              ggml_get_op_params_i32(glu, 1) == 0 && ggml_cuda_mmvq_iq3_fuse_mixed_ok(ffn_up->src[0], ffn_gate->src[0]))) {
             return false;
         }
 #else
