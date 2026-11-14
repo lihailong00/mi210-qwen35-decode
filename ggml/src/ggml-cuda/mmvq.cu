@@ -1676,6 +1676,13 @@ void ggml_cuda_mul_mat_vec_q(
     }
 
 #if defined(GGML_USE_HIP)
+    if (!ids && ne11 == 1 && ne12 == 1 && ne13 == 1 &&
+            ggml_cuda_mmvq_lowbit(ctx, src0, (const block_q8_1 *) src1_q8_1.get(), dst, fusion)) {
+        return;
+    }
+#endif
+
+#if defined(GGML_USE_HIP)
     const bool plain_fusion = fusion && !fusion->gate_bias && !fusion->shared_up &&
             !fusion->x_scale && !fusion->gate_scale;
     const bool swiglu = plain_fusion && fusion->gate && !fusion->x_bias &&

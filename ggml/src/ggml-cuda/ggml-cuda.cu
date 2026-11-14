@@ -776,6 +776,7 @@ struct ggml_backend_cuda_buffer_context {
 #if defined(GGML_USE_HIP)
     std::mutex codex_iq3_mutex;
     std::unordered_map<const void *, void *> codex_iq3_cache;
+    std::map<std::pair<const void *, int>, void *> repack_cache;
 #endif
 
     ggml_backend_cuda_buffer_context(int device, void * dev_ptr) :
@@ -785,8 +786,9 @@ struct ggml_backend_cuda_buffer_context {
 
     ~ggml_backend_cuda_buffer_context() {
 #if defined(GGML_USE_HIP)
-        if (!codex_iq3_cache.empty()) ggml_cuda_set_device(device);
+        if (!codex_iq3_cache.empty() || !repack_cache.empty()) ggml_cuda_set_device(device);
         for (auto & entry : codex_iq3_cache) CUDA_CHECK(hipFree(entry.second));
+        for (auto & entry : repack_cache) CUDA_CHECK(hipFree(entry.second));
 #endif
         CUDA_CHECK(cudaFree(dev_ptr));
     }
@@ -918,6 +920,35 @@ const void * codex_iq3_get_packed(const ggml_tensor * tensor, int device, hipStr
     CUDA_CHECK(hipGetLastError());
     CUDA_CHECK(hipStreamSynchronize(stream));
     buffer->codex_iq3_cache.emplace(tensor->data,memory);
+    return memory;
+}
+
+const void * ggml_cuda_get_repacked(const ggml_tensor * tensor, int device, hipStream_t stream, int kind, size_t bytes, ggml_cuda_repack_fn fn) {
+    if (!tensor || tensor->view_src || !tensor->buffer || !ggml_backend_buffer_is_cuda(tensor->buffer) ||
+            ggml_backend_buffer_get_usage(tensor->buffer) != GGML_BACKEND_BUFFER_USAGE_WEIGHTS) {
+        return nullptr;
+    }
+    auto * buffer = static_cast<ggml_backend_cuda_buffer_context *>(tensor->buffer->context);
+    if (buffer->device != device) return nullptr;
+    std::lock_guard<std::mutex> guard(buffer->codex_iq3_mutex);
+    const auto key = std::make_pair((const void *) tensor->data, kind);
+    auto it = buffer->repack_cache.find(key);
+    if (it != buffer->repack_cache.end()) return it->second;
+    hipStreamCaptureStatus status;
+    CUDA_CHECK(hipStreamIsCapturing(stream, &status));
+    if (status != hipStreamCaptureStatusNone) return nullptr;
+    size_t free_bytes, total_bytes;
+    CUDA_CHECK(hipMemGetInfo(&free_bytes, &total_bytes));
+    if (free_bytes < bytes + size_t(4)*1024*1024*1024) return nullptr;
+    void * memory = nullptr;
+    if (hipMalloc(&memory, bytes) != hipSuccess) {
+        (void) hipGetLastError();
+        return nullptr;
+    }
+    fn(tensor->data, memory, tensor, stream);
+    CUDA_CHECK(hipGetLastError());
+    CUDA_CHECK(hipStreamSynchronize(stream));
+    buffer->repack_cache.emplace(key, memory);
     return memory;
 }
 #endif
