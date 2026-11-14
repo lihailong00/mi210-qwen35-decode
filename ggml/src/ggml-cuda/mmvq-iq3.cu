@@ -16,6 +16,8 @@
 #if defined(GGML_USE_HIP)
 #include "iq3gemv.cuh"
 #include "mixgemv.cuh"
+#include <map>
+#include <mutex>
 #include <cstdlib>
 #include <climits>
 
@@ -352,19 +354,48 @@ static size_t mixg_lds(const int K, const int N4, const int nwv4) {
 }
 template <class T3, class T4>
 static void mixg_launch(const bool first3, const int na, const uint8_t * w3, float * d3, const int N3, const iq4k::soa & s4, float * d4,
-        const int N4, const block_q8_1 * y, const int K, const int ncu, hipStream_t stream) {
+        const int N4, const block_q8_1 * y, const int K, const int ncu, hipStream_t stream, const mixg::glu_args & ga) {
     const int nwv = ncu*mixg::NW;
     const size_t lds = mixg::lds_bytes<T3, T4>(K, N4, na > 0 ? (mixg::NW - na)*ncu : nwv);
     const int y4off = (int) mixg::y4_offset<T3, T4>(K);
     const int rot = (first3 ? N3/mixg::RG : N4/mixg::RG) % nwv;
     if (first3) {
-        mixg::gemv_pair<T3, T4, IQ3G_SM, true ><<<ncu, dim3(64, mixg::NW), lds, stream>>>(w3, d3, N3, s4, d4, N4, y, K, y4off, rot, na);
+        mixg::gemv_pair<T3, T4, IQ3G_SM, true ><<<ncu, dim3(64, mixg::NW), lds, stream>>>(w3, d3, N3, s4, d4, N4, y, K, y4off, rot, na, ga);
     } else {
-        mixg::gemv_pair<T3, T4, IQ3G_SM, false><<<ncu, dim3(64, mixg::NW), lds, stream>>>(w3, d3, N3, s4, d4, N4, y, K, y4off, rot, na);
+        mixg::gemv_pair<T3, T4, IQ3G_SM, false><<<ncu, dim3(64, mixg::NW), lds, stream>>>(w3, d3, N3, s4, d4, N4, y, K, y4off, rot, na, ga);
     }
 }
 
-bool ggml_cuda_mmvq_mix(ggml_backend_cuda_context & ctx, ggml_tensor * const * mm, const int n) {
+// zero-initialized counters of the SwiGLU epilogue (per device, allocated outside graph capture; the kernel leaves them zero)
+static constexpr int MIXG_CNT = 1 << 14;
+static unsigned int * mixg_counters(const int device, hipStream_t stream) {
+    static std::mutex mtx;
+    static std::map<int, unsigned int *> bufs;
+    std::lock_guard<std::mutex> lock(mtx);
+    auto it = bufs.find(device);
+    if (it == bufs.end()) {
+        hipStreamCaptureStatus status;
+        CUDA_CHECK(hipStreamIsCapturing(stream, &status));
+        if (status != hipStreamCaptureStatusNone) {
+            return nullptr;
+        }
+        unsigned int * p = nullptr;
+        CUDA_CHECK(cudaMalloc(&p, MIXG_CNT*sizeof(unsigned int)));
+        CUDA_CHECK(cudaMemset(p, 0, MIXG_CNT*sizeof(unsigned int)));
+        CUDA_CHECK(cudaDeviceSynchronize());
+        it = bufs.emplace(device, p).first;
+    }
+    return it->second;
+}
+// GGML_MMVQ_MIX_GLU=1: compute the SwiGLU of a gate/up pair (+ its q8_1) in the pair kernel instead of its own node.
+// Off by default: the epilogue's serial chain at the end of the kernel (release fence, atomic, acquire, loads, q8 stores,
+// ~5 us) costs more than the separate swiglu_q8 node (~3 us) in graph replay.
+static bool mixg_glu_enabled() {
+    static const bool enabled = [] { const char * v = getenv("GGML_MMVQ_MIX_GLU"); return v != nullptr && v[0] == '1'; }();
+    return enabled;
+}
+
+bool ggml_cuda_mmvq_mix(ggml_backend_cuda_context & ctx, ggml_tensor * const * mm, const int n, ggml_tensor * glu) {
     if (n != 2 || !ggml_cuda_mmvq_mix_member(mm[0]) || !ggml_cuda_mmvq_mix_member(mm[1]) || mm[0]->src[1] != mm[1]->src[1]) {
         return false;
     }
@@ -399,6 +430,27 @@ bool ggml_cuda_mmvq_mix(ggml_backend_cuda_context & ctx, ggml_tensor * const * m
     if (lds > 65536) {
         return false;
     }
+    // SwiGLU epilogue (glu = the GLU node of a gate/up pair): dst = silu(src[0]) * src[1] (not swapped), + its q8_1 blocks
+    const ggml_tensor * gate_t = nullptr;
+    const ggml_tensor * up_t   = nullptr;
+    unsigned int * cnt = nullptr;
+    if (glu) {
+        if (!mixg_glu_enabled() || na > 0 || N3 != N4 || N3 % 32 != 0 || N3/32 + 2 > MIXG_CNT || glu->op != GGML_OP_GLU ||
+                ggml_get_glu_op(glu) != GGML_GLU_OP_SWIGLU || ((const int32_t *) glu->op_params)[1] != 0 || !glu->src[1] ||
+                glu->type != GGML_TYPE_F32 || !ggml_is_contiguous(glu) || ggml_nelements(glu) != N3 ||
+                !ggml_is_contiguous(glu->src[0]) || !ggml_is_contiguous(glu->src[1])) {
+            return false;
+        }
+        gate_t = glu->src[0];
+        up_t   = glu->src[1];
+        if (!((gate_t == m3 && up_t == m4) || (gate_t == m4 && up_t == m3))) {
+            return false;
+        }
+        cnt = mixg_counters(device, stream);   // nullptr during graph capture if not allocated yet
+        if (!cnt) {
+            return false;
+        }
+    }
     const uint8_t * soa3 = iq3g_get_soa(w3, device, stream);                 // nullptr during graph capture if not created yet
     const void    * soa4 = ggml_cuda_mmvq_iq4k_soa_il4(w4, device, stream);  // = the single launcher's copy at K <= 8192
     if (!soa3 || !soa4) {
@@ -408,6 +460,23 @@ bool ggml_cuda_mmvq_mix(ggml_backend_cuda_context & ctx, ggml_tensor * const * m
     if (!ggml_cuda_mmvq_q8_cached(ctx, m3->src[1], &q8)) {
         return false;
     }
+    mixg::glu_args ga{};
+    if (glu) {
+        // the GLU output's q8_1 goes to the activation cache (the same buffer as this kernel's input q8: the kernel writes it
+        // only after every workgroup has staged the input); after this call the launch must happen
+        block_q8_1 * gy = nullptr;
+        int * gsum = nullptr;
+        if (!ggml_cuda_mmvq_cache_produce(ctx, glu, &gy, &gsum)) {
+            return false;
+        }
+        ga.g    = (const float *) gate_t->data;
+        ga.u    = (const float *) up_t->data;
+        ga.dst  = (float *) glu->data;
+        ga.y    = gy;
+        ga.ysum = gsum;
+        ga.cnt  = cnt;
+        ga.nb   = N3/32;
+    }
     const iq4k::soa s4 = iq4k::soa_make(w4->type, soa4, (size_t) N4*(K/QK_K));
     const bool first3 = mixg_mode() != 2;
     float * d3 = (float *) m3->data;
@@ -416,10 +485,10 @@ bool ggml_cuda_mmvq_mix(ggml_backend_cuda_context & ctx, ggml_tensor * const * m
     for (int e = 0; e < n_empty_pre; ++e) {
         mixg::empty_kernel<<<1, 64, 0, stream>>>();   // calibration probe: n empty launches before the pair (after a small kernel)
     }
-    if (s3 && x4)       mixg_launch<iq3s_t,   iq4k::iq4xs_t>(first3, na, soa3, d3, N3, s4, d4, N4, q8, K, ncu, stream);
-    else if (s3)        mixg_launch<iq3s_t,   iq4k::q4k_t  >(first3, na, soa3, d3, N3, s4, d4, N4, q8, K, ncu, stream);
-    else if (x4)        mixg_launch<iq3xxs_t, iq4k::iq4xs_t>(first3, na, soa3, d3, N3, s4, d4, N4, q8, K, ncu, stream);
-    else                mixg_launch<iq3xxs_t, iq4k::q4k_t  >(first3, na, soa3, d3, N3, s4, d4, N4, q8, K, ncu, stream);
+    if (s3 && x4)       mixg_launch<iq3s_t,   iq4k::iq4xs_t>(first3, na, soa3, d3, N3, s4, d4, N4, q8, K, ncu, stream, ga);
+    else if (s3)        mixg_launch<iq3s_t,   iq4k::q4k_t  >(first3, na, soa3, d3, N3, s4, d4, N4, q8, K, ncu, stream, ga);
+    else if (x4)        mixg_launch<iq3xxs_t, iq4k::iq4xs_t>(first3, na, soa3, d3, N3, s4, d4, N4, q8, K, ncu, stream, ga);
+    else                mixg_launch<iq3xxs_t, iq4k::q4k_t  >(first3, na, soa3, d3, N3, s4, d4, N4, q8, K, ncu, stream, ga);
     static const int n_empty = [] { const char * v = getenv("GGML_MMVQ_MIX_EMPTY"); return v ? atoi(v) : 0; }();
     // probe shape (GGML_MMVQ_MIX_EMPTY_CFG): 0 = 1 x 64 threads, no LDS; 1 = 1 x 1024 threads with the pair kernel's LDS;
     // 2 = ncu x 1024 threads with the pair kernel's LDS
@@ -450,7 +519,7 @@ bool ggml_cuda_mmvq_iq3_multi(ggml_backend_cuda_context &, const ggml_tensor * c
 bool ggml_cuda_mmvq_mix_member(const ggml_tensor *) {
     return false;
 }
-bool ggml_cuda_mmvq_mix(ggml_backend_cuda_context &, ggml_tensor * const *, int) {
+bool ggml_cuda_mmvq_mix(ggml_backend_cuda_context &, ggml_tensor * const *, int, ggml_tensor *) {
     return false;
 }
 #endif

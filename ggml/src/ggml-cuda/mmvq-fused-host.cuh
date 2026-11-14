@@ -75,7 +75,9 @@ bool ggml_cuda_mmvq_q8_cached(ggml_backend_cuda_context & ctx, const ggml_tensor
 // r4-mixgroup: one launch for a pair of single-token GEMVs on the same activation that mixes an IQ3_S/IQ3_XXS job with
 // an IQ4_XS/Q4_K job (mixgemv.cuh; linear-attention qkv + z, mixed-type FFN gate + up). member: can this MUL_MAT be
 // part of such a pair; mix: run the pair mm[0..1] (false: nothing launched, the caller runs the nodes one by one).
-// GGML_MMVQ_MIX=0 disables, =2 runs the IQ4 job first. soa_il4: the iq4k IL = 4 copy (mmvq-iq4k.cu).
+// glu (optional): the SWIGLU node of a gate/up pair, computed in the same launch (+ its q8_1 for ffn_down).
+// GGML_MMVQ_MIX=0 disables, =2 runs the IQ4 job first, GGML_MMVQ_MIX_GLU=0 keeps the SwiGLU separate.
+// soa_il4: the iq4k IL = 4 copy (mmvq-iq4k.cu).
 bool ggml_cuda_mmvq_mix_member(const ggml_tensor * mm);
-bool ggml_cuda_mmvq_mix(ggml_backend_cuda_context & ctx, ggml_tensor * const * mm, int n);
+bool ggml_cuda_mmvq_mix(ggml_backend_cuda_context & ctx, ggml_tensor * const * mm, int n, ggml_tensor * glu = nullptr);
 const void * ggml_cuda_mmvq_iq4k_soa_il4(const ggml_tensor * w, int device, cudaStream_t stream);

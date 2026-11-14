@@ -4961,10 +4961,20 @@ static int ggml_cuda_try_mix_group(ggml_backend_cuda_context * cuda_ctx, ggml_cg
     while (nx < cgraph->n_nodes && ggml_cuda_is_view_or_noop(cgraph->nodes[nx])) {
         nx++;
     }
+    ggml_tensor * mm[2] = { n0, n1 };
     if (nx < cgraph->n_nodes) {
-        const ggml_tensor * t = cgraph->nodes[nx];
+        ggml_tensor * t = cgraph->nodes[nx];
         if (t->op == GGML_OP_MUL_MAT && t->src[1] == n0->src[1]) {
             return 0;
+        }
+        // gate/up pair + its SWIGLU node in one launch (the GLU output and its q8_1 come from the pair kernel)
+        if (t->op == GGML_OP_GLU && (t->flags & GGML_TENSOR_FLAG_COMPUTE) && t->src[0] && t->src[1] &&
+                ((t->src[0] == n0 && t->src[1] == n1) || (t->src[0] == n1 && t->src[1] == n0)) &&
+                !ggml_cuda_should_fuse_mul_mat(t->src[1], t->src[0], t)) {
+            const int outs3[3] = { i, j, nx };
+            if (ggml_cuda_check_fusion_memory_ranges(cgraph, i, nx - i + 1, outs3, 3) && ggml_cuda_mmvq_mix(*cuda_ctx, mm, 2, t)) {
+                return nx - i;
+            }
         }
         auto is_member = [&](const ggml_tensor * s) {
             for (; s; s = s->view_src) {
@@ -4989,7 +4999,6 @@ static int ggml_cuda_try_mix_group(ggml_backend_cuda_context * cuda_ctx, ggml_cg
     if (!ggml_cuda_check_fusion_memory_ranges(cgraph, i, j - i + 1, outs, 2)) {
         return 0;
     }
-    ggml_tensor * mm[2] = { n0, n1 };
     if (!ggml_cuda_mmvq_mix(*cuda_ctx, mm, 2)) {
         return 0;
     }

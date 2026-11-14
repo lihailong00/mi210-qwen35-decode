@@ -105,6 +105,92 @@ static inline size_t y4_offset(const int K) {
 // calibration probe (GGML_MMVQ_MIX_EMPTY=n): n empty launches after every pair, to measure what a launch costs in graph replay
 static __global__ void empty_kernel() {}
 
+// ---- fused SwiGLU epilogue for gate/up pairs (equal N): dst = silu(gate) * up and its q8_1 blocks (+ int sums) for the
+// following ffn_down GEMV, with exactly the arithmetic of the swiglu_q8 producer (q8-producers.cu: gated_q8_kernel<0>).
+// Per 32-row block a counter collects the 16 unit results (8 units of 4 rows per job); after all of its work every wave
+// publishes its units (release fence + one atomic per unit, in parallel over lanes) and the wave that completes a block
+// computes it. The q8 blocks go to the per-stream activation cache, which also holds this kernel's own input: they are
+// only written after every workgroup has staged the input (pro counter; all workgroups are co-resident, grid = #CUs).
+// The last block resets the counters (graph replay safe; zero-initialized once).
+struct glu_args {
+    const float  * g;      // gate results (one of d3 / d4)
+    const float  * u;      // up results
+    float        * dst;    // GLU output (f32)
+    block_q8_1   * y;      // q8_1 of the GLU output
+    int          * ysum;   // int sums per q8_1 block
+    unsigned int * cnt;    // [N/32] arrivals per block, then [N/32] = done blocks, [N/32 + 1] = staged workgroups
+    int            nb;     // N/32
+};
+// (int8_t) roundf(v / d) without the IEEE division in the common case (bit-exact, = q8p_round_div)
+static __device__ __forceinline__ int q8_round_div(const float v, const float d, const float inv_d) {
+    const float t  = v * inv_d;
+    const float fr = __builtin_amdgcn_fractf(fabsf(t));
+    if (fabsf(fr - 0.5f) > 3.0e-5f) {
+        return (int) rintf(t);
+    }
+    return (int) roundf(v / d);
+}
+// a3 / a4: this wave's first IQ3 / IQ4 unit (round robin step nwv)
+static __device__ __forceinline__ void glu_epilogue(const glu_args & ga, const int a3, const int U3, const int a4, const int U4,
+        const int nwv) {
+    const int n3 = a3 < U3 ? (U3 - 1 - a3)/nwv + 1 : 0;
+    const int n4 = a4 < U4 ? (U4 - 1 - a4)/nwv + 1 : 0;
+    if (n3 + n4 == 0) {
+        return;
+    }
+    __threadfence();   // release: this wave's d3 / d4 stores
+    const int l = threadIdx.x;
+    int b = -1;
+    if (l < n3) {
+        b = (a3 + l*nwv) / 8;
+    } else if (l < n3 + n4) {
+        b = (a4 + (l - n3)*nwv) / 8;
+    }
+    bool done = false;
+    if (b >= 0) {
+        done = atomicAdd(ga.cnt + b, 1u) == 15u;
+    }
+    unsigned long long m = __ballot(done);
+    if (m == 0) {
+        return;
+    }
+    // the activation cache buffer is also this kernel's input: wait until every workgroup has staged it (normally long done)
+    while (__hip_atomic_load(ga.cnt + ga.nb + 1, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT) < gridDim.x) {
+        __builtin_amdgcn_s_sleep(1);
+    }
+    __threadfence();   // acquire: the other waves' results of the completed blocks
+    const int half = threadIdx.x >> 5, li = threadIdx.x & 31;
+    while (m) {
+        const int l0 = __ffsll((long long) m) - 1; m &= m - 1;
+        int l1 = -1;
+        if (m) { l1 = __ffsll((long long) m) - 1; m &= m - 1; }
+        const int b0 = __shfl(b, l0, 64);
+        const int b1 = __shfl(b, l1 < 0 ? 0 : l1, 64);
+        const int bb = half ? (l1 < 0 ? -1 : b1) : b0;
+        if (bb >= 0) {
+            const int i = bb*32 + li;
+            const float gv = ga.g[i];
+            const float r  = (gv / (1.0f + expf(-gv))) * ga.u[i];   // ggml_cuda_op_silu_single(gate) * up
+            ga.dst[i] = r;
+            float amax = fabsf(r);
+            amax = warp_reduce_max<32>(amax);
+            const float  d = amax / 127.0f;
+            const int8_t q = amax == 0.0f ? 0 : q8_round_div(r, d, 1.0f / d);
+            const int sum = warp_reduce_sum<32>((int) q);
+            ga.y[bb].qs[li] = q;
+            if (li == 0) {
+                ga.y[bb].ds = make_half2(d, d * sum);
+                ga.ysum[bb] = sum;
+                ga.cnt[bb] = 0u;
+                if (atomicAdd(ga.cnt + ga.nb, 1u) == (unsigned int) ga.nb - 1u) {   // last block of the launch: reset
+                    ga.cnt[ga.nb] = 0u;
+                    ga.cnt[ga.nb + 1] = 0u;
+                }
+            }
+        }
+    }
+}
+
 // nwv4 = waves that run IQ4 units (all waves in the flowing mode, (NW - na)*grid in the split mode)
 template <class T3, class T4>
 static inline size_t lds_bytes(const int K, const int N4, const int nwv4) {
@@ -120,7 +206,7 @@ template <class T3, class T4, int SM, bool FIRST3>
 __launch_bounds__(NW*64, 1)
 __global__ void gemv_pair(const uint8_t * __restrict__ w3, float * __restrict__ d3, const int N3,
         const iq4k::soa s4, float * __restrict__ d4, const int N4,
-        const block_q8_1 * __restrict__ yg, const int K, const int y4off, const int rot, const int na) {
+        const block_q8_1 * __restrict__ yg, const int K, const int y4off, const int rot, const int na, const glu_args ga) {
     extern __shared__ __align__(16) uint32_t smem[];
 #if defined(__HIP_DEVICE_COMPILE__)
     if ((uint32_t) (size_t) (__attribute__((address_space(3))) uint32_t *) smem != 0) __builtin_trap();
@@ -146,6 +232,9 @@ __global__ void gemv_pair(const uint8_t * __restrict__ w3, float * __restrict__ 
         }
     }
     __syncthreads();
+    if (ga.dst && tid == 0) {
+        atomicAdd(ga.cnt + ga.nb + 1, 1u);   // this workgroup no longer reads the activation (see glu_epilogue)
+    }
 
     const int nwv4 = na > 0 ? (NW - na)*gridDim.x : nwv;
     const int nunits4 = N4/RG, maxu4 = (nunits4 + nwv4 - 1)/nwv4;
@@ -168,6 +257,9 @@ __global__ void gemv_pair(const uint8_t * __restrict__ w3, float * __restrict__ 
             if (u3 < U3) { part3<T3, SM>(w3, d3, N3, K, u3, big, lane, grp); u3 += nwv; }
             if (u4 < U4) { part4<T4>(s4, d4, N4, K, ys4, ow, u4, big, lane, grp); u4 += nwv; }
         }
+        if (ga.dst) {
+            glu_epilogue(ga, w, U3, w2, U4, nwv);
+        }
         return;
     }
     if constexpr (FIRST3) {
@@ -176,6 +268,9 @@ __global__ void gemv_pair(const uint8_t * __restrict__ w3, float * __restrict__ 
     } else {
         part4<T4>(s4, d4, N4, K, ys4, ow, w, nwv, lane, grp);
         part3<T3, SM>(w3, d3, N3, K, w2, nwv, lane, grp);
+    }
+    if (ga.dst) {   // gate/up pair: SwiGLU + q8_1 epilogue
+        glu_epilogue(ga, FIRST3 ? w : w2, N3/RG, FIRST3 ? w2 : w, N4/RG, nwv);
     }
 }
 
