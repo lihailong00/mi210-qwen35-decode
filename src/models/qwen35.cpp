@@ -284,6 +284,14 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn(
     cb(Kcur, "Kcur", il);
     cb(Vcur, "Vcur", il);
 
+    // graph order: the three projections back to back, then q norm + rope, the gate copy, k norm + rope and the
+    // k/v cache stores (build_attn). The CUDA backend runs that whole chain as one kernel
+    // (ggml_cuda_try_attn_prep_fusion); emitting the gate CONT right after the q rope keeps the projections alive
+    // until the fused outputs are allocated, so they cannot alias the kernel inputs.
+    ggml_build_forward_expand(gf, Qcur_full);
+    ggml_build_forward_expand(gf, Kcur);
+    ggml_build_forward_expand(gf, Vcur);
+
     ggml_tensor * Qcur = ggml_view_3d(ctx0, Qcur_full, n_embd_head, n_head, n_tokens,
         ggml_element_size(Qcur_full) * n_embd_head * 2,
         ggml_element_size(Qcur_full) * n_embd_head * 2 * n_head, 0);
@@ -323,6 +331,9 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn(
     cb(Qcur, "Qcur", il);
     cb(Kcur, "Kcur", il);
     cb(Vcur, "Vcur", il);
+
+    ggml_build_forward_expand(gf, Qcur);
+    ggml_build_forward_expand(gf, gate);
 
     // Attention computation
     const float kq_scale = hparams.f_attention_scale == 0.0f ? 1.0f / sqrtf(float(n_embd_head)) : hparams.f_attention_scale;
