@@ -143,8 +143,16 @@ static bool q8p_enabled() {
     return enabled;
 }
 
+static bool q8p_norm_enabled() {
+    static const bool enabled = [] {
+        const char * v = getenv("GGML_Q8_PRODUCERS_NORM");
+        return v == nullptr || v[0] != '0';
+    }();
+    return enabled;
+}
+
 bool ggml_cuda_rms_norm_mul_q8(ggml_backend_cuda_context & ctx, const ggml_tensor * rms_norm, ggml_tensor * mul_node) {
-    if (!q8p_enabled() || ggml_cuda_info().devices[ctx.device].warp_size != 64) {
+    if (!q8p_enabled() || !q8p_norm_enabled() || ggml_cuda_info().devices[ctx.device].warp_size != 64) {
         return false;
     }
     const ggml_tensor * x = rms_norm->src[0];

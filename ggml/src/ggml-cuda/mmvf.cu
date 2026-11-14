@@ -675,7 +675,11 @@ static __global__ void mmvf_bf16_thin(const nv_bfloat16 * __restrict__ x, const 
 static bool ggml_cuda_mul_mat_vec_f_bf16_thin(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids,
         ggml_tensor * dst, const ggml_cuda_mm_fusion_args_host * fusion) {
 #if defined(GGML_USE_HIP)
-    if (src0->type != GGML_TYPE_BF16 || ids || src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32) {
+    static const bool disabled = [] {
+        const char * v = getenv("GGML_MMVF_THIN");
+        return v != nullptr && v[0] == '0';
+    }();
+    if (disabled || src0->type != GGML_TYPE_BF16 || ids || src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32) {
         return false;
     }
     const int64_t K = src0->ne[0];
