@@ -1229,6 +1229,9 @@ struct test_case {
     }
 
     virtual ggml_tensor * build_graph(ggml_context * ctx) = 0;
+
+    // optional: expand graph nodes in a specific order before the output is expanded
+    virtual void expand_graph(ggml_cgraph * gf) { GGML_UNUSED(gf); }
     virtual ggml_tensor * build_graph(ggml_context * ctx, ggml_context * ctx_weights) {
         GGML_UNUSED(ctx_weights);
         return build_graph(ctx);
@@ -1485,6 +1488,7 @@ struct test_case {
         }
 
         // build graph
+        expand_graph(gf);
         ggml_build_forward_expand(gf, out);
 
         // add sentinels as graph nodes so that they are checked in the callback
@@ -1659,6 +1663,7 @@ struct test_case {
 
         // build graph
         ggml_cgraph * gf = ggml_new_graph_custom(ctx.get(), graph_nodes, false);
+        expand_graph(gf);
         ggml_build_forward_expand(gf, out);
 
         // warmup run
@@ -2896,6 +2901,134 @@ struct test_rope_set_rows : public test_case {
 };
 
 // GGML_OP_RMS_NORM with optional GGML_OP_MUL, GGML_OP_ROPE, GGML_OP_VIEW and GGML_OP_SET_ROWS
+// qwen3.5 full-attention prep chain as built by src/models/qwen35.cpp + build_attn: q/k rms_norm*w + rope (partial,
+// multi-section), gate half of the joint q|gate projection made contiguous, k/v rows stored into f16/f32 caches.
+// order 1 = current model order (projections, q chain, gate cont, k chain, k store, v store: fused into one CUDA kernel),
+// order 0 = the previous order (q chain, v proj, k chain, k store, v store, gate cont).
+struct test_attn_prep : public test_case {
+    const int64_t hd;
+    const int64_t nh;
+    const int64_t nkv;
+    const int64_t nt;
+    const int     n_rot;
+    const int     mode;
+    const int     order;
+    const ggml_type cache_type;
+    std::vector<ggml_tensor *> outs;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "ATTN_PREP";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    std::vector<ggml_tensor *> fusion_test_nodes() override { return outs; }
+
+    std::string vars() override {
+        return VARS_TO_STR8(hd, nh, nkv, nt, n_rot, mode, order, cache_type);
+    }
+
+    test_attn_prep(int64_t hd = 256, int64_t nh = 24, int64_t nkv = 4, int64_t nt = 1, int n_rot = 64,
+                   int mode = GGML_ROPE_TYPE_IMROPE, int order = 1, ggml_type cache_type = GGML_TYPE_F16)
+        : hd(hd), nh(nh), nkv(nkv), nt(nt), n_rot(n_rot), mode(mode), order(order), cache_type(cache_type) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        const int64_t kv_size = 2*nt + 3;
+        const float   eps     = 1e-6f;
+        int sections[4] = { 11, 11, 10, 0 };
+        if (n_rot != 64) {
+            sections[0] = sections[1] = n_rot/6; sections[2] = n_rot/2 - 2*(n_rot/6); sections[3] = 0;
+        }
+
+        ggml_tensor * qf_in = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hd*2*nh, nt);
+        ggml_tensor * k_in  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hd*nkv,  nt);
+        ggml_tensor * v_in  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hd*nkv,  nt);
+        ggml_tensor * wq    = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, hd);
+        ggml_tensor * wk    = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, hd);
+        const bool is_mrope = mode & GGML_ROPE_TYPE_MROPE;
+        ggml_tensor * pos   = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, nt * (is_mrope ? 4 : 1));
+        ggml_tensor * k_cache = ggml_new_tensor_2d(ctx, cache_type, hd*nkv, kv_size);
+        ggml_tensor * v_cache = ggml_new_tensor_2d(ctx, cache_type, hd*nkv, kv_size);
+        ggml_set_name(k_cache, "k_cache");
+        ggml_set_name(v_cache, "v_cache");
+        ggml_tensor * k_idx = ggml_new_tensor_1d(ctx, GGML_TYPE_I64, nt);
+        ggml_tensor * v_idx = ggml_new_tensor_1d(ctx, GGML_TYPE_I64, nt);
+
+        // stand-ins for the projection outputs (computed nodes, like the MUL_MATs in the model)
+        ggml_tensor * qf = ggml_scale(ctx, qf_in, 1.0f);
+        ggml_tensor * kf = ggml_scale(ctx, k_in,  1.0f);
+        ggml_tensor * vf = ggml_scale(ctx, v_in,  1.0f);
+        ggml_set_name(qf, "qf");
+
+        ggml_tensor * q = ggml_view_3d(ctx, qf, hd, nh, nt, qf->nb[0]*hd*2, qf->nb[0]*hd*2*nh, 0);
+        q = ggml_rms_norm(ctx, q, eps);
+        q = ggml_mul(ctx, q, wq);
+        ggml_tensor * k = ggml_reshape_3d(ctx, kf, hd, nkv, nt);
+        k = ggml_rms_norm(ctx, k, eps);
+        k = ggml_mul(ctx, k, wk);
+        ggml_tensor * gate = ggml_view_3d(ctx, qf, hd, nh, nt, qf->nb[0]*hd*2, qf->nb[0]*hd*2*nh, qf->nb[0]*hd);
+        gate = ggml_cont_2d(ctx, gate, hd*nh, nt);
+        ggml_set_name(gate, "gate");
+        ggml_tensor * v = ggml_reshape_3d(ctx, vf, hd, nkv, nt);
+        if (is_mrope) {
+            q = ggml_rope_multi(ctx, q, pos, nullptr, n_rot, sections, mode, 262144, 10000000.0f, 1.0f, 0.0f, 1.0f, 32.0f, 1.0f);
+            k = ggml_rope_multi(ctx, k, pos, nullptr, n_rot, sections, mode, 262144, 10000000.0f, 1.0f, 0.0f, 1.0f, 32.0f, 1.0f);
+        } else {
+            q = ggml_rope_ext(ctx, q, pos, nullptr, n_rot, mode, 262144, 10000000.0f, 1.0f, 0.0f, 1.0f, 32.0f, 1.0f);
+            k = ggml_rope_ext(ctx, k, pos, nullptr, n_rot, mode, 262144, 10000000.0f, 1.0f, 0.0f, 1.0f, 32.0f, 1.0f);
+        }
+        ggml_set_name(q, "q_rope");
+
+        ggml_tensor * k_store = ggml_set_rows(ctx, k_cache, ggml_view_2d(ctx, k, hd*nkv, nt, k->nb[2], 0), k_idx);
+        ggml_tensor * v_store = ggml_set_rows(ctx, v_cache, ggml_view_2d(ctx, v, hd*nkv, nt, v->nb[2], 0), v_idx);
+        ggml_set_name(k_store, "k_store");
+        ggml_set_name(v_store, "v_store");
+
+        // the test framework expands the returned tensor last; record the desired expansion order
+        if (order == 1) {
+            expand_order = { qf, kf, vf, q, gate, v, k, k_store, v_store };
+        } else {
+            expand_order = { q, vf, v, k, k_store, v_store, gate };
+        }
+        outs = { q, gate, k_store, v_store };
+
+        // one output that depends on everything so that the graph contains all nodes
+        return v_store;
+    }
+
+    std::vector<ggml_tensor *> expand_order;
+
+    void expand_graph(ggml_cgraph * gf) override {
+        for (ggml_tensor * t : expand_order) {
+            ggml_build_forward_expand(gf, t);
+        }
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->type == GGML_TYPE_I64) {
+                init_set_rows_row_ids(t, 2*nt + 3);
+            } else if (t->type == GGML_TYPE_I32) {
+                std::vector<int32_t> data(ggml_nelements(t));
+                for (int64_t i = 0; i < nt; ++i) {
+                    const int32_t p = rand() % 4096;
+                    for (int64_t s = 0; s < ggml_nelements(t)/nt; ++s) {
+                        data[s*nt + i] = s == 3 ? 0 : p + (int32_t) s * (rand() % 3);
+                    }
+                }
+                ggml_backend_tensor_set(t, data.data(), 0, ggml_nbytes(t));
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+
+    double max_nmse_err() override {
+        return 1e-6;
+    }
+};
+
 struct test_rms_norm_mul_rope : public test_case {
     const std::array<int64_t, 4> ne;
     const float eps;
@@ -11155,6 +11288,18 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_rms_norm_mul_add(GGML_TYPE_F32, { 256, 4, 1, 1 }, 1e-6f, false, false, false, true));
 
     test_cases.emplace_back(new test_rms_norm_mul_rope({128, 4, 7, 2}));
+    // qwen3.5 attention prep chain: fused (order 1) and unfused (order 0) graph orders, rope modes, cache types
+    for (int order : {1, 0}) {
+        for (int64_t nt : {1, 3, 17}) {
+            test_cases.emplace_back(new test_attn_prep(256, 24, 4, nt, 64, GGML_ROPE_TYPE_IMROPE, order));
+            test_cases.emplace_back(new test_attn_prep(256, 24, 4, nt, 64, GGML_ROPE_TYPE_IMROPE, order, GGML_TYPE_F32));
+            test_cases.emplace_back(new test_attn_prep(256, 24, 4, nt, 64, GGML_ROPE_TYPE_MROPE,  order));
+            test_cases.emplace_back(new test_attn_prep(256, 24, 4, nt, 64, GGML_ROPE_TYPE_NEOX,   order));
+            test_cases.emplace_back(new test_attn_prep(256, 24, 4, nt, 64, GGML_ROPE_TYPE_NORMAL, order));
+            test_cases.emplace_back(new test_attn_prep(128, 16, 2, nt, 128, GGML_ROPE_TYPE_NEOX,  order));
+            test_cases.emplace_back(new test_attn_prep(256, 16, 2, nt, 256, GGML_ROPE_TYPE_IMROPE, order));
+        }
+    }
     test_cases.emplace_back(new test_rms_norm_mul_rope({128, 4, 7, 2}, 1e-6f, false, true));
 
     for (auto multi_add : {false, true}) {
@@ -12834,6 +12979,17 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         test_cases.emplace_back(new test_rms_norm_mul_rope({4096, n_tokens, 1, 1}, 1e-6f, false, false, true, GGML_ROPE_TYPE_NORMAL, true, false));
         test_cases.emplace_back(new test_rms_norm_mul_rope({128, 32, n_tokens, 1}, 1e-6f, false, false, true, GGML_ROPE_TYPE_NEOX));
         test_cases.emplace_back(new test_rms_norm_mul_rope({128, 8, n_tokens, 1}, 1e-6f, false, true, true, GGML_ROPE_TYPE_NEOX));
+    }
+
+    // qwen3.5 full-attention prep chain (fused into one kernel on CUDA/HIP) and the decode flash attention it feeds
+    for (int64_t n_tokens : {1, 512}) {
+        test_cases.emplace_back(new test_attn_prep(256, 24, 4, n_tokens, 64, GGML_ROPE_TYPE_IMROPE, 1));
+        test_cases.emplace_back(new test_attn_prep(256, 24, 4, n_tokens, 64, GGML_ROPE_TYPE_IMROPE, 0));
+    }
+
+    // qwen3.5 decode flash attention: head size 256, 4 kv heads, GQA 6, f16 cache laid out like the KV cache view
+    for (int64_t kv : {256, 1024, 4096, 8192, 16384}) {
+        test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, kv, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 2, 1, 3}));
     }
 
     // POOL_1D max over MoE down-projection amax shapes:
