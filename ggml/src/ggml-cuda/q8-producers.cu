@@ -338,12 +338,13 @@ bool ggml_cuda_rms_norm_mul_q8(ggml_backend_cuda_context & ctx, const ggml_tenso
             ((uintptr_t) w->data) % 16 != 0 || x->ne[0] > 16384) {
         return false;
     }
-    // w is read per slice (safe only if it coincides with dst exactly); x is read in full by every workgroup, so an
-    // output that overlaps x (in place, as ggml-alloc does for the output norm) needs the single-workgroup kernel
+    // x is read in full by every workgroup of the multi-workgroup kernel, so an output that overlaps x (in place, as
+    // ggml-alloc does for the output norm) needs the single-workgroup kernel. w is read element by element: it may
+    // coincide with dst exactly (also single-workgroup, so the __restrict__ of the multi-workgroup kernel always holds)
     if (q8p_partial_overlap(w, mul_node)) {
         return false;
     }
-    const bool inplace = q8p_overlap(x, mul_node);
+    const bool inplace = q8p_overlap(x, mul_node) || q8p_overlap(w, mul_node);
     block_q8_1 * y = nullptr;
     int * ysum = nullptr;
     if (!ggml_cuda_mmvq_cache_produce(ctx, mul_node, &y, &ysum)) {
