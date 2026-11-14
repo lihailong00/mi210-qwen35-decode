@@ -3,6 +3,11 @@
 #include "ggml.h"
 #include "rope.cuh"
 
+#include <cstring>
+#include <map>
+#include <mutex>
+#include <utility>
+
 struct rope_corr_dims {
     float v[2];
 };
@@ -1034,18 +1039,24 @@ struct ggml_cuda_attn_prep {
     rope_corr_dims corr_dims;
     float theta_scale;
     const float * freq_factors;
+    const float * pow_table; // theta_scale^i, i < n_dims/2 (nullptr: the kernel calls powf)
 };
 
-// device-side cache of theta_scale^i for attn_prep_f32 (written by the first launch with the same powf; a key
-// mismatch, e.g. another model in the process, just falls back to powf)
-static __device__ float              g_attn_prep_pow[256];
-static __device__ unsigned long long g_attn_prep_pow_key = 0;
-
-static __device__ __forceinline__ unsigned long long attn_prep_pow_key(const float theta_scale, const int n_pairs) {
-    if (n_pairs <= 0 || n_pairs > 256) {
-        return 0;
+// Table of theta_scale^i for attn_prep_f32, one immutable device buffer per (device, theta_scale, n_pairs). It is
+// filled by attn_prep_pow_init (the same device powf expression as the in-kernel fallback, so the values are
+// bit-identical) outside graph capture, and the host waits for the init kernel before publishing the buffer, so every
+// attn_prep launch that receives it (any stream, captured or not) only reads finished values. A launch that would
+// need a table which does not exist yet while its stream is capturing gets none and calls powf itself (as the first
+// launch of the old in-kernel cache did): no per-token launch, no writer racing with readers.
+static __global__ void attn_prep_pow_init(float * __restrict__ table, const float theta_scale, const int n_pairs) {
+    const int i = threadIdx.x;
+    if (i < n_pairs) {
+        const int   iw = 2*i;
+        const float pw = powf(theta_scale, iw/2.0f);
+        table[i] = pw;
+    } else {
+        table[i] = 0.0f;
     }
-    return (1ull << 63) | ((unsigned long long) n_pairs << 32) | __float_as_uint(theta_scale);
 }
 
 // half(fma(a, b, c)) rounded once, like the v_fma_mixlo_f16 the compiler forms for ggml_cuda_cast<half>(x0*c - x1*s)
@@ -1117,7 +1128,7 @@ static __global__ void attn_prep_f32(
         const mrope_sections sections,
         const float freq_scale, const float ext_factor, const float attn_factor,
         const rope_corr_dims corr_dims, const float theta_scale,
-        const float * __restrict__ freq_factors) {
+        const float * __restrict__ freq_factors, const float * __restrict__ pow_table) {
     constexpr int EPT = HD / 64;
     static_assert(HD % 64 == 0, "bad head size");
 
@@ -1135,9 +1146,8 @@ static __global__ void attn_prep_f32(
         const float * src  = is_q ? q_src + t*q_s2 + h*q_s1 : k_src + t*k_s2 + h*k_s1;
         const float * w    = is_q ? wq : wk;
         const int64_t krow = is_q ? 0 : k_idx[t]; // uniform, issued early
-        // speculative load of the cached theta_scale^i of this lane (first pass), validated by the key below
-        const unsigned long long pow_key_seen = __atomic_load_n(&g_attn_prep_pow_key, __ATOMIC_RELAXED);
-        const float pw_pref = g_attn_prep_pow[tid];
+        // early load of the tabulated theta_scale^i of this lane (first pass); the table is complete before launch
+        const float pw_pref = pow_table ? pow_table[tid] : 0.0f;
 
         float wv[EPT];
         attn_prep_load<EPT>(src + e0, x);
@@ -1154,11 +1164,9 @@ static __global__ void attn_prep_f32(
             p4[2] = pos[t + 2*n_tokens];
             p4[3] = pos[t + 3*n_tokens];
         }
-        // theta_scale^i depends only on the model: after the first launch it comes from a device-side table written
-        // with the same powf (bit-identical); powf was ~1/3 of this latency-bound kernel
-        const unsigned long long pow_key = attn_prep_pow_key(theta_scale, n_pairs);
-        const bool pow_cached = pow_key != 0 && pow_key_seen == pow_key;
-        const bool pow_writer = pow_key != 0 && !pow_cached && b == 0 && t == 0;
+        // theta_scale^i depends only on the model: it comes from a device-side table computed with the same powf
+        // (bit-identical, see attn_prep_pow_init); powf was ~1/3 of this latency-bound kernel
+        const bool pow_cached = pow_table != nullptr;
         __shared__ float s_cos[HD/2];
         __shared__ float s_sin[HD/2];
         for (int i = tid; i < n_pairs; i += 64) {
@@ -1170,10 +1178,7 @@ static __global__ void attn_prep_f32(
                 p = p4[0];
             }
             const int   iw          = 2*i;
-            const float pw          = pow_cached ? (i == tid ? pw_pref : g_attn_prep_pow[i]) : powf(theta_scale, iw/2.0f);
-            if (pow_writer) {
-                g_attn_prep_pow[i] = pw;
-            }
+            const float pw          = pow_cached ? (i == tid ? pw_pref : pow_table[i]) : powf(theta_scale, iw/2.0f);
             const float theta_base  = p*pw;
             const float freq_factor = has_ff ? freq_factors[i] : 1.0f;
             float cos_theta;
@@ -1181,9 +1186,6 @@ static __global__ void attn_prep_f32(
             rope_yarn<true>(theta_base/freq_factor, freq_scale, corr_dims, 2*i, ext_factor, attn_factor, cos_theta, sin_theta);
             s_cos[i] = cos_theta;
             s_sin[i] = sin_theta;
-        }
-        if (pow_writer) {
-            __threadfence(); // table entries visible before the key (published after the barrier below)
         }
 
         // sum of squares in the order of rms_norm_f32<128, 1, true> for 256 columns (float4 per thread, 32-lane
@@ -1217,9 +1219,6 @@ static __global__ void attn_prep_f32(
             ys[e0 + j] = x[j];
         }
         __syncthreads();
-        if (pow_writer && tid == 0) {
-            __atomic_store_n(&g_attn_prep_pow_key, pow_key, __ATOMIC_RELAXED);
-        }
 
         // rotated element e of pair (ia, ib): fma(P, cos, M*sin) with (P, M) = (x0, -x1) for ia and (x1, x0) for ib.
         // This is the exact contraction the compiler emits for rope_multi/rope_neox (x0*cos - x1*sin ->
@@ -1302,7 +1301,7 @@ static void attn_prep_launch(const ggml_cuda_attn_prep & p, cudaStream_t stream)
             (DK *) p.k_dst, p.kd_s1, p.k_idx, (DV *) p.v_dst, p.vd_s1, p.v_idx,
             p.n_head, p.n_head_kv, p.n_tokens, p.eps_q, p.eps_k,
             p.n_dims, p.pos, p.rope_kind, p.is_imrope, p.sections,
-            p.freq_scale, p.ext_factor, p.attn_factor, p.corr_dims, p.theta_scale, p.freq_factors);
+            p.freq_scale, p.ext_factor, p.attn_factor, p.corr_dims, p.theta_scale, p.freq_factors, p.pow_table);
     } else {
         attn_prep_f32<HD, true, DK, DV><<<block_nums, block_dims, 0, stream>>>(
             p.q_src, p.q_s1, p.q_s2, p.g_src, p.g_s1, p.g_s2, p.k_src, p.k_s1, p.k_s2, p.v_src, p.v_s1,
@@ -1310,7 +1309,7 @@ static void attn_prep_launch(const ggml_cuda_attn_prep & p, cudaStream_t stream)
             (DK *) p.k_dst, p.kd_s1, p.k_idx, (DV *) p.v_dst, p.vd_s1, p.v_idx,
             p.n_head, p.n_head_kv, p.n_tokens, p.eps_q, p.eps_k,
             p.n_dims, p.pos, p.rope_kind, p.is_imrope, p.sections,
-            p.freq_scale, p.ext_factor, p.attn_factor, p.corr_dims, p.theta_scale, p.freq_factors);
+            p.freq_scale, p.ext_factor, p.attn_factor, p.corr_dims, p.theta_scale, p.freq_factors, p.pow_table);
     }
 }
 
@@ -1325,6 +1324,46 @@ static void attn_prep_launch_types(const ggml_cuda_attn_prep & p, cudaStream_t s
     } else {
         attn_prep_launch<HD, float, half>(p, stream);
     }
+}
+
+static std::mutex attn_prep_pow_mutex;
+static std::map<std::pair<int, uint64_t>, float *> attn_prep_pow_tables; // (device, key) -> 256 floats, never rewritten
+
+// the immutable table for (device, theta_scale, n_pairs), created on first use outside graph capture; nullptr if it
+// does not exist yet and the stream is capturing (or n_pairs is out of range)
+static const float * attn_prep_pow_table(const int device, cudaStream_t stream, const float theta_scale, const int n_pairs) {
+    if (n_pairs <= 0 || n_pairs > 256) {
+        return nullptr;
+    }
+    uint32_t ts_bits;
+    memcpy(&ts_bits, &theta_scale, sizeof(ts_bits));
+    const uint64_t key = ((uint64_t) n_pairs << 32) | ts_bits;
+    std::lock_guard<std::mutex> lock(attn_prep_pow_mutex);
+    const auto it = attn_prep_pow_tables.find({device, key});
+    if (it != attn_prep_pow_tables.end()) {
+        return it->second;
+    }
+#if defined(GGML_USE_HIP)
+    hipStreamCaptureStatus status;
+    CUDA_CHECK(hipStreamIsCapturing(stream, &status));
+    if (status != hipStreamCaptureStatusNone) {
+        return nullptr;
+    }
+#else
+    cudaStreamCaptureStatus status;
+    CUDA_CHECK(cudaStreamIsCapturing(stream, &status));
+    if (status != cudaStreamCaptureStatusNone) {
+        return nullptr;
+    }
+#endif // defined(GGML_USE_HIP)
+    float * table = nullptr;
+    CUDA_CHECK(cudaMalloc(&table, 256*sizeof(float)));
+    attn_prep_pow_init<<<1, 256, 0, stream>>>(table, theta_scale, n_pairs);
+    CUDA_CHECK(cudaGetLastError());
+    // once per key and device: the table is complete before any launch (on any stream) can be handed the pointer
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    attn_prep_pow_tables.emplace(std::make_pair(device, key), table);
+    return table;
 }
 
 bool ggml_cuda_attn_prep_supported(const int64_t head_dim, const ggml_type k_type, const ggml_type v_type) {
@@ -1389,6 +1428,7 @@ void ggml_cuda_op_attn_prep_fused(ggml_backend_cuda_context & ctx, ggml_tensor *
     ggml_rope_yarn_corr_dims(p.n_dims, n_ctx_orig, freq_base, beta_fast, beta_slow, p.corr_dims.v);
 
     cudaStream_t stream = ctx.stream();
+    p.pow_table = attn_prep_pow_table(ctx.device, stream, p.theta_scale, p.n_dims / 2);
     switch (q->ne[0]) {
         case 128: attn_prep_launch_types<128>(p, stream); break;
         case 256: attn_prep_launch_types<256>(p, stream); break;
