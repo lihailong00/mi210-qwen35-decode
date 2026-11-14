@@ -36,6 +36,7 @@
 #include "ggml-cuda/mmq.cuh"
 #include "ggml-cuda/mmvf.cuh"
 #include "ggml-cuda/mmvq.cuh"
+#include "ggml-cuda/mmvq-fused-host.cuh"
 #include "ggml-cuda/moe-weighted-reduction.cuh"
 #include "ggml-cuda/norm.cuh"
 #include "ggml-cuda/opt-step-adamw.cuh"
@@ -777,6 +778,7 @@ struct ggml_backend_cuda_buffer_context {
 #if defined(GGML_USE_HIP)
     std::mutex codex_iq3_mutex;
     std::unordered_map<const void *, void *> codex_iq3_cache;
+    std::map<std::pair<const void *, int>, void *> repack_cache;
 #endif
 
     ggml_backend_cuda_buffer_context(int device, void * dev_ptr) :
@@ -786,8 +788,9 @@ struct ggml_backend_cuda_buffer_context {
 
     ~ggml_backend_cuda_buffer_context() {
 #if defined(GGML_USE_HIP)
-        if (!codex_iq3_cache.empty()) ggml_cuda_set_device(device);
+        if (!codex_iq3_cache.empty() || !repack_cache.empty()) ggml_cuda_set_device(device);
         for (auto & entry : codex_iq3_cache) CUDA_CHECK(hipFree(entry.second));
+        for (auto & entry : repack_cache) CUDA_CHECK(hipFree(entry.second));
 #endif
         CUDA_CHECK(cudaFree(dev_ptr));
     }
@@ -919,6 +922,35 @@ const void * codex_iq3_get_packed(const ggml_tensor * tensor, int device, hipStr
     CUDA_CHECK(hipGetLastError());
     CUDA_CHECK(hipStreamSynchronize(stream));
     buffer->codex_iq3_cache.emplace(tensor->data,memory);
+    return memory;
+}
+
+const void * ggml_cuda_get_repacked(const ggml_tensor * tensor, int device, hipStream_t stream, int kind, size_t bytes, ggml_cuda_repack_fn fn) {
+    if (!tensor || tensor->view_src || !tensor->buffer || !ggml_backend_buffer_is_cuda(tensor->buffer) ||
+            ggml_backend_buffer_get_usage(tensor->buffer) != GGML_BACKEND_BUFFER_USAGE_WEIGHTS) {
+        return nullptr;
+    }
+    auto * buffer = static_cast<ggml_backend_cuda_buffer_context *>(tensor->buffer->context);
+    if (buffer->device != device) return nullptr;
+    std::lock_guard<std::mutex> guard(buffer->codex_iq3_mutex);
+    const auto key = std::make_pair((const void *) tensor->data, kind);
+    auto it = buffer->repack_cache.find(key);
+    if (it != buffer->repack_cache.end()) return it->second;
+    hipStreamCaptureStatus status;
+    CUDA_CHECK(hipStreamIsCapturing(stream, &status));
+    if (status != hipStreamCaptureStatusNone) return nullptr;
+    size_t free_bytes, total_bytes;
+    CUDA_CHECK(hipMemGetInfo(&free_bytes, &total_bytes));
+    if (free_bytes < bytes + size_t(4)*1024*1024*1024) return nullptr;
+    void * memory = nullptr;
+    if (hipMalloc(&memory, bytes) != hipSuccess) {
+        (void) hipGetLastError();
+        return nullptr;
+    }
+    fn(tensor->data, memory, tensor, stream);
+    CUDA_CHECK(hipGetLastError());
+    CUDA_CHECK(hipStreamSynchronize(stream));
+    buffer->repack_cache.emplace(key, memory);
     return memory;
 }
 #endif
@@ -2726,7 +2758,9 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
                     ggml_cuda_op_geglu(ctx, dst);
                     break;
                 case GGML_GLU_OP_SWIGLU:
-                    ggml_cuda_op_swiglu(ctx, dst);
+                    if (!ggml_cuda_swiglu_q8(ctx, dst)) {
+                        ggml_cuda_op_swiglu(ctx, dst);
+                    }
                     break;
                 case GGML_GLU_OP_SWIGLU_OAI:
                     ggml_cuda_op_swiglu_oai(ctx, dst);
@@ -5348,7 +5382,9 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     }
 
     if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL }, {})) {
-        ggml_cuda_op_rms_norm_fused(*cuda_ctx, node, cgraph->nodes[i + 1]);
+        if (!ggml_cuda_rms_norm_mul_q8(*cuda_ctx, node, cgraph->nodes[i + 1])) {
+            ggml_cuda_op_rms_norm_fused(*cuda_ctx, node, cgraph->nodes[i + 1]);
+        }
         return 1;
     }
 
@@ -5370,7 +5406,9 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_UNARY, GGML_OP_MUL }, { GGML_UNARY_OP_SILU }) ||
         ggml_cuda_can_fuse(cgraph, i, { GGML_OP_UNARY, GGML_OP_MUL }, { GGML_UNARY_OP_SIGMOID }) ||
         ggml_cuda_can_fuse(cgraph, i, { GGML_OP_UNARY, GGML_OP_MUL }, { GGML_UNARY_OP_SOFTPLUS })) {
-        ggml_cuda_op_unary_mul(*cuda_ctx, node, cgraph->nodes[i + 1]);
+        if (!ggml_cuda_unary_mul_q8(*cuda_ctx, node, cgraph->nodes[i + 1])) {
+            ggml_cuda_op_unary_mul(*cuda_ctx, node, cgraph->nodes[i + 1]);
+        }
         return 1;
     }
 
@@ -5644,6 +5682,9 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     ggml_cuda_set_device(cuda_ctx->device);
     ggml_cuda_upload_flush(cuda_ctx); // before any capture begins
     ggml_cuda_upload_alternate_counter++;
+#if defined(GGML_USE_HIP)
+    ggml_cuda_mmvq_cache_reset(*cuda_ctx);
+#endif
 
     bool use_cuda_graph             = false;
     bool cuda_graph_update_required = false;
