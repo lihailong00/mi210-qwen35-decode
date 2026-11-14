@@ -25,8 +25,25 @@ static bool iq4k_enabled() {
 
 // the layout of the copy (row interleave, round tiling) follows the launch configuration that will consume it
 static int iq4k_ncu() { return ggml_cuda_info().devices[ggml_cuda_get_device()].nsm; }
+// tuning override for the single-matrix launcher at K <= 8192 (row-interleaved layout, IL = 64/L; the cache key
+// includes IL): GGML_MMVQ_IQ4K_X="L:NW" (IQ4_XS), GGML_MMVQ_IQ4K_Q="L:NW" (Q4_K). Default: iq4k::pick_cfg.
+static iq4k::cfg iq4k_pick_cfg(ggml_type type, int N, int K, int ncu) {
+    iq4k::cfg c = iq4k::pick_cfg(type, N, K, ncu);
+    static const char * ex = getenv("GGML_MMVQ_IQ4K_X");
+    static const char * eq = getenv("GGML_MMVQ_IQ4K_Q");
+    const char * e = type == GGML_TYPE_IQ4_XS ? ex : eq;
+    int L = 0, NW = 0;
+    if (e && !c.rt && sscanf(e, "%d:%d", &L, &NW) == 2 && (L == 16 || L == 32 || L == 64) && NW >= 1 && NW <= 16) {
+        iq4k::cfg o = c; o.L = L; o.NW = NW;
+        if (iq4k::shape_ok(o, type, K, N)) {
+            c = o;
+        }
+    }
+    return c;
+}
 static void iq4k_repack_single(const void * src, void * dst, const ggml_tensor * t, hipStream_t stream) {
-    iq4k::repack(t->type, src, dst, t->ne[1], (int) t->ne[0], stream, iq4k_ncu());
+    const int ncu = iq4k_ncu();
+    iq4k::repack_cfg(t->type, src, dst, t->ne[1], (int) t->ne[0], iq4k_pick_cfg(t->type, (int) t->ne[1], (int) t->ne[0], ncu), stream);
 }
 static void iq4k_repack_glu(const void * src, void * dst, const ggml_tensor * t, hipStream_t stream) {
     iq4k::repack_glu(t->type, src, dst, t->ne[1], (int) t->ne[0], stream, iq4k_ncu());
@@ -64,7 +81,7 @@ bool ggml_cuda_mmvq_iq4k_wants(const ggml_tensor * src0) {
     const int64_t K = src0->ne[0], N = src0->ne[1];
     return K % QK_K == 0 && K <= 32768 && N >= 2048 && ggml_is_matrix(src0) && ggml_is_contiguous(src0) &&
         GGML_CUDA_CC_IS_CDNA2(ggml_cuda_info().devices[ggml_cuda_get_device()].cc) &&
-        iq4k::shape_ok(iq4k::pick_cfg(src0->type, (int) N, (int) K, ggml_cuda_info().devices[ggml_cuda_get_device()].nsm), src0->type, (int) K, (int) N);
+        iq4k::shape_ok(iq4k_pick_cfg(src0->type, (int) N, (int) K, ggml_cuda_info().devices[ggml_cuda_get_device()].nsm), src0->type, (int) K, (int) N);
 }
 
 // ---- grouped launch (iq4k-r3): GEMVs that share the activation, one launch, round-robin units over the concatenated
@@ -214,7 +231,7 @@ bool ggml_cuda_mmvq_iq4k(ggml_backend_cuda_context & ctx, const ggml_tensor * sr
         return false;
     }
     const int ncu = ggml_cuda_info().devices[device].nsm;
-    const iq4k::cfg c = gate ? iq4k::pick_cfg_glu(type, (int) N, (int) K, ncu) : iq4k::pick_cfg(type, (int) N, (int) K, ncu);
+    const iq4k::cfg c = gate ? iq4k::pick_cfg_glu(type, (int) N, (int) K, ncu) : iq4k_pick_cfg(type, (int) N, (int) K, ncu);
     if (!iq4k::shape_ok(c, type, (int) K, (int) N)) {
         return false;
     }
@@ -241,7 +258,10 @@ bool ggml_cuda_mmvq_iq4k(ggml_backend_cuda_context & ctx, const ggml_tensor * sr
         }
         ok = iq4k::launch_glu(type, up_soa, gate_soa, src1_q8_1, dst_d, (int) K, (int) N, stream, scratch, cnt, ncu);
     } else {
-        ok = iq4k::launch(type, up_soa, src1_q8_1, dst_d, (int) K, (int) N, stream, scratch, cnt, residual, ncu);
+        const iq4k::soa s = iq4k::soa_make(type, up_soa, (size_t) N*(K/QK_K));
+        ok = type == GGML_TYPE_IQ4_XS ?
+            iq4k::dispatch<iq4k::iq4xs_t, false>(c, s, s, src1_q8_1, dst_d, (int) K, (int) N, stream, residual, scratch, cnt) :
+            iq4k::dispatch<iq4k::q4k_t,   false>(c, s, s, src1_q8_1, dst_d, (int) K, (int) N, stream, residual, scratch, cnt);
     }
     if (!ok) {
         return false;
