@@ -4645,6 +4645,86 @@ static int ggml_cuda_try_fattn_gate_fusion(ggml_backend_cuda_context * cuda_ctx,
     return im - i;
 }
 
+#if defined(GGML_USE_HIP)
+// Single-token BF16 thin GEMV + elementwise epilogue chain (qwen35 ssm_beta / ssm_alpha):
+//   MUL_MAT -> RESHAPE -> UNARY(SIGMOID)                          epi 1
+//   MUL_MAT -> RESHAPE -> ADD(bias) -> UNARY(SOFTPLUS) -> MUL(a)  epi 2
+// Returns the number of nodes of the chain starting at k (0: no match).
+static int ggml_cuda_bf16_epi_chain(const ggml_cgraph * cgraph, const int k, const ggml_tensor * src1_req, ggml_cuda_bf16_epi_job & job) {
+    if (k + 2 >= cgraph->n_nodes) {
+        return 0;
+    }
+    ggml_tensor * mm = cgraph->nodes[k];
+    if (mm->op != GGML_OP_MUL_MAT || mm->src[0]->type != GGML_TYPE_BF16 || mm->src[1]->type != GGML_TYPE_F32 ||
+            mm->type != GGML_TYPE_F32 || mm->src[0]->ne[1] > 4096 || ggml_nelements(mm) != mm->src[0]->ne[1] ||
+            ggml_nelements(mm->src[1]) != mm->src[0]->ne[0] || (src1_req && mm->src[1] != src1_req)) {
+        return 0;
+    }
+    const int64_t N = mm->ne[0];
+    const ggml_tensor * rs = cgraph->nodes[k + 1];
+    if (rs->op != GGML_OP_RESHAPE || rs->src[0] != mm) {
+        return 0;
+    }
+    // contiguous f32 with N elements (any shape, e.g. the [1, N] beta reshape)
+    auto vec_ok = [N](const ggml_tensor * t) {
+        return t != nullptr && t->type == GGML_TYPE_F32 && ggml_is_contiguous(t) && ggml_nelements(t) == N;
+    };
+    // operands of the elementwise ADD / MUL: additionally ne0 == N, so there is no broadcasting
+    auto row_ok = [N, &vec_ok](const ggml_tensor * t) {
+        return vec_ok(t) && t->ne[0] == N;
+    };
+    ggml_tensor * n2 = cgraph->nodes[k + 2];
+    if (n2->op == GGML_OP_UNARY && ggml_get_unary_op(n2) == GGML_UNARY_OP_SIGMOID && n2->src[0] == rs && vec_ok(n2)) {
+        const int out = k + 2;
+        if (!ggml_can_fuse_subgraph(cgraph, k, { GGML_OP_MUL_MAT, GGML_OP_RESHAPE, GGML_OP_UNARY }, { out }) ||
+                !ggml_cuda_check_fusion_memory_ranges(cgraph, k, 3, &out, 1)) {
+            return 0;
+        }
+        job = { mm->src[0], n2, nullptr, nullptr, 1 };
+        return 3;
+    }
+    if (n2->op == GGML_OP_ADD && k + 4 < cgraph->n_nodes) {
+        const ggml_tensor * b  = n2->src[0] == rs ? n2->src[1] : (n2->src[1] == rs ? n2->src[0] : nullptr);
+        const ggml_tensor * n3 = cgraph->nodes[k + 3];
+        ggml_tensor       * n4 = cgraph->nodes[k + 4];
+        if (!row_ok(b) || !row_ok(n2) || n3->op != GGML_OP_UNARY || ggml_get_unary_op(n3) != GGML_UNARY_OP_SOFTPLUS ||
+                n3->src[0] != n2 || !row_ok(n3) || n4->op != GGML_OP_MUL || !row_ok(n4)) {
+            return 0;
+        }
+        const ggml_tensor * a = n4->src[0] == n3 ? n4->src[1] : (n4->src[1] == n3 ? n4->src[0] : nullptr);
+        if (!row_ok(a)) {
+            return 0;
+        }
+        const int out = k + 4;
+        if (!ggml_can_fuse_subgraph(cgraph, k, { GGML_OP_MUL_MAT, GGML_OP_RESHAPE, GGML_OP_ADD, GGML_OP_UNARY, GGML_OP_MUL }, { out }) ||
+                !ggml_cuda_check_fusion_memory_ranges(cgraph, k, 5, &out, 1)) {
+            return 0;
+        }
+        job = { mm->src[0], n4, (const float *) b->data, (const float *) a->data, 2 };
+        return 5;
+    }
+    return 0;
+}
+
+// one launch for the chain at i and, if the next non-view node starts another chain on the same activation, that one too
+static int ggml_cuda_try_fuse_bf16_epi(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, const int i) {
+    ggml_cuda_bf16_epi_job jobs[2];
+    const int l1 = ggml_cuda_bf16_epi_chain(cgraph, i, nullptr, jobs[0]);
+    if (l1 == 0) {
+        return 0;
+    }
+    int j = i + l1;
+    while (j < cgraph->n_nodes && ggml_cuda_is_view_or_noop(cgraph->nodes[j])) {
+        j++;
+    }
+    const int l2 = j < cgraph->n_nodes ? ggml_cuda_bf16_epi_chain(cgraph, j, cgraph->nodes[i]->src[1], jobs[1]) : 0;
+    if (!ggml_cuda_mmvf_bf16_thin_epi(*cuda_ctx, cgraph->nodes[i]->src[1], jobs, l2 > 0 ? 2 : 1)) {
+        return 0;
+    }
+    return l2 > 0 ? j + l2 - 1 - i : l1 - 1;
+}
+#endif // defined(GGML_USE_HIP)
+
 static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
 
     if (ggml_cuda_fusion_disabled()) {
@@ -4659,6 +4739,15 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
             return nodes_to_skip;
         }
     }
+
+#if defined(GGML_USE_HIP)
+    if (node->op == GGML_OP_MUL_MAT && node->src[0]->type == GGML_TYPE_BF16 && cuda_ctx->stream_context().concurrent_events.empty()) {
+        const int nodes_to_skip = ggml_cuda_try_fuse_bf16_epi(cuda_ctx, cgraph, i);
+        if (nodes_to_skip > 0) {
+            return nodes_to_skip;
+        }
+    }
+#endif
 
     // full-attention prep chain (q/k norm + rope, gate copy, k/v cache stores) as one kernel
     if (node->op == GGML_OP_RMS_NORM) {
