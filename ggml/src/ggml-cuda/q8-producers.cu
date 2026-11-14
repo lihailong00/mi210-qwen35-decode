@@ -65,11 +65,15 @@ static __global__ void __launch_bounds__(256) gated_q8_kernel(const float * __re
     q8p_quantize_1(r, i, y, ysum);
 }
 
-// rms_norm(x) * w for one row, block 1024 / 4 float4 per thread: same arithmetic as rms_norm_f32<1024, 4, true, true>
+// rms_norm(x) * w for one row (+ q8_1), same arithmetic as rms_norm_f32<1024, 4, true, true>. The q8_1 epilogue is
+// VALU-heavy, so the row is split over gridDim.x workgroups of 1024 threads: every workgroup computes the identical
+// full-row reduction (bit-identical scale), then outputs its own slice of 128 float4 (16 q8_1 blocks) with threads
+// 0..127. (One workgroup doing all 1280 float4 of a 5120 row spent ~4 us in situ on the q8 math of 16 waves on one CU.)
 template <int VPT>
 static __global__ void __launch_bounds__(1024) rms_norm_mul_q8_kernel(const float * __restrict__ x, const float * __restrict__ w,
         float * __restrict__ dst, block_q8_1 * __restrict__ y, int * __restrict__ ysum, const int ncols, const float eps) {
     constexpr int block_size = 1024;
+    constexpr int per_wg     = 128;   // float4 per workgroup slice
     __shared__ float s_sum[32];
     const int tid = threadIdx.x;
     const int ncols4 = ncols / 4;
@@ -77,16 +81,22 @@ static __global__ void __launch_bounds__(1024) rms_norm_mul_q8_kernel(const floa
     const float4 * mul4 = (const float4 *) w;
     float4       * dst4 = (float4 *) dst;
 
+    // slice operands are loaded together with the reduction inputs (shorter dependent latency chain)
+    const int  io  = blockIdx.x*per_wg + tid;
+    const bool out = tid < per_wg && io < ncols4;
+    float4 xo = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+    float4 mo = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+    if (out) {
+        xo = x4[io];
+        mo = mul4[io];
+    }
     float4 xs[VPT];
-    float4 ms[VPT];
     float  tmp = 0.0f;
-    // the weights are loaded together with x (before the reduction) to shorten the dependent latency chain
 #pragma unroll
     for (int k = 0; k < VPT; k++) {
         const int i = tid + k*block_size;
         if (i < ncols4) {
             xs[k] = x4[i];
-            ms[k] = mul4[i];
         }
     }
 #pragma unroll
@@ -99,36 +109,32 @@ static __global__ void __launch_bounds__(1024) rms_norm_mul_q8_kernel(const floa
     tmp = block_reduce<block_reduce_method::SUM, block_size>(tmp, s_sum);
     const float scale = rsqrtf(tmp / ncols + eps);
 
-#pragma unroll
-    for (int k = 0; k < VPT; k++) {
-        const int i = tid + k*block_size;
-        if (i < ncols4) {
-            float4 r = make_float4(scale*xs[k].x, scale*xs[k].y, scale*xs[k].z, scale*xs[k].w);
-            const float4 m = ms[k];
-            r.x *= m.x;
-            r.y *= m.y;
-            r.z *= m.z;
-            r.w *= m.w;
-            dst4[i] = r;
+    if (out) {
+        const int i = io;
+        float4 r = make_float4(scale*xo.x, scale*xo.y, scale*xo.z, scale*xo.w);
+        r.x *= mo.x;
+        r.y *= mo.y;
+        r.z *= mo.z;
+        r.w *= mo.w;
+        dst4[i] = r;
 
-            // q8_1: 8 consecutive threads hold one block of 32 values (ncols4 % 8 == 0, so whole groups are active)
-            float amax = fmaxf(fmaxf(fabsf(r.x), fabsf(r.y)), fmaxf(fabsf(r.z), fabsf(r.w)));
-            amax = q8p_max8(amax);
-            const float d = amax / 127.0f;
-            const float inv_d = 1.0f / d;
-            const int8_t q0 = amax == 0.0f ? 0 : q8p_round_div(r.x, d, inv_d);
-            const int8_t q1 = amax == 0.0f ? 0 : q8p_round_div(r.y, d, inv_d);
-            const int8_t q2 = amax == 0.0f ? 0 : q8p_round_div(r.z, d, inv_d);
-            const int8_t q3 = amax == 0.0f ? 0 : q8p_round_div(r.w, d, inv_d);
-            int sum = (int) q0 + (int) q1 + (int) q2 + (int) q3;
-            sum = q8p_sum8(sum);
-            const uint32_t packed = (uint32_t) (uint8_t) q0 | ((uint32_t) (uint8_t) q1 << 8) |
-                                    ((uint32_t) (uint8_t) q2 << 16) | ((uint32_t) (uint8_t) q3 << 24);
-            ((uint32_t *) y[i/8].qs)[i%8] = packed;
-            if (i % 8 == 0) {
-                y[i/8].ds = make_half2(d, d * sum);
-                ysum[i/8] = sum;
-            }
+        // q8_1: 8 consecutive threads hold one block of 32 values (per_wg % 8 == 0, so whole groups are active)
+        float amax = fmaxf(fmaxf(fabsf(r.x), fabsf(r.y)), fmaxf(fabsf(r.z), fabsf(r.w)));
+        amax = q8p_max8(amax);
+        const float d = amax / 127.0f;
+        const float inv_d = 1.0f / d;
+        const int8_t q0 = amax == 0.0f ? 0 : q8p_round_div(r.x, d, inv_d);
+        const int8_t q1 = amax == 0.0f ? 0 : q8p_round_div(r.y, d, inv_d);
+        const int8_t q2 = amax == 0.0f ? 0 : q8p_round_div(r.z, d, inv_d);
+        const int8_t q3 = amax == 0.0f ? 0 : q8p_round_div(r.w, d, inv_d);
+        int sum = (int) q0 + (int) q1 + (int) q2 + (int) q3;
+        sum = q8p_sum8(sum);
+        const uint32_t packed = (uint32_t) (uint8_t) q0 | ((uint32_t) (uint8_t) q1 << 8) |
+                                ((uint32_t) (uint8_t) q2 << 16) | ((uint32_t) (uint8_t) q3 << 24);
+        ((uint32_t *) y[i/8].qs)[i%8] = packed;
+        if (i % 8 == 0) {
+            y[i/8].ds = make_half2(d, d * sum);
+            ysum[i/8] = sum;
         }
     }
 }
@@ -233,12 +239,14 @@ bool ggml_cuda_rms_norm_mul_q8(ggml_backend_cuda_context & ctx, const ggml_tenso
     }
     float eps;
     memcpy(&eps, rms_norm->op_params, sizeof(float));
-    // VPT only bounds the per-thread loop (elements beyond ncols are skipped), so 2 and 4 give identical results
+    // VPT only bounds the per-thread loop (elements beyond ncols are skipped), so 2 and 4 give identical results;
+    // one workgroup per 128 float4 (ne0 % 512 == 0)
+    const int nwg = (int) (x->ne[0] / 512);
     if (x->ne[0] <= 8192) {
-        rms_norm_mul_q8_kernel<2><<<1, 1024, 0, ctx.stream()>>>((const float *) x->data, (const float *) w->data, (float *) mul_node->data,
+        rms_norm_mul_q8_kernel<2><<<nwg, 1024, 0, ctx.stream()>>>((const float *) x->data, (const float *) w->data, (float *) mul_node->data,
                 y, ysum, (int) x->ne[0], eps);
     } else {
-        rms_norm_mul_q8_kernel<4><<<1, 1024, 0, ctx.stream()>>>((const float *) x->data, (const float *) w->data, (float *) mul_node->data,
+        rms_norm_mul_q8_kernel<4><<<nwg, 1024, 0, ctx.stream()>>>((const float *) x->data, (const float *) w->data, (float *) mul_node->data,
                 y, ysum, (int) x->ne[0], eps);
     }
     CUDA_CHECK(cudaGetLastError());
