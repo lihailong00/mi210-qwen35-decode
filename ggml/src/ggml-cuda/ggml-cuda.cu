@@ -952,6 +952,13 @@ const void * ggml_cuda_get_repacked(const ggml_tensor * tensor, int device, hipS
     buffer->repack_cache.emplace(key, memory);
     return memory;
 }
+
+bool ggml_cuda_has_repacked(const ggml_tensor * tensor, int kind) {
+    if (!tensor || tensor->view_src || !tensor->buffer || !ggml_backend_buffer_is_cuda(tensor->buffer)) return false;
+    auto * buffer = static_cast<ggml_backend_cuda_buffer_context *>(tensor->buffer->context);
+    std::lock_guard<std::mutex> guard(buffer->codex_iq3_mutex);
+    return buffer->repack_cache.find(std::make_pair((const void *) tensor->data, kind)) != buffer->repack_cache.end();
+}
 #endif
 
 static void * ggml_backend_cuda_buffer_get_base(ggml_backend_buffer_t buffer) {
@@ -2181,7 +2188,14 @@ static bool ggml_cuda_should_fuse_mul_mat(const ggml_tensor * ffn_up,
 
     if (ffn_up->src[0]->type != ffn_gate->src[0]->type || !ggml_are_same_shape(ffn_up->src[0], ffn_gate->src[0]) ||
         !ggml_are_same_stride(ffn_up->src[0], ffn_gate->src[0])) {
+#if defined(GGML_USE_HIP)
+        // IQ3_S + IQ3_XXS gate/up pairs: fused by the single-token iq3gemv kernel (mmvq-iq3.cu)
+        if (!(is_mul_mat && !has_bias && !has_scale && ggml_cuda_mmvq_iq3_fuse_mixed_ok(ffn_up->src[0], ffn_gate->src[0]))) {
+            return false;
+        }
+#else
         return false;
+#endif
     }
 
     if (ffn_up->src[1] != ffn_gate->src[1]) {

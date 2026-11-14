@@ -1760,7 +1760,8 @@ void ggml_cuda_mul_mat_vec_q(
             fusion_local.x_bias = fusion->x_bias->data;
         }
         if (fusion->gate) {
-            GGML_ASSERT(fusion->gate->type == src0->type && ggml_are_same_stride(fusion->gate, src0));
+            GGML_ASSERT((fusion->gate->type == src0->type && ggml_are_same_stride(fusion->gate, src0)) ||
+                        ggml_cuda_mmvq_iq3_fuse_mixed_ok(src0, fusion->gate));   // mixed IQ3_S/IQ3_XXS: mmvq-iq3.cu
             fusion_local.gate = fusion->gate->data;
         }
         if (fusion->gate_bias) {
@@ -1821,6 +1822,14 @@ void ggml_cuda_mul_mat_vec_q(
         src1_q8_1_ptr = (const block_q8_1 *) src1_q8_1_alloc.get();
         src1_sums = nullptr;
     }
+
+#if defined(GGML_USE_HIP)
+    // IQ3_S / IQ3_XXS on the iq3gemv SoA re-layout (no codex packed copies are created for tensors handled here)
+    if (!ids && ne11 == 1 && ne12 == 1 && ne13 == 1 &&
+            ggml_cuda_mmvq_iq3(ctx, src0, src1_q8_1_ptr, dst, fusion)) {
+        return;
+    }
+#endif
 
 #if defined(GGML_USE_HIP)
     if (!ids && ne11 == 1 && ne12 == 1 && ne13 == 1 &&

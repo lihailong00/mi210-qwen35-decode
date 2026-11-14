@@ -20,3 +20,10 @@ bool ggml_cuda_unary_mul_q8(ggml_backend_cuda_context & ctx, ggml_tensor * unary
 // Single-token GEMV for IQ2_S/IQ2_XS/IQ2_XXS/Q2_K/IQ1_M on SoA re-laid-out weights (activation already quantized to q8_1).
 bool ggml_cuda_mmvq_lowbit(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const block_q8_1 * src1_q8_1, ggml_tensor * dst,
         const ggml_cuda_mm_fusion_args_host * fusion);
+
+// Single-token GEMV for IQ3_S/IQ3_XXS on the iq3gemv SoA re-layout (mmvq-iq3.cu; replaces the codex packed copies).
+// Handles plain, residual (fusion->x_bias) and SwiGLU gate/up (fusion->gate) GEMVs; returns false to fall back.
+bool ggml_cuda_mmvq_iq3(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const block_q8_1 * src1_q8_1, ggml_tensor * dst,
+        const ggml_cuda_mm_fusion_args_host * fusion);
+// true if a gate/up pair of different IQ3 types (IQ3_S + IQ3_XXS) can be fused by ggml_cuda_mmvq_iq3
+bool ggml_cuda_mmvq_iq3_fuse_mixed_ok(const ggml_tensor * up_w, const ggml_tensor * gate_w);
