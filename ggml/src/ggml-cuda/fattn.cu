@@ -738,6 +738,20 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
         return BEST_FATTN_KERNEL_MMA_F16;
     }
 
+    // experiment override: GGML_CUDA_FA_FORCE=vec|tile
+    {
+        static const char * force = getenv("GGML_CUDA_FA_FORCE");
+        if (force && strcmp(force, "vec") == 0 && can_use_vector_kernel) {
+            return BEST_FATTN_KERNEL_VEC;
+        }
+        if (force && strcmp(force, "tile") == 0) {
+            return BEST_FATTN_KERNEL_TILE;
+        }
+        if (force && strcmp(force, "mma") == 0 && amd_mfma_available(cc)) {
+            return BEST_FATTN_KERNEL_MMA_F16;
+        }
+    }
+
     // If there are no tensor cores available, use the generic tile kernel:
     if (can_use_vector_kernel) {
         if (!ggml_is_quantized(K->type) && !ggml_is_quantized(V->type)) {
