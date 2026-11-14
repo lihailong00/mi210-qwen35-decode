@@ -120,6 +120,52 @@ static __global__ void repack_rt_q4_K(const block_q4_K * __restrict__ src, uint8
     }
 }
 
+// Stream-K round-tiled layout (SK+RT): W = nunits*q steps split into ranges of T = ceil(W/NWV) steps (nact active
+// waves, the last one gets `last` steps). Step s belongs to wave w = s/T at local step j = s%T; its chunk is stored
+// step-major over the waves: j*nact + w (j < last), last*nact + (j-last)*(nact-1) + w (j >= last). Every grid step
+// reads one contiguous slab and every wave does the same number of steps.
+struct skgeo { int T, nact, last; };
+static __host__ __device__ __forceinline__ skgeo sk_geo(const int64_t W, const int NWV) {
+    skgeo g; g.T = (int) ((W + NWV - 1)/NWV); g.nact = (int) ((W + g.T - 1)/g.T); g.last = (int) (W - (int64_t) (g.nact - 1)*g.T); return g;
+}
+static __host__ __device__ __forceinline__ size_t sk_chunk(const int w, const int j, const skgeo & g) {
+    return j < g.last ? (size_t) j*g.nact + w : (size_t) g.last*g.nact + (size_t) (j - g.last)*(g.nact - 1) + w;
+}
+static __host__ __device__ __forceinline__ size_t sk_chunk_of_step(const int64_t st, const skgeo & g) {
+    return sk_chunk((int) (st / g.T), (int) (st % g.T), g);
+}
+template <int IPB, int SB>
+static __global__ void repack_skrt(const uint8_t * __restrict__ src, uint8_t * __restrict__ dst, const int64_t nb, const int bpr,
+        const int IL, const int L, const int NWV) {
+    const int64_t g = blockIdx.x*(int64_t) blockDim.x + threadIdx.x;
+    if (g >= nb) return;
+    constexpr int BB = SB + 128;   // block bytes: header + codes
+    const uint8_t * b = src + g*BB;
+    const int64_t row = g / bpr; const int blk = (int) (g % bpr);
+    const int ipr = bpr*IPB, q = ipr/L, nunits = (int) (nb/bpr)/IL;
+    const skgeo geo = sk_geo((int64_t) nunits*q, NWV);
+    const int64_t u = row / IL; const int ri = (int) (row % IL);
+    {
+        const int it = IPB*blk, kk = it / L, l = it % L;
+        const size_t e = sk_chunk_of_step(u*q + kk, geo)*(L/IPB)*IL + (l/IPB)*IL + ri;
+        if (SB == 8) { ((uint32_t *) (dst + nb*128 + e*8))[0] = ((const uint32_t *) b)[0]; ((uint32_t *) (dst + nb*128 + e*8))[1] = ((const uint32_t *) b)[1]; }
+        else *(uint4 *) (dst + nb*128 + e*16) = *(const uint4 *) b;
+    }
+#pragma unroll
+    for (int jj = 0; jj < IPB; ++jj) {
+        const int it = IPB*blk + jj, kk = it / L, l = it % L;
+        const size_t c = sk_chunk_of_step(u*q + kk, geo)*L*IL + l*IL + ri;
+        if (IPB == 8) {   // IQ4_XS: 16 B of codes per sub-block (8-byte aligned source)
+            const uint32_t * sq = (const uint32_t *) (b + SB + 16*jj);
+            uint32_t * Q = (uint32_t *) (dst + c*16);
+            Q[0] = sq[0]; Q[1] = sq[1]; Q[2] = sq[2]; Q[3] = sq[3];
+        } else {          // Q4_K: pair jj = 32 B -> plane A (low half) / plane B (high half)
+            *(uint4 *) (dst + c*16)         = *(const uint4 *) (b + SB + 32*jj);
+            *(uint4 *) (dst + nb*64 + c*16) = *(const uint4 *) (b + SB + 32*jj + 16);
+        }
+    }
+}
+
 // ---------------------------------------------------------------- IQ4_NL lookup (v_perm, as get_int_from_table_16)
 // kvalues_iq4nl = {-127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113}
 struct tab4 { uint32_t t0, t1, t2, t3; };
@@ -324,7 +370,7 @@ template <int L> static __device__ __forceinline__ float group_sum(float v) {
 // Results go to LDS during the loop and are written after it.
 // GLU: dst = (W_up . y) * silu(W_gate . y) (same type/shape); residual (optional): dst = W . y + residual.
 // Requirements: K % 256 == 0, N % (G*R) == 0.
-template <class T, int L, int R, bool GLU, bool SK, bool RT = false, bool EX = false>
+template <class T, int L, int R, bool GLU, bool SK, bool RT = false, bool EX = false, int U = 1>
 __launch_bounds__(1024, 1)
 __global__ void gemv(const soa s, const soa sg, const block_q8_1 * __restrict__ yg, float * __restrict__ dst,
         const int K, const int N, const float * __restrict__ residual, float * __restrict__ scratch, unsigned int * __restrict__ cnt) {
@@ -335,7 +381,7 @@ __global__ void gemv(const soa s, const soa sg, const block_q8_1 * __restrict__ 
     const int grp  = threadIdx.x / L;
     const uint32_t bpr = K / QK_K;
     const int ipr    = bpr*T::IPB;
-    const int q      = (ipr + L - 1) / L;
+    const int q      = (ipr + L*U - 1) / (L*U);   // steps per unit (U items per lane per step)
     const bool exact = ipr % L == 0;
     const int nunits = N / GR;
     const int wy     = __builtin_amdgcn_readfirstlane(threadIdx.y);   // wave index in the workgroup (uniform)
@@ -345,8 +391,10 @@ __global__ void gemv(const soa s, const soa sg, const block_q8_1 * __restrict__ 
     // SK: contiguous range [b, e) of the global step stream (units u = step/q).
     // !SK: round robin units w, w + nwaves, ... (all complete); local unit counter cu -> global unit w + cu*nwaves.
     const int myu    = SK ? 0 : (w < nunits ? (nunits - 1 - w)/nwaves + 1 : 0);
-    const int b      = SK ? (int) ((int64_t) w*W/nwaves) : 0;
-    const int e      = SK ? (int) ((int64_t) (w + 1)*W/nwaves) : myu*q;
+    const skgeo geo  = sk_geo(W, nwaves);
+    // SK+RT: equal ranges of geo.T steps (waves >= nact idle); plain SK: proportional ranges
+    const int b      = SK ? (RT ? (w < geo.nact ? w*geo.T : (int) W) : (int) ((int64_t) w*W/nwaves)) : 0;
+    const int e      = SK ? (RT ? (w < geo.nact - 1 ? b + geo.T : (int) W) : (int) ((int64_t) (w + 1)*W/nwaves)) : myu*q;
     const int maxu   = SK ? (int) (((W + nwaves - 1)/nwaves + q - 1)/q) + 1 : (nunits + nwaves - 1)/nwaves;
     const int u0     = b / q;
     auto gunit = [&](const int cu) -> int { return SK ? cu : w + cu*nwaves; };
@@ -354,8 +402,8 @@ __global__ void gemv(const soa s, const soa sg, const block_q8_1 * __restrict__ 
     const typename T::lc c = T::lane_consts(lane);
 
     typedef typename T::raw raw;
-    raw A[R], B[R];
-    raw Ag[GLU ? R : 1], Bg[GLU ? R : 1];
+    raw A[U*R], B[U*R];
+    raw Ag[GLU ? U*R : 1], Bg[GLU ? U*R : 1];
 
     const int ue = (e - 1)/q, ke = (e - 1) % q;   // last real step
     int ls = b, lu = u0, lk = b % q;              // load cursor
@@ -365,23 +413,30 @@ __global__ void gemv(const soa s, const soa sg, const block_q8_1 * __restrict__ 
 #pragma unroll
     for (int r = 0; r < R; ++r) { qlane[r] = lane*GR + grp*R + r; slane[r] = (lane/T::IPB)*GR + grp*R + r; }
     const uint32_t boff = RT ? (uint32_t) (nbk*4) : 4*bpr*GR;
-    auto load_step = [&](raw (&bb)[R], raw (&bg)[GLU ? R : 1]) {
+    auto load_step = [&](raw (&bb)[U*R], raw (&bg)[GLU ? U*R : 1]) {
         const bool past = ls >= e;
         if constexpr (EX) {
             const int kr = past ? ue : lu, kk = past ? ke : lk;
             uint32_t qs_, ss_;
-            if constexpr (RT) {
+            if constexpr (SK && RT) {
+                const int j = (past ? e - 1 : ls) - b;
+                const uint32_t ch = (uint32_t) sk_chunk(w, j, geo);
+                qs_ = ch*(U*L*GR); ss_ = ch*((U*L/T::IPB)*GR);
+            } else if constexpr (RT) {
                 const int nur = min(nwaves, nunits - kr*nwaves);
                 const uint32_t ch = (uint32_t) (kr*nwaves*q + kk*nur + w);
-                qs_ = ch*(L*GR); ss_ = ch*((L/T::IPB)*GR);
+                qs_ = ch*(U*L*GR); ss_ = ch*((U*L/T::IPB)*GR);
             } else {
                 const uint32_t un = (uint32_t) gunit(kr);
-                qs_ = (un*bpr*8 + kk*L)*GR; ss_ = (un*bpr + kk*(L/T::IPB))*GR;
+                qs_ = (un*bpr*8 + kk*U*L)*GR; ss_ = (un*bpr + kk*(U*L/T::IPB))*GR;
             }
 #pragma unroll
+            for (int uu = 0; uu < U; ++uu)
+#pragma unroll
             for (int r = 0; r < R; ++r) {
-                bb[r] = T::load_c(s, qs_ + qlane[r], ss_ + slane[r], boff);
-                if constexpr (GLU) bg[r] = T::load_c(sg, qs_ + qlane[r], ss_ + slane[r], boff);
+                const uint32_t qo = qs_ + uu*(L*GR) + qlane[r], so = ss_ + uu*((L/T::IPB)*GR) + slane[r];
+                bb[uu*R + r] = T::load_c(s, qo, so, boff);
+                if constexpr (GLU) bg[uu*R + r] = T::load_c(sg, qo, so, boff);
             }
         } else if constexpr (RT) {   // round-robin only: round = local unit index, position = w (requires ipr % L == 0)
             const int kr = past ? ue : lu, kk = past ? ke : lk;
@@ -416,15 +471,18 @@ __global__ void gemv(const soa s, const soa sg, const block_q8_1 * __restrict__ 
 #pragma unroll
     for (int r = 0; r < R; ++r) { acc[r] = 0.0f; if constexpr (GLU) accg[r] = 0.0f; }
     int cs = b, cu = u0, ck = b % q;              // compute cursor
-    auto compute_step = [&](raw (&bb)[R], raw (&bg)[GLU ? R : 1]) {
-        const int itl = lane + L*ck;
-        const uint32_t * yr = EX ? ysm + lane*T::YW + ck*(L*T::YW) : ysm + min(itl, ipr - 1)*T::YW;
-        const bool valid = EX || exact || itl < ipr;
+    auto compute_step = [&](raw (&bb)[U*R], raw (&bg)[GLU ? U*R : 1]) {
 #pragma unroll
-        for (int r = 0; r < R; ++r) {
-            const float v = T::compute(bb[r], yr, c);
-            acc[r] += valid ? v : 0.0f;
-            if constexpr (GLU) { const float vg = T::compute(bg[r], yr, c); accg[r] += valid ? vg : 0.0f; }
+        for (int uu = 0; uu < U; ++uu) {
+            const int itl = lane + L*(ck*U + uu);
+            const uint32_t * yr = EX ? ysm + lane*T::YW + (ck*U + uu)*(L*T::YW) : ysm + min(itl, ipr - 1)*T::YW;
+            const bool valid = EX || exact || itl < ipr;
+#pragma unroll
+            for (int r = 0; r < R; ++r) {
+                const float v = T::compute(bb[uu*R + r], yr, c);
+                acc[r] += valid ? v : 0.0f;
+                if constexpr (GLU) { const float vg = T::compute(bg[uu*R + r], yr, c); accg[r] += valid ? vg : 0.0f; }
+            }
         }
         if (ck == q - 1 || cs == e - 1) {         // end of a unit or of the range (uniform)
             if (cs < e) {
@@ -499,8 +557,8 @@ __global__ void gemv(const soa s, const soa sg, const block_q8_1 * __restrict__ 
 
 template <class T> static inline size_t lds_bytes(int K) { return (size_t) (K/32/T::YPI)*T::YW*4; }
 // + per-wave unit results: blockDim.y * maxu * NV * G*R floats
-template <class T> static inline size_t lds_bytes_total(int K, int N, int L, int R, int NW, int grid, bool glu = false, bool sk = false) {
-    const int G = 64/L, ipb = T::IPB, ipr = (K/256)*ipb, q = (ipr + L - 1)/L, nunits = N/(G*R), nwaves = grid*NW;
+template <class T> static inline size_t lds_bytes_total(int K, int N, int L, int R, int NW, int grid, bool glu = false, bool sk = false, int U = 1) {
+    const int G = 64/L, ipb = T::IPB, ipr = (K/256)*ipb, q = (ipr + L*U - 1)/(L*U), nunits = N/(G*R), nwaves = grid*NW;
     const int64_t W = (int64_t) nunits*q;
     const int maxu = sk ? (int) (((W + nwaves - 1)/nwaves + q - 1)/q) + 1 : (nunits + nwaves - 1)/nwaves;
     return lds_bytes<T>(K) + (size_t) NW*maxu*(glu ? 2 : 1)*G*R*4;
@@ -528,9 +586,12 @@ static constexpr size_t CNT_UINTS      = 1 << 13;
 template <class T, int L, int R, bool GLU>
 static inline void launch_k(const cfg & c, const soa & s, const soa & sg, const block_q8_1 * y, float * dst, int K, int N,
         hipStream_t st, const float * residual, float * scratch, unsigned int * cnt) {
-    const size_t lds = lds_bytes_total<T>(K, N, L, R, c.NW, c.grid, GLU, c.sk);
+    const size_t lds = lds_bytes_total<T>(K, N, L, R, c.NW, c.grid, GLU, c.sk, c.U);
     const bool ex = ((K/QK_K)*T::IPB) % L == 0;
-    if (c.sk)      hipLaunchKernelGGL((gemv<T, L, R, GLU, true>),               dim3(c.grid), dim3(64, c.NW), lds, st, s, sg, y, dst, K, N, residual, scratch, cnt);
+    if (c.U == 2 && c.rt && !c.sk) { hipLaunchKernelGGL((gemv<T, L, R, GLU, false, true, true, 2>),  dim3(c.grid), dim3(64, c.NW), lds, st, s, sg, y, dst, K, N, residual, scratch, cnt); return; }
+    if (c.U == 2 && !c.rt && !c.sk) { hipLaunchKernelGGL((gemv<T, L, R, GLU, false, false, true, 2>), dim3(c.grid), dim3(64, c.NW), lds, st, s, sg, y, dst, K, N, residual, scratch, cnt); return; }
+    if (c.sk && c.rt) hipLaunchKernelGGL((gemv<T, L, R, GLU, true, true, true>), dim3(c.grid), dim3(64, c.NW), lds, st, s, sg, y, dst, K, N, residual, scratch, cnt);
+    else if (c.sk) hipLaunchKernelGGL((gemv<T, L, R, GLU, true>),               dim3(c.grid), dim3(64, c.NW), lds, st, s, sg, y, dst, K, N, residual, scratch, cnt);
     else if (c.rt) hipLaunchKernelGGL((gemv<T, L, R, GLU, false, true, true>),  dim3(c.grid), dim3(64, c.NW), lds, st, s, sg, y, dst, K, N, residual, scratch, cnt);
     else if (ex)   hipLaunchKernelGGL((gemv<T, L, R, GLU, false, false, true>), dim3(c.grid), dim3(64, c.NW), lds, st, s, sg, y, dst, K, N, residual, scratch, cnt);
     else           hipLaunchKernelGGL((gemv<T, L, R, GLU, false>),              dim3(c.grid), dim3(64, c.NW), lds, st, s, sg, y, dst, K, N, residual, scratch, cnt);
@@ -542,7 +603,8 @@ static inline bool shape_ok(const cfg & c, ggml_type t, int K, int N) {
     const int ipb = t == GGML_TYPE_Q4_K ? 4 : 8;
     const int GR = (64/c.L)*c.R;
     return K % 256 == 0 && (K/256)*ipb >= c.L && N % GR == 0 && (!c.sk || N/GR >= c.grid*c.NW) && c.grid*c.NW + 1 <= (int) CNT_UINTS &&
-        (!c.rt || (!c.sk && ((K/256)*ipb) % c.L == 0 && c.L % ipb == 0)) &&
+        (!c.rt || (((K/256)*ipb) % c.L == 0 && c.L % ipb == 0)) &&
+        (c.U == 1 || (c.U == 2 && !c.sk && ((K/256)*ipb) % (2*c.L) == 0)) &&
         (size_t) c.grid*c.NW*2*2*GR <= SCRATCH_FLOATS && (size_t) N*(K/256)*144 < (1ull << 32);
 }
 
@@ -603,9 +665,17 @@ static inline bool repack_cfg(ggml_type t, const void * src, void * dst, int64_t
     const int64_t nb = nrows*(K/QK_K);
     const int nthr = 256; const int nblk = (int) ((nb + nthr - 1)/nthr);
     const int nwv = c.grid*c.NW;
+    const int Ll = c.L*c.U;   // items per wave step of the layout
+    if (c.sk) {
+        switch (t) {
+            case GGML_TYPE_IQ4_XS: hipLaunchKernelGGL((repack_skrt<8, 8>),  dim3(nblk), dim3(nthr), 0, st, (const uint8_t *) src, (uint8_t *) dst, nb, K/QK_K, IL, c.L, nwv); return true;
+            case GGML_TYPE_Q4_K:   hipLaunchKernelGGL((repack_skrt<4, 16>), dim3(nblk), dim3(nthr), 0, st, (const uint8_t *) src, (uint8_t *) dst, nb, K/QK_K, IL, c.L, nwv); return true;
+            default: return false;
+        }
+    }
     switch (t) {
-        case GGML_TYPE_IQ4_XS: hipLaunchKernelGGL(repack_rt_iq4_xs, dim3(nblk), dim3(nthr), 0, st, (const block_iq4_xs *) src, (uint8_t *) dst, nb, K/QK_K, IL, c.L, nwv); return true;
-        case GGML_TYPE_Q4_K:   hipLaunchKernelGGL(repack_rt_q4_K,   dim3(nblk), dim3(nthr), 0, st, (const block_q4_K *)   src, (uint8_t *) dst, nb, K/QK_K, IL, c.L, nwv); return true;
+        case GGML_TYPE_IQ4_XS: hipLaunchKernelGGL(repack_rt_iq4_xs, dim3(nblk), dim3(nthr), 0, st, (const block_iq4_xs *) src, (uint8_t *) dst, nb, K/QK_K, IL, Ll, nwv); return true;
+        case GGML_TYPE_Q4_K:   hipLaunchKernelGGL(repack_rt_q4_K,   dim3(nblk), dim3(nthr), 0, st, (const block_q4_K *)   src, (uint8_t *) dst, nb, K/QK_K, IL, Ll, nwv); return true;
         default: return false;
     }
 }
