@@ -5296,6 +5296,116 @@ struct test_gated_delta_net_cache_fusion : public test_case {
     }
 };
 
+// GGML_OP_GDN_DECODE_PREP + GGML_OP_GDN_DECODE_OUT (fused single-token gated delta net decode)
+// the recurrent states are updated in place; the graph output concatenates the op output with the updated state rows
+struct test_gdn_decode : public test_case {
+    const ggml_type type_w; // alpha/beta projection weights
+    const int64_t   H_k;
+    const int64_t   H_v;
+    const int64_t   S;
+    const int64_t   n_embd;
+    const int64_t   n_rows;
+    const int       src_row;
+    const int       dst_row;
+    const bool      out_only; // only the GDN_DECODE_OUT op (perf)
+
+    std::string vars() override {
+        return VARS_TO_STR9(type_w, H_k, H_v, S, n_embd, n_rows, src_row, dst_row, out_only);
+    }
+
+    test_gdn_decode(ggml_type type_w = GGML_TYPE_BF16, int64_t H_k = 2, int64_t H_v = 4, int64_t S = 128,
+            int64_t n_embd = 256, int64_t n_rows = 2, int src_row = 1, int dst_row = 1, bool out_only = false)
+        : type_w(type_w), H_k(H_k), H_v(H_v), S(S), n_embd(n_embd), n_rows(n_rows),
+          src_row(src_row), dst_row(dst_row), out_only(out_only) {}
+
+    double max_nmse_err() override {
+        return 1e-6;
+    }
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "GDN_DECODE";
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        const int64_t conv_dim = (2*H_k + H_v)*S;
+        const int64_t d_conv   = 4;
+
+        ggml_tensor * s_copy = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 1);
+        ggml_set_name(s_copy, "s_copy");
+
+        ggml_tensor * ss = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, S*S*H_v, n_rows);
+        ggml_set_name(ss, "ssm_state");
+
+        ggml_tensor * prep;
+        ggml_tensor * cs = nullptr;
+        if (out_only) {
+            prep = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, conv_dim + 2*H_v);
+            ggml_set_name(prep, "prep_in");
+        } else {
+            ggml_tensor * qkv     = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, conv_dim);
+            ggml_tensor * x       = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_embd);
+            ggml_tensor * w_alpha = ggml_new_tensor_2d(ctx, type_w, n_embd, H_v);
+            ggml_tensor * w_beta  = ggml_new_tensor_2d(ctx, type_w, n_embd, H_v);
+            ggml_tensor * dt      = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, H_v);
+            ggml_tensor * a       = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, H_v);
+            ggml_tensor * conv_w  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, d_conv, conv_dim);
+            cs                    = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, (d_conv - 1)*conv_dim, n_rows);
+            ggml_set_name(qkv, "qkv");
+            ggml_set_name(x, "x");
+            ggml_set_name(w_alpha, "w_alpha");
+            ggml_set_name(w_beta, "w_beta");
+            ggml_set_name(dt, "dt");
+            ggml_set_name(a, "a");
+            ggml_set_name(conv_w, "conv_w");
+            ggml_set_name(cs, "conv_state");
+            prep = ggml_gdn_decode_prep(ctx, qkv, x, w_alpha, w_beta, dt, a, conv_w, cs, s_copy, nullptr,
+                    dst_row, (int) H_k, (int) H_v, (int) S, 1e-6f/S);
+            ggml_set_name(prep, "prep");
+        }
+
+        ggml_tensor * z      = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, H_v*S);
+        ggml_tensor * norm_w = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, S);
+        ggml_set_name(z, "z");
+        ggml_set_name(norm_w, "norm_w");
+
+        ggml_tensor * out = ggml_gdn_decode_out(ctx, prep, z, norm_w, ss, s_copy, nullptr,
+                dst_row, (int) H_k, (int) H_v, (int) S, 1e-6f);
+        ggml_set_name(out, "out");
+
+        if (out_only) {
+            return out;
+        }
+
+        // pull the updated state rows into the output (the concat depends on both ops, so it runs after them)
+        ggml_tensor * ss_row = ggml_view_1d(ctx, ss, ss->ne[0], dst_row*ss->nb[1]);
+        ggml_tensor * cs_row = ggml_view_1d(ctx, cs, cs->ne[0], dst_row*cs->nb[1]);
+        ggml_tensor * res = ggml_concat(ctx, ggml_concat(ctx, prep, out, 0), ggml_concat(ctx, cs_row, ss_row, 0), 0);
+        ggml_set_name(res, "res");
+        return res;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            if (ggml_is_view_op(t->op)) {
+                continue;
+            }
+            if (strcmp(t->name, "s_copy") == 0) {
+                const int32_t v = src_row;
+                ggml_backend_tensor_set(t, &v, 0, sizeof(v));
+            } else if (strcmp(t->name, "a") == 0) {
+                init_tensor_uniform(t, -2.0f, -0.01f);
+            } else if (strcmp(t->name, "ssm_state") == 0) {
+                init_tensor_uniform(t, -0.5f, 0.5f);
+            } else if (strcmp(t->name, "prep_in") == 0) {
+                init_tensor_uniform(t, 0.0f, 0.5f);
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+};
+
 // GGML_OP_GATED_LINEAR_ATTN
 struct test_gla : public test_case {
     const ggml_type type;
@@ -12728,6 +12838,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64,   4, 2, 1, false, true,  /*K=*/4));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 8, 32,   4, 2, 2, false, true,  /*K=*/4));
 
+    // fused single-token gated delta net decode (states updated in place, read row != / == written row)
+    test_cases.emplace_back(new test_gdn_decode(GGML_TYPE_BF16, 2, 4, 128, 256, 2, 1, 1));
+    test_cases.emplace_back(new test_gdn_decode(GGML_TYPE_BF16, 2, 6, 128, 512, 3, 0, 2));
+    test_cases.emplace_back(new test_gdn_decode(GGML_TYPE_F32,  4, 4, 128, 384, 1, 0, 0));
+    test_cases.emplace_back(new test_gdn_decode(GGML_TYPE_BF16, 16, 48, 128, 5120, 1, 0, 0));
+
     // gdn + cache cpy fusion (K > 1)
     test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32, 4, 32,   2, 1, 2));
     test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32, 4, 64,   4, 1, 2));
@@ -12772,6 +12888,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 // Test cases for performance evaluation: should be representative of real-world use cases
 static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     std::vector<std::unique_ptr<test_case>> test_cases;
+
+    // qwen3.5-27B linear attention decode shapes
+    test_cases.emplace_back(new test_gdn_decode(GGML_TYPE_BF16, 16, 48, 128, 5120, 1, 0, 0));
+    test_cases.emplace_back(new test_gdn_decode(GGML_TYPE_BF16, 16, 48, 128, 5120, 1, 0, 0, true));
 
     for (float n : {128.0f, 4096.0f, 32768.0f, 1048576.0f}) {
         test_cases.emplace_back(new test_arange(GGML_TYPE_F32, 0.0f, n, 1.0f));

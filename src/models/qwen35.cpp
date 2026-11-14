@@ -344,6 +344,111 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn(
     return cur;
 }
 
+// LLAMA_GDN_FUSED_DECODE=0 disables the fused single-token gated delta net decode path (default: enabled)
+static bool qwen35_gdn_fused_decode_enabled() {
+    static const bool enabled = [] {
+        const char * e = getenv("LLAMA_GDN_FUSED_DECODE");
+        return e == nullptr || atoi(e) != 0;
+    }();
+    return enabled;
+}
+
+static bool qwen35_tensor_on_dev(const ggml_tensor * t, ggml_backend_dev_t dev) {
+    return t != nullptr && t->buffer != nullptr &&
+        ggml_backend_buft_get_device(ggml_backend_buffer_get_type(t->buffer)) == dev;
+}
+
+// Fused decode of one linear-attention layer for a single token of a single sequence (ggml_gdn_decode_prep +
+// ggml_gdn_decode_out). The ops update the conv/ssm states in place in the recurrent cache, so they are only used
+// when they run on the device that holds the states (and every weight that steers the op placement); otherwise,
+// or if the backend does not support them, nullptr is returned and the caller builds the unfused graph.
+// returns the gated, normalized attention output [head_v_dim*num_v_heads, 1] (input of ssm_out)
+static ggml_tensor * qwen35_build_gdn_fused_decode(
+        llm_graph_context  & g,
+        const llama_model  & model,
+        llm_graph_input_rs * inp,
+        ggml_tensor        * x,
+        ggml_tensor        * qkv_mixed,
+        ggml_tensor        * z,
+        int                  il) {
+    const auto & hparams = g.hparams;
+    const auto & layer   = model.layers[il];
+    const auto * mctx    = inp->mctx;
+
+    const int64_t head_k_dim  = hparams.ssm_d_state;
+    const int64_t num_k_heads = hparams.ssm_n_group;
+    const int64_t num_v_heads = hparams.ssm_dt_rank;
+    const int64_t head_v_dim  = hparams.ssm_d_inner / num_v_heads;
+
+    if (!qwen35_gdn_fused_decode_enabled() ||
+        g.ubatch.n_seq_tokens != 1 || g.ubatch.n_seqs != 1 || g.cparams.n_rs_seq != 0 ||
+        mctx->get_n_rs() != 1 || head_k_dim != head_v_dim ||
+        layer.ssm_alpha_s != nullptr || layer.ssm_beta_s != nullptr) {
+        return nullptr;
+    }
+
+    ggml_tensor * conv_states_all = mctx->get_r_l(il);
+    ggml_tensor * ssm_states_all  = mctx->get_s_l(il);
+    if (conv_states_all->type != GGML_TYPE_F32 || ssm_states_all->type != GGML_TYPE_F32) {
+        return nullptr;
+    }
+
+    ggml_backend_dev_t dev = model.dev_layer(il);
+    if (dev == nullptr || ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU) {
+        return nullptr;
+    }
+    for (const ggml_tensor * t : { conv_states_all, ssm_states_all, layer.ssm_alpha, layer.ssm_beta, layer.ssm_dt,
+                                   layer.ssm_a, layer.ssm_conv1d, layer.ssm_norm }) {
+        if (!qwen35_tensor_on_dev(t, dev)) {
+            return nullptr;
+        }
+    }
+
+    // the alpha/beta projections are computed inside the op: no Hadamard input transform, no LoRA
+    if (g.hdmd && (g.hdmd->rot.count(layer.ssm_alpha) || g.hdmd->rot.count(layer.ssm_beta))) {
+        return nullptr;
+    }
+    for (const auto & lora : *g.loras) {
+        if (lora.first->get_weight(layer.ssm_alpha) || lora.first->get_weight(layer.ssm_beta)) {
+            return nullptr;
+        }
+    }
+
+    ggml_context * ctx0 = g.ctx0;
+
+    // zero a cleared state row first, like build_rs does (no-op view when rs_z < 0);
+    // the zeroing nodes are passed as dependencies of the fused ops so they run before them
+    const int32_t rs_z = mctx->get_rs_z();
+    auto zero_row = [&](ggml_tensor * states) {
+        ggml_tensor * row = ggml_view_1d(ctx0, states, states->ne[0]*(rs_z >= 0), rs_z*states->nb[1]*(rs_z >= 0));
+        return ggml_scale_inplace(ctx0, row, 0);
+    };
+
+    const int dst_row = (int) mctx->get_head();
+
+    ggml_tensor * prep = ggml_gdn_decode_prep(ctx0,
+            ggml_reshape_1d(ctx0, qkv_mixed, ggml_nelements(qkv_mixed)), x,
+            layer.ssm_alpha, layer.ssm_beta, layer.ssm_dt, layer.ssm_a, layer.ssm_conv1d,
+            conv_states_all, inp->s_copy, zero_row(conv_states_all),
+            dst_row, (int) num_k_heads, (int) num_v_heads, (int) head_k_dim,
+            hparams.f_norm_rms_eps / (float) head_k_dim); // == build_gdn_l2_norm eps
+
+    ggml_tensor * out = ggml_gdn_decode_out(ctx0, prep,
+            ggml_reshape_1d(ctx0, z, ggml_nelements(z)), layer.ssm_norm,
+            ssm_states_all, inp->s_copy, zero_row(ssm_states_all),
+            dst_row, (int) num_k_heads, (int) num_v_heads, (int) head_v_dim,
+            hparams.f_norm_rms_eps);
+
+    if (!ggml_backend_dev_supports_op(dev, prep) || !ggml_backend_dev_supports_op(dev, out)) {
+        return nullptr;
+    }
+
+    g.cb(prep, "gdn_decode_prep", il);
+    g.cb(out,  "final_output",    il);
+
+    return ggml_reshape_2d(ctx0, out, head_v_dim*num_v_heads, 1);
+}
+
 ggml_tensor * llama_model_qwen35::graph::build_layer_attn_linear(
         llm_graph_input_rs * inp,
         ggml_tensor *        cur,
@@ -366,6 +471,14 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn_linear(
     auto qkvz = build_qkvz(cur, il);
     ggml_tensor * qkv_mixed = qkvz.first;
     ggml_tensor * z         = qkvz.second;
+
+    // single-token decode of one sequence: two fused ops (conv/norms/gates + delta rule/gated norm, states updated
+    // in place in the cache) replace ~15 kernels and the two alpha/beta projections
+    if (ggml_tensor * fused = qwen35_build_gdn_fused_decode(*this, model, inp, cur, qkv_mixed, z, il)) {
+        cur = build_lora_mm(model.layers[il].ssm_out, fused, model.layers[il].ssm_out_s);
+        cb(cur, "linear_attn_out", il);
+        return cur;
+    }
 
     ggml_tensor * beta = build_lora_mm(model.layers[il].ssm_beta, cur, model.layers[il].ssm_beta_s);
     beta = ggml_reshape_4d(ctx0, beta, 1, num_v_heads, n_seq_tokens, n_seqs);

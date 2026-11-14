@@ -585,6 +585,8 @@ extern "C" {
         GGML_OP_RWKV_WKV7,
         GGML_OP_SOLVE_TRI,
         GGML_OP_GATED_DELTA_NET,
+        GGML_OP_GDN_DECODE_PREP,
+        GGML_OP_GDN_DECODE_OUT,
         GGML_OP_LIGHTNING_INDEXER,
         GGML_OP_DSV4_HC_COMB,
         GGML_OP_DSV4_HC_PRE,
@@ -2699,6 +2701,64 @@ extern "C" {
             struct ggml_tensor  * beta,
             struct ggml_tensor  * state,
             int64_t               K);
+
+    // fused single-token, single-sequence gated delta net decode (qwen3.5 / qwen3-next linear attention)
+    // the two ops replace conv1d+silu, q/k L2 norm, alpha/beta projections + gates, the recurrent state
+    // gathers/write-backs, the delta rule and the gated output norm of one token. the recurrent states are
+    // read from row s_copy[0] and written back IN PLACE to row dst_row of the cache tensors.
+    // v head h uses q/k head h % H_k (tiled, same as ggml_gated_delta_net).
+    //
+    // ggml_gdn_decode_prep:
+    //   qkv        : [conv_dim]                    f32, conv_dim = (2*H_k + H_v)*S channels: q | k | v
+    //   x          : [n_embd]                      f32, input of the alpha/beta projections
+    //   w_alpha    : [n_embd, H_v]                 bf16 or f32
+    //   w_beta     : [n_embd, H_v]                 bf16 or f32
+    //   dt_bias, a : [H_v]                         f32
+    //   conv_w     : [d_conv, conv_dim]            f32
+    //   conv_state : [(d_conv - 1)*conv_dim, rows] f32 (updated in place)
+    //   s_copy     : [n] i32, s_copy[0] = row to read the states from
+    //   dep        : optional, computed before this op (e.g. the zeroing of a cleared state row)
+    // result: [(2*H_k + H_v)*S + 2*H_v] f32 = l2norm(q) | l2norm(k) | v | exp(gate) | sigmoid(beta)
+    //   with gate = softplus(x.w_alpha + dt_bias)*a, l2norm(t) = t/sqrt(sum(t^2) + eps_l2*S)
+    GGML_API struct ggml_tensor * ggml_gdn_decode_prep(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * qkv,
+            struct ggml_tensor  * x,
+            struct ggml_tensor  * w_alpha,
+            struct ggml_tensor  * w_beta,
+            struct ggml_tensor  * dt_bias,
+            struct ggml_tensor  * a,
+            struct ggml_tensor  * conv_w,
+            struct ggml_tensor  * conv_state,
+            struct ggml_tensor  * s_copy,
+            struct ggml_tensor  * dep,
+            int                   dst_row,
+            int                   H_k,
+            int                   H_v,
+            int                   S,
+            float                 eps_l2);
+
+    // ggml_gdn_decode_out:
+    //   prep       : result of ggml_gdn_decode_prep
+    //   z          : [H_v*S]                       f32, output gate
+    //   norm_w     : [S]                           f32
+    //   ssm_state  : [S*S*H_v, rows]               f32 (updated in place), per head the transposed state M[col][i]
+    //   s_copy     : [n] i32, s_copy[0] = row to read the states from
+    //   dep        : optional, computed before this op
+    // result: [H_v*S] f32 = rms_norm(o, eps)*norm_w*silu(z), o = delta rule output of the token
+    GGML_API struct ggml_tensor * ggml_gdn_decode_out(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * prep,
+            struct ggml_tensor  * z,
+            struct ggml_tensor  * norm_w,
+            struct ggml_tensor  * ssm_state,
+            struct ggml_tensor  * s_copy,
+            struct ggml_tensor  * dep,
+            int                   dst_row,
+            int                   H_k,
+            int                   H_v,
+            int                   S,
+            float                 eps);
 
     // DSA lightning indexer
     //

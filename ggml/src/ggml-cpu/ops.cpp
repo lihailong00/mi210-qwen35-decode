@@ -11344,6 +11344,186 @@ void ggml_compute_forward_gated_delta_net(
     }
 }
 
+// ggml_compute_forward_gdn_decode_prep / ggml_compute_forward_gdn_decode_out
+// reference implementation of the fused single-token gated delta net decode ops (single threaded)
+
+static float ggml_gdn_dec_row_dot(const ggml_tensor * w, int64_t row, const float * x, int64_t n) {
+    const char * wr = (const char *) w->data + row*w->nb[1];
+    float sum = 0.0f;
+    if (w->type == GGML_TYPE_F32) {
+        const float * wf = (const float *) wr;
+        for (int64_t i = 0; i < n; ++i) {
+            sum += wf[i]*x[i];
+        }
+    } else if (w->type == GGML_TYPE_BF16) {
+        const ggml_bf16_t * wb = (const ggml_bf16_t *) wr;
+        for (int64_t i = 0; i < n; ++i) {
+            sum += GGML_BF16_TO_FP32(wb[i])*x[i];
+        }
+    } else if (w->type == GGML_TYPE_F16) {
+        const ggml_fp16_t * wh = (const ggml_fp16_t *) wr;
+        for (int64_t i = 0; i < n; ++i) {
+            sum += GGML_CPU_FP16_TO_FP32(wh[i])*x[i];
+        }
+    } else {
+        GGML_ABORT("gdn_decode_prep: unsupported alpha/beta weight type");
+    }
+    return sum;
+}
+
+void ggml_compute_forward_gdn_decode_prep(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+    if (params->ith != 0) {
+        return;
+    }
+
+    const ggml_tensor * qkv     = dst->src[0];
+    const ggml_tensor * x       = dst->src[1];
+    const ggml_tensor * w_alpha = dst->src[2];
+    const ggml_tensor * w_beta  = dst->src[3];
+    const ggml_tensor * dt_bias = dst->src[4];
+    const ggml_tensor * a       = dst->src[5];
+    const ggml_tensor * conv_w  = dst->src[6];
+    ggml_tensor       * cs      = dst->src[7];
+    const ggml_tensor * s_copy  = dst->src[8];
+
+    const int   dst_row = ggml_get_op_params_i32(dst, 0);
+    const int   H_k     = ggml_get_op_params_i32(dst, 1);
+    const int   H_v     = ggml_get_op_params_i32(dst, 2);
+    const int   S       = ggml_get_op_params_i32(dst, 3);
+    const float eps_l2  = ggml_get_op_params_f32(dst, 4);
+
+    const int64_t conv_dim = (int64_t) (2*H_k + H_v)*S;
+    const int64_t d_conv   = conv_w->ne[0];
+    const int64_t n_embd   = x->ne[0];
+    const int32_t src_row  = ((const int32_t *) s_copy->data)[0];
+    GGML_ASSERT(src_row >= 0 && src_row < cs->ne[1]);
+
+    const float * qkv_d = (const float *) qkv->data;
+    const float * x_d   = (const float *) x->data;
+    const float * cw_d  = (const float *) conv_w->data;
+    float * out = (float *) dst->data;
+
+    // conv1d over [state | x] + silu; the state shifts by one (in place safe: each channel is read before it is written)
+    const float * cs_src = (const float *) ((const char *) cs->data + src_row*cs->nb[1]);
+    float       * cs_dst = (float       *) ((char       *) cs->data + dst_row*cs->nb[1]);
+    std::vector<float> win(d_conv);
+    for (int64_t ch = 0; ch < conv_dim; ++ch) {
+        for (int64_t j = 0; j < d_conv - 1; ++j) {
+            win[j] = cs_src[ch*(d_conv - 1) + j];
+        }
+        win[d_conv - 1] = qkv_d[ch];
+        float sum = 0.0f;
+        for (int64_t j = 0; j < d_conv; ++j) {
+            sum += win[j]*cw_d[ch*d_conv + j];
+        }
+        out[ch] = sum/(1.0f + expf(-sum));
+        for (int64_t j = 0; j < d_conv - 1; ++j) {
+            cs_dst[ch*(d_conv - 1) + j] = win[j + 1];
+        }
+    }
+
+    // l2 norm of the q and k heads (rms_norm(eps_l2) scaled by 1/sqrt(S))
+    const float scale_out = 1.0f/sqrtf((float) S);
+    for (int64_t hd = 0; hd < 2*H_k; ++hd) {
+        float * y = out + hd*S;
+        float sum = 0.0f;
+        for (int i = 0; i < S; ++i) {
+            sum += y[i]*y[i];
+        }
+        const float scale = 1.0f/sqrtf(sum/S + eps_l2);
+        for (int i = 0; i < S; ++i) {
+            y[i] = (scale*y[i])*scale_out;
+        }
+    }
+
+    // gates
+    const float * dt_d = (const float *) dt_bias->data;
+    const float * a_d  = (const float *) a->data;
+    for (int h = 0; h < H_v; ++h) {
+        const float alpha = ggml_gdn_dec_row_dot(w_alpha, h, x_d, n_embd) + dt_d[h];
+        const float beta  = ggml_gdn_dec_row_dot(w_beta,  h, x_d, n_embd);
+        const float sp    = alpha > 20.0f ? alpha : log1pf(expf(alpha));
+        out[conv_dim + h]       = expf(sp*a_d[h]);
+        out[conv_dim + H_v + h] = 1.0f/(1.0f + expf(-beta));
+    }
+}
+
+void ggml_compute_forward_gdn_decode_out(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+    if (params->ith != 0) {
+        return;
+    }
+
+    const ggml_tensor * prep   = dst->src[0];
+    const ggml_tensor * z      = dst->src[1];
+    const ggml_tensor * norm_w = dst->src[2];
+    ggml_tensor       * ss     = dst->src[3];
+    const ggml_tensor * s_copy = dst->src[4];
+
+    const int   dst_row = ggml_get_op_params_i32(dst, 0);
+    const int   H_k     = ggml_get_op_params_i32(dst, 1);
+    const int   H_v     = ggml_get_op_params_i32(dst, 2);
+    const int   S       = ggml_get_op_params_i32(dst, 3);
+    const float eps     = ggml_get_op_params_f32(dst, 4);
+
+    const int32_t src_row = ((const int32_t *) s_copy->data)[0];
+    GGML_ASSERT(src_row >= 0 && src_row < ss->ne[1]);
+
+    const float * p   = (const float *) prep->data;
+    const float * q   = p;
+    const float * k   = p + H_k*S;
+    const float * v   = p + 2*H_k*S;
+    const float * g   = p + (2*H_k + H_v)*S;
+    const float * b   = g + H_v;
+    const float * z_d = (const float *) z->data;
+    const float * nw  = (const float *) norm_w->data;
+    float * out = (float *) dst->data;
+
+    const float scale = 1.0f/sqrtf((float) S);
+
+    std::vector<float> st((size_t) S*S);
+    std::vector<float> o(S);
+    for (int h = 0; h < H_v; ++h) {
+        const int hk = h % H_k;
+        const float * qh = q + hk*S;
+        const float * kh = k + hk*S;
+        const float * vh = v + h*S;
+        const float * s_src = (const float *) ((const char *) ss->data + src_row*ss->nb[1]) + (size_t) h*S*S;
+        float       * s_dst = (float       *) ((char       *) ss->data + dst_row*ss->nb[1]) + (size_t) h*S*S;
+        memcpy(st.data(), s_src, sizeof(float)*S*S);
+        // transposed state: st[col*S + i] = S[i][col]
+        for (int col = 0; col < S; ++col) {
+            float * m = st.data() + (size_t) col*S;
+            float kv = 0.0f;
+            for (int i = 0; i < S; ++i) {
+                kv += m[i]*kh[i];
+            }
+            const float delta = (vh[col] - g[h]*kv)*b[h];
+            float attn = 0.0f;
+            for (int i = 0; i < S; ++i) {
+                m[i] = g[h]*m[i] + kh[i]*delta;
+                attn += m[i]*qh[i];
+            }
+            o[col] = attn*scale;
+        }
+        memcpy(s_dst, st.data(), sizeof(float)*S*S);
+
+        float sum = 0.0f;
+        for (int i = 0; i < S; ++i) {
+            sum += o[i]*o[i];
+        }
+        const float rs = 1.0f/sqrtf(sum/S + eps);
+        for (int i = 0; i < S; ++i) {
+            const float zz = z_d[h*S + i];
+            out[h*S + i] = (zz/(1.0f + expf(-zz)))*((rs*o[i])*nw[i]);
+        }
+    }
+}
+
+
 
 // ggml_compute_forward_dsv4_hc_comb
 
