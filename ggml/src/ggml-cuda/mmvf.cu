@@ -4,6 +4,7 @@
 #include "mmvf.cuh"
 #include "mmf.cuh"
 #include "convert.cuh"
+#include "mmvq-fused-host.cuh"
 
 template <typename T, typename type_acc, int ncols_dst, int block_size, bool has_fusion = false, bool is_multi_token_id = false>
 static __global__ void mul_mat_vec_f(
@@ -717,6 +718,129 @@ static bool ggml_cuda_mul_mat_vec_f_bf16_thin(ggml_backend_cuda_context & ctx, c
     return true;
 #else
     GGML_UNUSED_VARS(ctx, src0, src1, ids, dst, fusion);
+    return false;
+#endif
+}
+
+#if defined(GGML_USE_HIP)
+struct mmvf_epi_args {
+    const nv_bfloat16 * x;
+    int64_t             stride_row;
+    float             * dst;
+    const float       * bias;
+    const float       * mul;
+    int                 epi;
+};
+
+// mmvf_bf16_thin (identical dot product and reduction) for up to two weight matrices sharing the activation, with the
+// elementwise epilogue of the fused graph chain. Blocks [0, n0) compute rows of job 0, the rest rows of job 1.
+template <int NT>
+__launch_bounds__(NT, 1)
+static __global__ void mmvf_bf16_thin_epi(const mmvf_epi_args j0, const mmvf_epi_args j1, const int n0,
+        const float * __restrict__ y, const int K) {
+    const bool second = (int) blockIdx.x >= n0;
+    const int row = second ? (int) blockIdx.x - n0 : (int) blockIdx.x;
+    const nv_bfloat16 * x = second ? j1.x : j0.x;
+    const int64_t stride_row = second ? j1.stride_row : j0.stride_row;
+    const int tid = threadIdx.x;
+    const uint4  * xr = (const uint4  *)(x + row*stride_row);
+    const float4 * y4 = (const float4 *) y;
+    float sum = 0.0f;
+    for (int c = tid; c < K/8; c += NT) {
+        const uint4  w  = xr[c];
+        const float4 a  = y4[2*c + 0];
+        const float4 b  = y4[2*c + 1];
+        const uint32_t wv[4] = {w.x, w.y, w.z, w.w};
+        const float yv[8] = {a.x, a.y, a.z, a.w, b.x, b.y, b.z, b.w};
+#pragma unroll
+        for (int k = 0; k < 4; ++k) {
+            sum += __uint_as_float(wv[k] << 16)         * yv[2*k + 0];
+            sum += __uint_as_float(wv[k] & 0xFFFF0000u) * yv[2*k + 1];
+        }
+    }
+    sum = warp_reduce_sum<64>(sum);
+    __shared__ float part[NT/64];
+    if (tid % 64 == 0) {
+        part[tid/64] = sum;
+    }
+    __syncthreads();
+    if (tid == 0) {
+        float r = 0.0f;
+#pragma unroll
+        for (int i = 0; i < NT/64; ++i) {
+            r += part[i];
+        }
+        float       * dst  = second ? j1.dst  : j0.dst;
+        const float * bias = second ? j1.bias : j0.bias;
+        const float * mul  = second ? j1.mul  : j0.mul;
+        const int     epi  = second ? j1.epi  : j0.epi;
+        if (bias) {
+            r += bias[row];                                  // ADD (k_bin_bcast): a + b
+        }
+        if (epi == 1) {
+            r = 1.0f / (1.0f + expf(-r));                    // op_sigmoid
+        } else if (epi == 2) {
+            r = ((r > 20.0f) ? r : log1pf(expf(r))) * mul[row]; // op_softplus(x) * g (unary_gated_op_kernel)
+        }
+        dst[row] = r;
+    }
+}
+#endif // defined(GGML_USE_HIP)
+
+bool ggml_cuda_mmvf_bf16_thin_epi(ggml_backend_cuda_context & ctx, const ggml_tensor * src1, const ggml_cuda_bf16_epi_job * jobs, int njobs) {
+#if defined(GGML_USE_HIP)
+    static const bool disabled = [] {
+        const char * v = getenv("GGML_MMVF_THIN");
+        const char * e = getenv("GGML_MMVF_EPI");
+        return (v != nullptr && v[0] == '0') || (e != nullptr && e[0] == '0');
+    }();
+    if (disabled || njobs < 1 || njobs > 2 || ggml_cuda_info().devices[ggml_cuda_get_device()].warp_size != 64) {
+        return false;
+    }
+    if (src1->type != GGML_TYPE_F32 || src1->ne[1] != 1 || src1->ne[2] != 1 || src1->ne[3] != 1 || !ggml_is_contiguous(src1) ||
+            ((uintptr_t) src1->data) % 16 != 0) {
+        return false;
+    }
+    const int64_t K = src1->ne[0];
+    if (K % 8 != 0 || K > 16384) {
+        return false;
+    }
+    mmvf_epi_args a[2] = {};
+    int64_t ntot = 0;
+    for (int j = 0; j < njobs; ++j) {
+        const ggml_tensor * src0 = jobs[j].src0;
+        const ggml_tensor * dst  = jobs[j].dst;
+        const int64_t N = src0->ne[1];
+        if (src0->type != GGML_TYPE_BF16 || src0->ne[0] != K || src0->ne[2] != 1 || src0->ne[3] != 1 || N > 4096 ||
+                src0->nb[0] != sizeof(nv_bfloat16) || src0->nb[1] % 16 != 0 || ((uintptr_t) src0->data) % 16 != 0) {
+            return false;
+        }
+        if (dst->type != GGML_TYPE_F32 || !ggml_is_contiguous(dst) || ggml_nelements(dst) != N || jobs[j].epi < 0 || jobs[j].epi > 2 ||
+                (jobs[j].epi == 2 && (!jobs[j].bias || !jobs[j].mul))) {
+            return false;
+        }
+        a[j].x          = (const nv_bfloat16 *) src0->data;
+        a[j].stride_row = src0->nb[1] / sizeof(nv_bfloat16);
+        a[j].dst        = (float *) dst->data;
+        a[j].bias       = jobs[j].bias;
+        a[j].mul        = jobs[j].mul;
+        a[j].epi        = jobs[j].epi;
+        ntot += N;
+    }
+    if (njobs == 1) {
+        a[1] = a[0];
+    }
+    const int n0 = (int) jobs[0].src0->ne[1];
+    const float * y = (const float *) src1->data;
+    if (K/8 >= 512) {
+        mmvf_bf16_thin_epi<640><<<ntot, 640, 0, ctx.stream()>>>(a[0], a[1], n0, y, (int) K);
+    } else {
+        mmvf_bf16_thin_epi<256><<<ntot, 256, 0, ctx.stream()>>>(a[0], a[1], n0, y, (int) K);
+    }
+    CUDA_CHECK(cudaGetLastError());
+    return true;
+#else
+    GGML_UNUSED_VARS(ctx, src1, jobs, njobs);
     return false;
 #endif
 }
