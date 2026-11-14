@@ -1,6 +1,8 @@
 #include "models.h"
 #include "llama-memory-recurrent.h"
 
+#include <cstring>
+
 void llama_model_qwen35::load_arch_hparams(llama_model_loader & ml) {
     ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS,       hparams.f_norm_rms_eps);
     ml.get_key_or_arr(LLM_KV_ROPE_DIMENSION_SECTIONS,    hparams.rope_sections, 4, true);
@@ -407,6 +409,16 @@ static ggml_tensor * qwen35_build_gdn_fused_decode(
     ggml_backend_dev_t dev = model.dev_layer(il);
     if (dev == nullptr || ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU) {
         return nullptr;
+    }
+    // only the CUDA/ROCm backend implements the fused ops on a GPU device. Other devices may still claim support:
+    // RPC reports GPU type and supports_op == true for every op without knowing what the remote server implements
+    // (a Vulkan remote silently skips unknown ops, Metal/SYCL/OpenCL or an older server abort)
+    {
+        ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
+        const char * reg_name = reg ? ggml_backend_reg_name(reg) : nullptr;
+        if (reg_name == nullptr || (strcmp(reg_name, "CUDA") != 0 && strcmp(reg_name, "ROCm") != 0)) {
+            return nullptr;
+        }
     }
     for (const ggml_tensor * t : { conv_states_all, ssm_states_all, layer.ssm_alpha, layer.ssm_beta, layer.ssm_dt,
                                    layer.ssm_a, layer.ssm_conv1d, layer.ssm_norm }) {
