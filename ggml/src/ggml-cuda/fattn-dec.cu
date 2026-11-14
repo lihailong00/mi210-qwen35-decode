@@ -24,6 +24,9 @@
 #include <mutex>
 #include <utility>
 
+// AMD only (wave64 layout, __hip_atomic_load / s_sleep in the in-kernel barrier): non-HIP builds get the stub below
+#if defined(GGML_USE_HIP)
+
 bool ggml_cuda_mmvq_cache_produce(ggml_backend_cuda_context & ctx, const ggml_tensor * t, block_q8_1 ** q8, int ** sums);
 
 #define FDEC_NT 256 // threads per workgroup (4 waves of 64)
@@ -446,3 +449,11 @@ bool ggml_cuda_fattn_dec_gate(ggml_backend_cuda_context & ctx, const ggml_tensor
     CUDA_CHECK(cudaGetLastError());
     return ok;
 }
+
+#else
+
+bool ggml_cuda_fattn_dec_gate(ggml_backend_cuda_context &, const ggml_tensor *, const float *, ggml_tensor *) {
+    return false;
+}
+
+#endif // defined(GGML_USE_HIP)

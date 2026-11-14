@@ -1461,6 +1461,16 @@ static void mul_mat_vec_q_switch_type(
     }
 }
 
+// GGML_MMVQ_Q8_CACHE=0 disables the per-stream activation cache (plain host code: also used outside the HIP-only
+// section, ggml_cuda_mul_mat_vec_q)
+static bool mmvq_q8_cache_disabled() {
+    static const bool disabled = [] {
+        const char * v = getenv("GGML_MMVQ_Q8_CACHE");
+        return v != nullptr && v[0] == '0';
+    }();
+    return disabled;
+}
+
 #if defined(GGML_USE_HIP)
 static __global__ void codex_iq3_sum_q8(const block_q8_1 * x, int * sums, int groups) {
     const int g = blockIdx.x*blockDim.x+threadIdx.x;
@@ -1670,14 +1680,6 @@ struct mmvq_q8_cache_entry {
 static std::mutex mmvq_q8_cache_mutex;
 static std::map<std::pair<int, cudaStream_t>, mmvq_q8_cache_entry> mmvq_q8_caches;
 
-static bool mmvq_q8_cache_disabled() {
-    static const bool disabled = [] {
-        const char * v = getenv("GGML_MMVQ_Q8_CACHE");
-        return v != nullptr && v[0] == '0';
-    }();
-    return disabled;
-}
-
 void ggml_cuda_mmvq_cache_reset(ggml_backend_cuda_context & ctx) {
     std::lock_guard<std::mutex> lock(mmvq_q8_cache_mutex);
     for (auto & e : mmvq_q8_caches) {
@@ -1796,6 +1798,17 @@ bool ggml_cuda_mmvq_q8_cached(ggml_backend_cuda_context & ctx, const ggml_tensor
 #else
 bool ggml_cuda_mmvq_q8_cached(ggml_backend_cuda_context &, const ggml_tensor *, const block_q8_1 **) {
     return false;
+}
+// the activation cache is HIP-only; callers outside HIP-only code (fattn-common.cuh launch_fattn, fattn-dec.cu,
+// q8-producers.cu, ggml-cuda.cu) must link in every build
+void ggml_cuda_mmvq_cache_reset(ggml_backend_cuda_context &) {
+}
+bool ggml_cuda_mmvq_cache_produce(ggml_backend_cuda_context &, const ggml_tensor *, block_q8_1 ** q8, int ** sums) {
+    *q8   = nullptr;
+    *sums = nullptr;
+    return false;
+}
+void ggml_cuda_mmvq_cache_release(int, cudaStream_t) {
 }
 #endif
 

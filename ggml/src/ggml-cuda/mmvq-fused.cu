@@ -1,4 +1,8 @@
 // Host dispatch for the single-token GEMV kernels with in-kernel q8_1 activation quantization (mmvq-fused.cuh).
+// AMD wave64 only (HIP builtins, hipStream* APIs): non-HIP builds (CUDA/MUSA glob this file too) get the stubs at the end.
+#include "mmvq-fused-host.cuh"
+
+#if defined(GGML_USE_HIP)
 #define vec_dot_iq3_s_q8_1 vec_dot_iq3_s_q8_1_original
 #define vec_dot_iq3_xxs_q8_1 vec_dot_iq3_xxs_q8_1_original
 #include "vecdotq.cuh"
@@ -401,3 +405,21 @@ bool ggml_cuda_mmvq_fused(ggml_backend_cuda_context & ctx, const ggml_tensor * s
     }
     return ok;
 }
+
+#else
+
+bool ggml_cuda_mmvq_fused_supported(const ggml_tensor *, const ggml_tensor *, const ggml_tensor *) {
+    return false;
+}
+bool ggml_cuda_mmvq_fused_preq(ggml_backend_cuda_context &, const ggml_tensor *, const block_q8_1 *, const int *,
+        ggml_tensor *, const ggml_cuda_mm_fusion_args_host *) {
+    return false;
+}
+bool ggml_cuda_mmvq_fused(ggml_backend_cuda_context &, const ggml_tensor *, const ggml_tensor *, ggml_tensor *,
+        const ggml_cuda_mm_fusion_args_host *, const float *, const int) {
+    return false;
+}
+void ggml_cuda_mmvq_fused_release(int, cudaStream_t) {
+}
+
+#endif // defined(GGML_USE_HIP)
