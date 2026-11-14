@@ -1760,6 +1760,18 @@ static bool mmvq_q8_cache_get(ggml_backend_cuda_context & ctx, const ggml_tensor
     return true;
 }
 
+bool ggml_cuda_mmvq_q8_cached(ggml_backend_cuda_context & ctx, const ggml_tensor * src1, const block_q8_1 ** q8) {
+    if (src1->type != GGML_TYPE_F32 || src1->ne[1] != 1 || src1->ne[2] != 1 || src1->ne[3] != 1 || !ggml_is_contiguous(src1)) {
+        return false;
+    }
+    const int64_t ne10 = src1->ne[0];
+    const int * sums = nullptr;
+    return mmvq_q8_cache_get(ctx, src1, ne10, GGML_PAD(ne10, MATRIX_ROW_PADDING), q8, &sums);
+}
+#else
+bool ggml_cuda_mmvq_q8_cached(ggml_backend_cuda_context &, const ggml_tensor *, const block_q8_1 **) {
+    return false;
+}
 #endif
 
 void ggml_cuda_mul_mat_vec_q(

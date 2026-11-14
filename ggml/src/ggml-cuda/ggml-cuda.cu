@@ -4725,6 +4725,81 @@ static int ggml_cuda_try_fuse_bf16_epi(ggml_backend_cuda_context * cuda_ctx, ggm
 }
 #endif // defined(GGML_USE_HIP)
 
+#if defined(GGML_USE_HIP)
+// iq4k-r3: consecutive single-token MUL_MATs (only views/reshapes in between) that read the same activation and have
+// IQ4_XS/Q4_K weights (mixed allowed) -> one grouped launch (attention q/k/v, linear-attention qkv + z, mixed-type
+// gate + up). A same-type gate/up pair that the GLU fusion takes is left to it, and a group is not formed if the node
+// after it consumes a member with ADD/MUL/GLU (residual / scale / GLU fusions keep priority).
+static int ggml_cuda_try_iq4k_group(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, const int i) {
+    ggml_tensor * n0 = cgraph->nodes[i];
+    if (!ggml_cuda_mmvq_iq4k_group_ok(n0)) {
+        return 0;
+    }
+    ggml_tensor * mm[4] = { n0, nullptr, nullptr, nullptr };
+    int n = 1, last = i, j = i + 1;
+    for (; j < cgraph->n_nodes && n < 4; ++j) {
+        ggml_tensor * t = cgraph->nodes[j];
+        if (ggml_cuda_is_view_or_noop(t)) {
+            continue;
+        }
+        if ((t->flags & GGML_TENSOR_FLAG_COMPUTE) == 0 || t->op != GGML_OP_MUL_MAT || t->src[1] != n0->src[1] ||
+                !ggml_cuda_mmvq_iq4k_group_ok(t)) {
+            break;
+        }
+        mm[n++] = t;
+        last = j;
+    }
+    if (n < 2) {
+        return 0;
+    }
+    // the first compute node after the group must not be an epilogue another fusion would merge with a member
+    int nx = last + 1;
+    while (nx < cgraph->n_nodes && ggml_cuda_is_view_or_noop(cgraph->nodes[nx])) {
+        nx++;
+    }
+    if (nx < cgraph->n_nodes) {
+        const ggml_tensor * t = cgraph->nodes[nx];
+        auto is_member = [&](const ggml_tensor * s) {
+            for (; s; s = s->view_src) {
+                for (int k = 0; k < n; ++k) {
+                    if (s == mm[k]) {
+                        return true;
+                    }
+                }
+                if (s->op != GGML_OP_VIEW && s->op != GGML_OP_RESHAPE) {
+                    break;
+                }
+            }
+            return false;
+        };
+        const bool uses = (t->src[0] && is_member(t->src[0])) || (t->src[1] && is_member(t->src[1]));
+        if (uses && t->op == GGML_OP_GLU) {
+            if (n == 2 && ggml_cuda_should_fuse_mul_mat(t->src[1], t->src[0], t)) {
+                return 0;   // same-type gate/up: the fused SwiGLU GEMV is better
+            }
+        } else if (uses && (t->op == GGML_OP_ADD || t->op == GGML_OP_MUL)) {
+            return 0;
+        }
+    }
+    int outs[4];
+    int no = 0;
+    for (int k = i; k <= last; ++k) {
+        for (int m = 0; m < n; ++m) {
+            if (cgraph->nodes[k] == mm[m]) {
+                outs[no++] = k;
+            }
+        }
+    }
+    if (no != n || !ggml_cuda_check_fusion_memory_ranges(cgraph, i, last - i + 1, outs, no)) {
+        return 0;
+    }
+    if (!ggml_cuda_mmvq_iq4k_group(*cuda_ctx, mm, n)) {
+        return 0;
+    }
+    return last - i;
+}
+#endif
+
 static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
 
     if (ggml_cuda_fusion_disabled()) {
@@ -4743,6 +4818,12 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
 #if defined(GGML_USE_HIP)
     if (node->op == GGML_OP_MUL_MAT && node->src[0]->type == GGML_TYPE_BF16 && cuda_ctx->stream_context().concurrent_events.empty()) {
         const int nodes_to_skip = ggml_cuda_try_fuse_bf16_epi(cuda_ctx, cgraph, i);
+        if (nodes_to_skip > 0) {
+            return nodes_to_skip;
+        }
+    }
+    if (node->op == GGML_OP_MUL_MAT && cuda_ctx->stream_context().concurrent_events.empty()) {
+        const int nodes_to_skip = ggml_cuda_try_iq4k_group(cuda_ctx, cgraph, i);
         if (nodes_to_skip > 0) {
             return nodes_to_skip;
         }

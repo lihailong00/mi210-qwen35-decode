@@ -2,6 +2,8 @@
 // lossless same-size row-interleaved SoA copy of the weights (created once per tensor, cached with the weight buffer),
 // q8_1 activation from the shared per-stream cache, residual epilogue (x_bias) and fused same-type gate/up SwiGLU.
 // GGML_MMVQ_IQ4K=0 disables (falls back to the stock paths).
+// iq4k-r3: grouped launch for GEMVs sharing the activation (ggml_cuda_mmvq_iq4k_group, detected in ggml-cuda.cu);
+// GGML_MMVQ_IQ4K_GROUP=0 disables only the grouping.
 #include "common.cuh"
 #include "vecdotq.cuh"
 #include "iq3-repack.cuh"
@@ -63,6 +65,112 @@ bool ggml_cuda_mmvq_iq4k_wants(const ggml_tensor * src0) {
     return K % QK_K == 0 && K <= 32768 && N >= 2048 && ggml_is_matrix(src0) && ggml_is_contiguous(src0) &&
         GGML_CUDA_CC_IS_CDNA2(ggml_cuda_info().devices[ggml_cuda_get_device()].cc) &&
         iq4k::shape_ok(iq4k::pick_cfg(src0->type, (int) N, (int) K, ggml_cuda_info().devices[ggml_cuda_get_device()].nsm), src0->type, (int) K, (int) N);
+}
+
+// ---- grouped launch (iq4k-r3): GEMVs that share the activation, one launch, round-robin units over the concatenated
+// jobs (iq4k::launch_g, RRM). Uses the row-interleaved IL = 4 copy, i.e. the same copy (cache kind) as the single launcher.
+static bool iq4k_group_enabled() {
+    static const bool enabled = [] {
+        const char * v = getenv("GGML_MMVQ_IQ4K_GROUP");
+        return iq4k_enabled() && (v == nullptr || v[0] != '0');
+    }();
+    return enabled;
+}
+static int iq4k_env_int(const char * name, int def) {
+    const char * v = getenv(name);
+    return v ? atoi(v) : def;
+}
+// Groups whose members all have N <= 2048 (attn_k + attn_v) run on the small-N multi-job kernel (iq4k::launch_sn, stock
+// mmvq structure on the original layout, bit-identical to the unfused path); GGML_MMVQ_IQ4K_GROUP_SMALL=0 disables.
+// Groups with a large member (q + k + v, qkv + z, mixed-type gate + up) use the round-robin multi-job kernel
+// (iq4k::launch_g): faster in back-to-back launches but slower than the separate tuned launches inside HIP graph
+// replay (+110 us/token GPU time), so they are off unless GGML_MMVQ_IQ4K_GROUP_BIG=1 (knobs: _NW waves per workgroup,
+// _RR round-robin (1) or balanced split (0)).
+static int iq4k_group_small() { static const int v = iq4k_env_int("GGML_MMVQ_IQ4K_GROUP_SMALL", 1); return v; }
+static int iq4k_group_big()   { static const int v = iq4k_env_int("GGML_MMVQ_IQ4K_GROUP_BIG", 0); return v; }
+static int iq4k_group_nw()    { static const int v = iq4k_env_int("GGML_MMVQ_IQ4K_GROUP_NW", 12); return v; }
+static int iq4k_group_rr()    { static const int v = iq4k_env_int("GGML_MMVQ_IQ4K_GROUP_RR", 1); return v; }
+static void iq4k_repack_il4(const void * src, void * dst, const ggml_tensor * t, hipStream_t stream) {
+    iq4k::repack_il(t->type, src, dst, t->ne[1], (int) t->ne[0], 4, stream);
+}
+
+bool ggml_cuda_mmvq_iq4k_group_ok(const ggml_tensor * mm) {
+    if (!iq4k_group_enabled() || mm->op != GGML_OP_MUL_MAT) {
+        return false;
+    }
+    const ggml_tensor * w = mm->src[0];
+    const ggml_tensor * x = mm->src[1];
+    if ((w->type != GGML_TYPE_IQ4_XS && w->type != GGML_TYPE_Q4_K) || x->type != GGML_TYPE_F32 || mm->type != GGML_TYPE_F32) {
+        return false;
+    }
+    const int64_t K = w->ne[0], N = w->ne[1];
+    return K % QK_K == 0 && K <= 8192 && N % 64 == 0 && ggml_is_matrix(w) && ggml_is_contiguous(w) &&
+        x->ne[0] == K && x->ne[1] == 1 && x->ne[2] == 1 && x->ne[3] == 1 && ggml_is_contiguous(x) &&
+        ggml_is_contiguous(mm) && mm->ne[1] == 1 && w->buffer &&
+        ggml_backend_buffer_get_usage(w->buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS &&
+        GGML_CUDA_CC_IS_CDNA2(ggml_cuda_info().devices[ggml_cuda_get_device()].cc);
+}
+
+bool ggml_cuda_mmvq_iq4k_group(ggml_backend_cuda_context & ctx, ggml_tensor * const * mm, int n) {
+    if (n < 2 || n > iq4k::G_MAXJ) {
+        return false;
+    }
+    const ggml_tensor * src1 = mm[0]->src[1];
+    const int K = (int) mm[0]->src[0]->ne[0];
+    int64_t maxn = 0;
+    for (int k = 0; k < n; ++k) {
+        if (!ggml_cuda_mmvq_iq4k_group_ok(mm[k]) || mm[k]->src[1] != src1) {
+            return false;
+        }
+        maxn = std::max<int64_t>(maxn, mm[k]->src[0]->ne[1]);
+    }
+    const int device = ggml_cuda_get_device();
+    const int ncu = ggml_cuda_info().devices[device].nsm;
+    cudaStream_t stream = ctx.stream();
+    iq4k::gjob_h jobs[iq4k::G_MAXJ];
+    if (maxn <= 2048) {
+        if (!iq4k_group_small()) {
+            return false;
+        }
+        const block_q8_1 * q8 = nullptr;
+        if (!ggml_cuda_mmvq_q8_cached(ctx, src1, &q8)) {
+            return false;
+        }
+        for (int k = 0; k < n; ++k) {
+            const ggml_tensor * w = mm[k]->src[0];
+            jobs[k] = { w->type, w->data, (float *) mm[k]->data, nullptr, (int) w->ne[1] };
+        }
+        if (!iq4k::launch_sn(jobs, n, q8, K, stream)) {
+            return false;
+        }
+        CUDA_CHECK(cudaGetLastError());
+        return true;
+    }
+    if (!iq4k_group_big()) {
+        return false;
+    }
+    for (int k = 0; k < n; ++k) {
+        const ggml_tensor * w = mm[k]->src[0];
+        const int kind = 0x200 + 16*(int) w->type + 4;   // = the single launcher's copy (L = 16, IL = 4) at K <= 8192
+        const void * soa = ggml_cuda_get_repacked(w, device, stream, kind, ggml_nbytes(w), iq4k_repack_il4);
+        if (!soa) {
+            return false;
+        }
+        jobs[k] = { w->type, soa, (float *) mm[k]->data, nullptr, (int) w->ne[1] };
+    }
+    const iq4k::gcfg c = { 16, iq4k_group_nw(), ncu, iq4k_group_rr() != 0 };
+    if (!iq4k::g_supported(jobs, n, K, false, c)) {
+        return false;
+    }
+    const block_q8_1 * q8 = nullptr;
+    if (!ggml_cuda_mmvq_q8_cached(ctx, src1, &q8)) {
+        return false;
+    }
+    if (!iq4k::launch_g(jobs, n, q8, K, stream, false, c)) {
+        return false;
+    }
+    CUDA_CHECK(cudaGetLastError());
+    return true;
 }
 
 bool ggml_cuda_mmvq_iq4k(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const block_q8_1 * src1_q8_1, ggml_tensor * dst,
@@ -142,6 +250,12 @@ bool ggml_cuda_mmvq_iq4k(ggml_backend_cuda_context & ctx, const ggml_tensor * sr
     return true;
 }
 #else
+bool ggml_cuda_mmvq_iq4k_group_ok(const ggml_tensor *) {
+    return false;
+}
+bool ggml_cuda_mmvq_iq4k_group(ggml_backend_cuda_context &, ggml_tensor * const *, int) {
+    return false;
+}
 bool ggml_cuda_mmvq_iq4k_wants(const ggml_tensor *) {
     return false;
 }
