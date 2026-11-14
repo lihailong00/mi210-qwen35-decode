@@ -24,14 +24,6 @@ static bool lowbit_enabled() {
     return enabled;
 }
 
-template <class T>
-static void lowbit_launch(const lb::soa & s, const block_q8_1 * y, float * dst, const int K, const int N, const float * residual,
-        const int ncu, hipStream_t stream) {
-    constexpr int L = 16, R = 2, NW = 16;
-    const size_t smem = lb::gemv_lds_bytes<T>(K);
-    lb::gemv<T, L, R, NW, false><<<ncu, dim3(64, NW), smem, stream>>>(s, y, dst, K, N, residual);
-}
-
 bool ggml_cuda_mmvq_lowbit(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const block_q8_1 * src1_q8_1, ggml_tensor * dst,
         const ggml_cuda_mm_fusion_args_host * fusion) {
     if (!lowbit_enabled()) {
@@ -43,8 +35,8 @@ bool ggml_cuda_mmvq_lowbit(ggml_backend_cuda_context & ctx, const ggml_tensor * 
     }
     const int64_t K = src0->ne[0];
     const int64_t N = src0->ne[1];
-    // stock mmvq is faster for small N (latency bound); lb kernels need N % 8 == 0
-    if (K % QK_K != 0 || N % 8 != 0 || N < 2048 || K > 32768 || !ggml_is_matrix(src0) || !ggml_is_contiguous(src0) ||
+    // lb::launch needs N % 64 == 0 (faster than stock mmvq even for 1024 rows)
+    if (K % QK_K != 0 || N % 64 != 0 || K > 32768 || !ggml_is_matrix(src0) || !ggml_is_contiguous(src0) ||
             !ggml_is_contiguous(dst) || dst->ne[1] != 1) {
         return false;
     }
@@ -78,16 +70,9 @@ bool ggml_cuda_mmvq_lowbit(ggml_backend_cuda_context & ctx, const ggml_tensor * 
     if (!soa_data) {
         return false;
     }
-    const lb::soa s = lb::soa_make(type, soa_data, (size_t) ggml_nelements(src0)/QK_K);
-    const int ncu = ggml_cuda_info().devices[device].nsm;
     float * dst_d = (float *) dst->data;
-    switch (type) {
-        case GGML_TYPE_IQ2_S:   lowbit_launch<lb::iq2_s_t<true>>  (s, src1_q8_1, dst_d, (int) K, (int) N, residual, ncu, stream); break;
-        case GGML_TYPE_IQ2_XS:  lowbit_launch<lb::iq2_xs_t<true>> (s, src1_q8_1, dst_d, (int) K, (int) N, residual, ncu, stream); break;
-        case GGML_TYPE_IQ2_XXS: lowbit_launch<lb::iq2_xxs_t<true>>(s, src1_q8_1, dst_d, (int) K, (int) N, residual, ncu, stream); break;
-        case GGML_TYPE_Q2_K:    lowbit_launch<lb::q2_K>           (s, src1_q8_1, dst_d, (int) K, (int) N, residual, ncu, stream); break;
-        case GGML_TYPE_IQ1_M:   lowbit_launch<lb::iq1_m>          (s, src1_q8_1, dst_d, (int) K, (int) N, residual, ncu, stream); break;
-        default: return false;
+    if (!lb::launch(type, soa_data, src1_q8_1, dst_d, (int) K, (int) N, stream, residual)) {  // per-shape tuned configs
+        return false;
     }
     CUDA_CHECK(cudaGetLastError());
     return true;

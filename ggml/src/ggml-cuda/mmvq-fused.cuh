@@ -30,7 +30,10 @@ static constexpr int COOP_KMAX = 32768;
 
 struct params {
     coop_state  * coop;      // nullptr: every workgroup quantizes x itself
-    char        * q8;        // global q8 buffer for the cooperative mode
+    char        * q8;        // global q8 buffer for the cooperative / pre-quantized modes
+    int           q8_pre;    // 1: q8 already holds the quantized activation (SoA): just copy it to LDS
+    const block_q8_1 * q8aos;  // optional: activation already quantized (AoS block_q8_1, from the activation cache)
+    const int        * q8sums; //           + per-block int sums
     const char  * vx;        // weights
     const char  * vg;        // gate weights (same type/layout as vx) for the fused swiglu, or nullptr
     const char  * mx;        // side data of vx (packed IQ3 meta)
@@ -117,6 +120,20 @@ static __device__ __forceinline__ void quantize_x_lds(const float * __restrict__
 template <bool SOA>
 static constexpr __host__ __device__ int lds_y_bytes(int K) {
     return SOA ? K + 8*(K/32) : (K/32)*int(sizeof(block_q8_1));
+}
+
+// Stage an already-quantized activation (AoS block_q8_1 + int sums) into the SoA LDS layout.
+template <int NT>
+static __device__ __forceinline__ void stage_q8_aos_to_lds(const block_q8_1 * __restrict__ y, const int * __restrict__ sums,
+        char * __restrict__ smem, const int K, const int tid) {
+    // qs: one int per thread per step (8 ints per block)
+    for (int i = tid; i < K/4; i += NT) {
+        ((int *) smem)[i] = ((const int *) y[i/8].qs)[i%8];
+    }
+    for (int b = tid; b < K/32; b += NT) {
+        ((half2 *)(smem + K))[b]          = y[b].ds;
+        ((int   *)(smem + K + 4*(K/32)))[b] = sums[b];
+    }
 }
 
 // Quantize chunks [c0, c1) (8 floats each) of x into the SoA layout at dst (global memory).
@@ -729,13 +746,15 @@ static constexpr __host__ __device__ int smem_bytes(int K) {
 // and the very first loads are issued before the activation prologue.
 
 // packed IQ3 (codex layout: codes[count*32 u32] then meta[count] 6 B)
-template <bool xxs>
+// MM: meta layout. 0 = codex 6-byte meta (2 small loads), 1 = 8-byte meta {d, pad, scales[4]} (one 8-byte load),
+// 2 = no meta loads (timing experiments only, wrong results)
+template <bool xxs, int MM = 0>
 struct pipe_pk {
     static constexpr bool soa_y     = true;
     static constexpr int  cpb       = 8;
     static constexpr int  qk        = 256;
     static constexpr int  tab_words = 0;
-    struct raw_t { uint4 c; uint16_t d; uint8_t s; };
+    struct raw_t { uint4 c; uint32_t d; uint32_t s; };
 
     static __device__ __forceinline__ void load_table(uint32_t *, const int, const int) {}
 
@@ -743,9 +762,18 @@ struct pipe_pk {
         const size_t pos = (size_t) row*stride_row + t;
         raw_t r;
         r.c = ((const uint4 *) vx)[pos];
-        const codex_iq3_meta * m = (const codex_iq3_meta *) mx + pos/8;
-        r.d = *(const uint16_t *) &m->d;
-        r.s = m->scales[(t & 7)/2];
+        if constexpr (MM == 0) {
+            const codex_iq3_meta * m = (const codex_iq3_meta *) mx + pos/8;
+            r.d = *(const uint16_t *) &m->d;
+            r.s = m->scales[(t & 7)/2];
+        } else if constexpr (MM == 1) {
+            const uint2 m = ((const uint2 *) mx)[pos/8];
+            r.d = m.x;
+            r.s = m.y;
+        } else {
+            r.d = 0x3c00;
+            r.s = 0x55555555;
+        }
         return r;
     }
 
@@ -753,7 +781,8 @@ struct pipe_pk {
         const int * y = soa_qs(smem, t);
         const int4 y0 = ((const int4 *) y)[0];
         const int4 y1 = ((const int4 *) y)[1];
-        const int sc = (r.s >> ((t & 1)*4)) & 15;
+        const uint32_t sbyte = MM == 0 ? r.s : (r.s >> (8*((t & 7)/2)));
+        const int sc = (sbyte >> ((t & 1)*4)) & 15;
         int value = 0;
         if constexpr (xxs) {
             alignas(4) static constexpr int8_t lv[16] = { 4, 12, 20, 28, 36, 44, 52, 62, -4,-12,-20,-28,-36,-44,-52,-62 };
@@ -782,7 +811,7 @@ struct pipe_pk {
             value = 2*value - 15*soa_sum(smem, K, t);
             value *= 1 + 2*sc;
         }
-        const float d = __half2float(__ushort_as_half(r.d)) * soa_d(smem, K, t);
+        const float d = __half2float(__ushort_as_half((uint16_t) (r.d & 0xFFFF))) * soa_d(smem, K, t);
         return d*value;
     }
 };
@@ -987,7 +1016,11 @@ static __global__ void mmvqf_pp_kernel(const params p) {
 
     const int tid = threadIdx.y*64 + threadIdx.x;
     D::load_table(tab, tid, NT);
-    quantize_x_lds<NT, D::soa_y>(p.x, smem, K);
+    if (D::soa_y && p.q8aos) {
+        stage_q8_aos_to_lds<NT>(p.q8aos, p.q8sums, smem, K, tid);
+    } else {
+        quantize_x_lds<NT, D::soa_y>(p.x, smem, K);
+    }
     if (p.residual || p.other) {
         const float * src = p.residual ? p.residual : p.other;
         for (int i = tid; i < niter*RW; i += NT) {
@@ -1122,7 +1155,12 @@ static __global__ void mmvqf_batch_kernel(const params p) {
     if constexpr (YG) {
         // activation already quantized (SoA) in global memory: no prologue
     } else if constexpr (D::soa_y) {
-        if (p.coop) {
+        if (p.q8_pre) {
+            const int n16 = lds_y_bytes<true>(K) / 16;
+            for (int i = tid; i < n16; i += NT) {
+                ((int4 *) smem)[i] = ((const int4 *) p.q8)[i];
+            }
+        } else if (p.coop) {
             coop_quantize_to_lds<NT>(p, smem, K, tid);
         } else {
             quantize_x_lds<NT, true>(p.x, smem, K);
