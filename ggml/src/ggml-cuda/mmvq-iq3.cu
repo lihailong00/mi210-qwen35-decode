@@ -5,7 +5,8 @@
 // Epilogues: residual add (fusion->x_bias), fused SwiGLU gate/up (fusion->gate, same or mixed IQ3_S/IQ3_XXS types).
 // Multi-job launches (ggml_cuda_mmvq_iq3_multi): 2-3 GEMVs on the same activation (qkv + z, k + v) in one kernel.
 // GGML_MMVQ_IQ3=0 disables this path (then the retained codex packed path / stock mmvq is used as before);
-// GGML_MMVQ_IQ3_MULTI=0 disables only the multi-job grouping, GGML_MMVQ_IQ3_PF=0 selects the previous prologue.
+// GGML_MMVQ_IQ3_MULTI=0 disables only the multi-job grouping, GGML_MMVQ_IQ3_PF=0 selects the previous prologue,
+// GGML_MMVQ_IQ3_SM=0 the previous (unit-major) weight layout.
 #include "common.cuh"
 #include "iq3-repack.cuh"
 #include "mmvq-fused-host.cuh"
@@ -46,8 +47,17 @@ static bool iq3g_smalln_codex() {
     return enabled;
 }
 
-static int iq3g_kind(const ggml_type t) {
-    return 0x1000 + (int) t*16 + IQ3G_RG;
+// Layout of the re-laid-out copies: step-major (the chunks one 16-lane wave step covers, CPS = 8, are contiguous for
+// all units, so all waves read one moving window of the matrix) when K/128 is a multiple of 8, else unit-major.
+// The layout is part of the cache key, so every kernel that reads a tensor uses the same one. GGML_MMVQ_IQ3_SM=0:
+// unit-major everywhere (previous layout).
+static constexpr int IQ3G_SM = 8;
+static int iq3g_sm(const int64_t K) {
+    static const bool enabled = iq3g_env_on("GGML_MMVQ_IQ3_SM");
+    return enabled && (K/128) % IQ3G_SM == 0 ? IQ3G_SM : 0;
+}
+static int iq3g_kind(const ggml_tensor * w) {
+    return 0x1000 + (int) w->type*16 + IQ3G_RG + (iq3g_sm(w->ne[0]) ? 0x800 : 0);
 }
 
 static bool iq3g_weight_ok(const ggml_tensor * w) {
@@ -69,12 +79,12 @@ static bool iq3g_weight_ok(const ggml_tensor * w) {
 
 template <int RG>
 static void iq3g_repack_fn(const void * src, void * dst, const ggml_tensor * t, hipStream_t stream) {
-    iq3g::repack(t->type, src, dst, (int) t->ne[1], (int) t->ne[0], RG, stream);
+    iq3g::repack(t->type, src, dst, (int) t->ne[1], (int) t->ne[0], RG, stream, iq3g_sm(t->ne[0]));
 }
 
 static const uint8_t * iq3g_get_soa(const ggml_tensor * w, const int device, hipStream_t stream) {
     const size_t nb = (size_t) ggml_nelements(w)/QK_K;
-    return (const uint8_t *) ggml_cuda_get_repacked(w, device, stream, iq3g_kind(w->type), iq3g::soa_bytes(w->type, nb),
+    return (const uint8_t *) ggml_cuda_get_repacked(w, device, stream, iq3g_kind(w), iq3g::soa_bytes(w->type, nb),
             iq3g_repack_fn<IQ3G_RG>);
 }
 
@@ -88,14 +98,15 @@ bool ggml_cuda_mmvq_iq3_fuse_mixed_ok(const ggml_tensor * up_w, const ggml_tenso
     if (iq3g::lds_bytes<iq3g::iq3s_t, iq3g::iq3xxs_t>((int) up_w->ne[0]) > 65536) {
         return false;
     }
-    return ggml_cuda_has_repacked(up_w, iq3g_kind(up_w->type)) && ggml_cuda_has_repacked(gate_w, iq3g_kind(gate_w->type));
+    return ggml_cuda_has_repacked(up_w, iq3g_kind(up_w)) && ggml_cuda_has_repacked(gate_w, iq3g_kind(gate_w));
 }
 
-template <class TA, class TB, int P, int PF>
+template <class TA, class TB, int P, int PF, int SM>
 static bool iq3g_launch(const uint8_t * wa, const uint8_t * wb, const block_q8_1 * y, float * dst, const int K, const int N,
         const float * residual, const int ncu, hipStream_t stream) {
     constexpr int L = 16, R = 1, NW = 16;
     static_assert((64/L)*R == IQ3G_RG, "kernel config must match the repack row interleave");
+    static_assert(SM == 0 || SM == L*P/4, "step-major layout: chunks per wave step");
     const size_t smem = iq3g::lds_bytes<TA, TB>(K);
     if (smem > 65536) {
         return false;
@@ -103,21 +114,19 @@ static bool iq3g_launch(const uint8_t * wa, const uint8_t * wb, const block_q8_1
     if (PF >= 3 && K/32 > NW*64) {   // the split prologue stages one activation block per thread
         return false;
     }
-    iq3g::gemv<TA, TB, P, L, R, NW, PF><<<ncu, dim3(64, NW), smem, stream>>>(wa, wb, y, dst, K, N, residual);
+    iq3g::gemv<TA, TB, P, L, R, NW, PF, 0, 1, SM><<<ncu, dim3(64, NW), smem, stream>>>(wa, wb, y, dst, K, N, residual);
     return true;
 }
 template <class TA, class TB>
 static bool iq3g_launch_pf(const uint8_t * wa, const uint8_t * wb, const block_q8_1 * y, float * dst, const int K, const int N,
-        const float * residual, const int ncu, hipStream_t stream) {
-    constexpr bool GLU = !std::is_same<TB, iq3g::none_t>::value;
-    const int mode = iq3g_pf_mode();
-    if (mode == 5 && iq3g_launch<TA, TB, 2, 5>(wa, wb, y, dst, K, N, residual, ncu, stream)) {
-        return true;
+        const float * residual, const int ncu, hipStream_t stream, const int sm) {
+    const bool pf5 = iq3g_pf_mode() == 5;
+    if (sm) {
+        return (pf5 && iq3g_launch<TA, TB, 2, 5, IQ3G_SM>(wa, wb, y, dst, K, N, residual, ncu, stream)) ||
+               iq3g_launch<TA, TB, 2, 0, IQ3G_SM>(wa, wb, y, dst, K, N, residual, ncu, stream);
     }
-    if (mode == 3 && !GLU && iq3g_launch<TA, TB, 2, 3>(wa, wb, y, dst, K, N, residual, ncu, stream)) {
-        return true;
-    }
-    return iq3g_launch<TA, TB, 2, 0>(wa, wb, y, dst, K, N, residual, ncu, stream);
+    return (pf5 && iq3g_launch<TA, TB, 2, 5, 0>(wa, wb, y, dst, K, N, residual, ncu, stream)) ||
+           iq3g_launch<TA, TB, 2, 0, 0>(wa, wb, y, dst, K, N, residual, ncu, stream);
 }
 
 bool ggml_cuda_mmvq_iq3(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const block_q8_1 * src1_q8_1, ggml_tensor * dst,
@@ -165,18 +174,19 @@ bool ggml_cuda_mmvq_iq3(ggml_backend_cuda_context & ctx, const ggml_tensor * src
     const int ncu = ggml_cuda_info().devices[device].nsm;
     float * d = (float *) dst->data;
     const bool us = src0->type == GGML_TYPE_IQ3_S;
+    const int  sm = iq3g_sm(K);   // = the layout iq3g_get_soa created the copies with
     bool ok = false;
     using namespace iq3g;
     if (!gate) {
-        ok = us ? iq3g_launch_pf<iq3s_t,   none_t>(wu, nullptr, src1_q8_1, d, K, N, residual, ncu, stream)
-                : iq3g_launch_pf<iq3xxs_t, none_t>(wu, nullptr, src1_q8_1, d, K, N, residual, ncu, stream);
+        ok = us ? iq3g_launch_pf<iq3s_t,   none_t>(wu, nullptr, src1_q8_1, d, K, N, residual, ncu, stream, sm)
+                : iq3g_launch_pf<iq3xxs_t, none_t>(wu, nullptr, src1_q8_1, d, K, N, residual, ncu, stream, sm);
     } else {
         // TA = gate (weights wg), TB = up (weights wu): dst = silu(gate.y) * (up.y)
         const bool gs = gate->type == GGML_TYPE_IQ3_S;
-        if (gs && us)        ok = iq3g_launch_pf<iq3s_t,   iq3s_t  >(wg, wu, src1_q8_1, d, K, N, nullptr, ncu, stream);
-        else if (gs && !us)  ok = iq3g_launch_pf<iq3s_t,   iq3xxs_t>(wg, wu, src1_q8_1, d, K, N, nullptr, ncu, stream);
-        else if (!gs && us)  ok = iq3g_launch_pf<iq3xxs_t, iq3s_t  >(wg, wu, src1_q8_1, d, K, N, nullptr, ncu, stream);
-        else                 ok = iq3g_launch_pf<iq3xxs_t, iq3xxs_t>(wg, wu, src1_q8_1, d, K, N, nullptr, ncu, stream);
+        if (gs && us)        ok = iq3g_launch_pf<iq3s_t,   iq3s_t  >(wg, wu, src1_q8_1, d, K, N, nullptr, ncu, stream, sm);
+        else if (gs && !us)  ok = iq3g_launch_pf<iq3s_t,   iq3xxs_t>(wg, wu, src1_q8_1, d, K, N, nullptr, ncu, stream, sm);
+        else if (!gs && us)  ok = iq3g_launch_pf<iq3xxs_t, iq3s_t  >(wg, wu, src1_q8_1, d, K, N, nullptr, ncu, stream, sm);
+        else                 ok = iq3g_launch_pf<iq3xxs_t, iq3xxs_t>(wg, wu, src1_q8_1, d, K, N, nullptr, ncu, stream, sm);
     }
     if (ok) {
         CUDA_CHECK(cudaGetLastError());
@@ -187,6 +197,21 @@ bool ggml_cuda_mmvq_iq3(ggml_backend_cuda_context & ctx, const ggml_tensor * src
 // ------------------------------------------------------------------------------------------------ multi-job
 static constexpr int IQ3G_MJ_NW = 16;
 static constexpr int IQ3G_MJ_L  = 16;
+
+template <int SM>
+static void iq3g_launch_mj(const bool hs, const bool hx, const block_q8_1 * y, const int K, const iq3g::mj_args & a, const int ncu,
+        hipStream_t stream) {
+    using namespace iq3g;
+    constexpr int NW = IQ3G_MJ_NW, L = IQ3G_MJ_L;
+    static_assert(64/L == IQ3G_RG, "kernel config must match the repack row interleave");
+    if (hs && hx) {
+        gemv_mj<iq3s_t, iq3xxs_t, 2, L, NW, 1, 0, SM><<<ncu, dim3(64, NW), lds_bytes_mj<iq3s_t, iq3xxs_t>(K, 1, NW, L), stream>>>(y, K, a);
+    } else if (hs) {
+        gemv_mj<iq3s_t, none_t, 2, L, NW, 1, 0, SM><<<ncu, dim3(64, NW), lds_bytes_mj<iq3s_t, none_t>(K, 1, NW, L), stream>>>(y, K, a);
+    } else {
+        gemv_mj<iq3xxs_t, none_t, 2, L, NW, 1, 0, SM><<<ncu, dim3(64, NW), lds_bytes_mj<iq3xxs_t, none_t>(K, 1, NW, L), stream>>>(y, K, a);
+    }
+}
 
 bool ggml_cuda_mmvq_iq3_multi_ok(const ggml_tensor * const * w, const int n) {
     if (!iq3g_enabled() || !iq3g_multi_enabled() || n < 2 || n > iq3g::MJ_MAX) {
@@ -246,21 +271,17 @@ bool ggml_cuda_mmvq_iq3_multi(ggml_backend_cuda_context & ctx, const ggml_tensor
         a.job[i].nh   = (uint32_t) (w[i]->ne[1]*(K/128));
         a.job[i].ubeg = ub;
         a.job[i].tsel = (hs && hx && w[i]->type == GGML_TYPE_IQ3_XXS) ? 1 : 0;
+        a.job[i].U    = (int) (w[i]->ne[1] / IQ3G_RG);
         ub += (int) (w[i]->ne[1] / IQ3G_RG);
     }
     a.njob = n;
     a.utot = ub;
     const int ncu = ggml_cuda_info().devices[device].nsm;
-    using namespace iq3g;
-    constexpr int NW = IQ3G_MJ_NW, L = IQ3G_MJ_L;
-    static_assert(64/L == IQ3G_RG, "kernel config must match the repack row interleave");
     // no first-item prefetch under the staging (PFM 0): slower with IQ3_XXS in the bench and for IQ3_S groups in situ
-    if (hs && hx) {
-        gemv_mj<iq3s_t, iq3xxs_t, 2, L, NW, 1, 0><<<ncu, dim3(64, NW), lds_bytes_mj<iq3s_t, iq3xxs_t>(K, 1, NW, L), stream>>>(src1_q8_1, K, a);
-    } else if (hs) {
-        gemv_mj<iq3s_t, none_t, 2, L, NW, 1, 0><<<ncu, dim3(64, NW), lds_bytes_mj<iq3s_t, none_t>(K, 1, NW, L), stream>>>(src1_q8_1, K, a);
+    if (iq3g_sm(K)) {
+        iq3g_launch_mj<IQ3G_SM>(hs, hx, src1_q8_1, K, a, ncu, stream);
     } else {
-        gemv_mj<iq3xxs_t, none_t, 2, L, NW, 1, 0><<<ncu, dim3(64, NW), lds_bytes_mj<iq3xxs_t, none_t>(K, 1, NW, L), stream>>>(src1_q8_1, K, a);
+        iq3g_launch_mj<0>(hs, hx, src1_q8_1, K, a, ncu, stream);
     }
     CUDA_CHECK(cudaGetLastError());
     return true;

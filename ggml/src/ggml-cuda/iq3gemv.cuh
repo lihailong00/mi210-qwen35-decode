@@ -76,9 +76,17 @@ static __host__ __device__ inline size_t soa_bytes(ggml_type t, size_t nb) {
 static __host__ __device__ __forceinline__ uint32_t chunk_index(uint32_t row, uint32_t h, uint32_t items, uint32_t RG) {
     return ((row / RG)*items + h)*RG + row % RG;
 }
+// CPS > 0: step-major layout - the CPS chunks that one wave step of a unit (RG rows) covers are contiguous, followed
+// by the same step of the next unit (U = N/RG units); all waves then read one moving window of the matrix instead of
+// U separate streams. CPS = 0: unit-major (chunk_index). Requires items % CPS == 0.
+static __host__ __device__ __forceinline__ uint32_t chunk_index_sm(uint32_t row, uint32_t h, uint32_t items, uint32_t RG, uint32_t U, uint32_t CPS) {
+    if (CPS == 0) return chunk_index(row, h, items, RG);
+    return (((h / CPS)*U + row / RG)*CPS + h % CPS)*RG + row % RG;
+}
 
-// repack: one thread per (row, half-block). dst must not alias src. N % RG == 0, K % 256 == 0.
-static __global__ void repack_iq3_s(const block_iq3_s * __restrict__ src, uint8_t * __restrict__ dst, const int N, const int K, const int RG) {
+// repack: one thread per (row, half-block). dst must not alias src. N % RG == 0, K % 256 == 0, (K/128) % CPS == 0.
+static __global__ void repack_iq3_s(const block_iq3_s * __restrict__ src, uint8_t * __restrict__ dst, const int N, const int K, const int RG,
+        const int CPS = 0) {
     const size_t t = blockIdx.x*(size_t) blockDim.x + threadIdx.x;
     const uint32_t items = K/128;
     const size_t nh = (size_t) N*items;
@@ -108,7 +116,7 @@ static __global__ void repack_iq3_s(const block_iq3_s * __restrict__ src, uint8_
     uint16_t d; memcpy(&d, &b.d, 2);
     F[2] |= (uint32_t) d << 16;
     F[5] |= scales << 16;
-    const uint32_t c = chunk_index(row, h, items, (uint32_t) RG);
+    const uint32_t c = chunk_index_sm(row, h, items, (uint32_t) RG, (uint32_t) (N/RG), (uint32_t) CPS);
     uint4 * Q = (uint4 *) dst; uint4 * FA = (uint4 *) (dst + nh*32); uint2 * FB = (uint2 *) (dst + nh*48);
     Q[2*(size_t) c]     = make_uint4(q[0], q[1], q[2], q[3]);
     Q[2*(size_t) c + 1] = make_uint4(q[4], q[5], q[6], q[7]);
@@ -116,7 +124,8 @@ static __global__ void repack_iq3_s(const block_iq3_s * __restrict__ src, uint8_
     FB[c] = make_uint2(F[4], F[5]);
 }
 
-static __global__ void repack_iq3_xxs(const block_iq3_xxs * __restrict__ src, uint8_t * __restrict__ dst, const int N, const int K, const int RG) {
+static __global__ void repack_iq3_xxs(const block_iq3_xxs * __restrict__ src, uint8_t * __restrict__ dst, const int N, const int K, const int RG,
+        const int CPS = 0) {
     const size_t t = blockIdx.x*(size_t) blockDim.x + threadIdx.x;
     const uint32_t items = K/128;
     const size_t nh = (size_t) N*items;
@@ -135,12 +144,13 @@ static __global__ void repack_iq3_xxs(const block_iq3_xxs * __restrict__ src, ui
         for (int m = 0; m < 4; ++m) w |= (((aux >> (7*m)) & 0x7Fu) | (((sc >> m) & 1u) << 7)) << (8*m);
         A[j] = w;
     }
-    const uint32_t c = chunk_index(row, h, items, (uint32_t) RG);
+    const uint32_t U = (uint32_t) (N/RG);
+    const uint32_t c = chunk_index_sm(row, h, items, (uint32_t) RG, U, (uint32_t) CPS);
     uint4 * Q = (uint4 *) dst; uint4 * AA = (uint4 *) (dst + nh*32); uint16_t * D = (uint16_t *) (dst + nh*48);
     Q[2*(size_t) c]     = make_uint4(q[0], q[1], q[2], q[3]);
     Q[2*(size_t) c + 1] = make_uint4(q[4], q[5], q[6], q[7]);
     AA[c] = make_uint4(A[0], A[1], A[2], A[3]);
-    if (half == 0) { uint16_t d; memcpy(&d, &b.d, 2); D[chunk_index(row, h/2, items/2, (uint32_t) RG)] = d; }
+    if (half == 0) { uint16_t d; memcpy(&d, &b.d, 2); D[chunk_index_sm(row, h/2, items/2, (uint32_t) RG, U, (uint32_t) (CPS/2))] = d; }
 }
 
 // ------------------------------------------------------------------------------------------------ type traits
@@ -422,10 +432,13 @@ struct none_t {
     template <int P> static __device__ uint32_t fold(const ld<P> &) { return 0; }
 };
 
-template <class TA, class TB, int P, int L, int R, int NW, int PF, int DBG = 0, int MINW = 1>   // DBG: 1 = loads only, 2 = compute only
+// SM > 0: weights in the step-major layout with CPS = SM chunks per step (SM must equal L/(4/P)*R... i.e. the chunks
+// one wave step of a unit covers: SM = L*P/4 for R = 1)
+template <class TA, class TB, int P, int L, int R, int NW, int PF, int DBG = 0, int MINW = 1, int SM = 0>   // DBG: 1 = loads only, 2 = compute only
 __launch_bounds__(NW*64, MINW)   /* MINW = min waves per SIMD (8 with NW=16: two workgroups per CU) */
 __global__ void gemv(const uint8_t * __restrict__ wa, const uint8_t * __restrict__ wb, const block_q8_1 * __restrict__ yg,
         float * __restrict__ dst, const int K, const int N, const float * __restrict__ residual) {
+    static_assert(SM == 0 || (R == 1 && SM == L*P/4), "step-major layout: SM = chunks per wave step");
     constexpr bool GLU  = !std::is_same<TB, none_t>::value;
     constexpr bool SAME = std::is_same<TA, TB>::value;
     constexpr int TOFF_A = 0;
@@ -454,8 +467,15 @@ __global__ void gemv(const uint8_t * __restrict__ wa, const uint8_t * __restrict
 #pragma unroll
         for (int r = 0; r < R; ++r) {
             const uint32_t rin = (uint32_t) (r*G + grp);
-            const uint32_t c  = ((uint32_t) uu*(uint32_t) items + (uint32_t) h)*RG + rin;
-            const uint32_t cb = ((uint32_t) uu*(uint32_t) (items/2) + (uint32_t) (h >> 1))*RG + rin;
+            uint32_t c, cb;
+            if constexpr (SM == 0) {
+                c  = ((uint32_t) uu*(uint32_t) items + (uint32_t) h)*RG + rin;
+                cb = ((uint32_t) uu*(uint32_t) (items/2) + (uint32_t) (h >> 1))*RG + rin;
+            } else {
+                const uint32_t hb = (uint32_t) h >> 1;
+                c  = ((((uint32_t) h / SM)*(uint32_t) U + (uint32_t) uu)*SM + (uint32_t) h % SM)*RG + rin;
+                cb = (((hb / (SM/2))*(uint32_t) U + (uint32_t) uu)*(SM/2) + hb % (SM/2))*RG + rin;
+            }
             ra[r] = TA::template load<P>(wa, nh, c, cb, p);
             if constexpr (GLU) rb[r] = TB::template load<P>(wb, nh, c, cb, p);
         }
@@ -583,7 +603,7 @@ struct mj_job {
     uint32_t        nh;     // chunks of the matrix = N*K/128
     int             ubeg;   // first unit of the job in the concatenated unit space (unused jobs: INT_MAX)
     int             tsel;   // 0: T0, 1: T1
-    int             pad_;
+    int             U;      // units of the job (N/RG), for the step-major layout
 };
 struct mj_args {
     mj_job job[MJ_MAX];
@@ -593,13 +613,20 @@ struct mj_args {
 static __device__ __forceinline__ int mj_find(const mj_args & a, const int u) {
     return (u >= a.job[1].ubeg) + (u >= a.job[2].ubeg);
 }
-template <class T, int P, int RG>
+template <class T, int P, int RG, int SM = 0>
 static __device__ __forceinline__ typename T::template ld<P> mj_load(const uint8_t * __restrict__ w, const uint32_t nh, const int lu,
-        const int items, const int grp, const int it) {
+        const int items, const int grp, const int it, const int U = 0) {
     constexpr int IPC = 4/P;
     const int h = it / IPC, p = it % IPC;
-    const uint32_t c  = ((uint32_t) lu*(uint32_t) items + (uint32_t) h)*RG + (uint32_t) grp;
-    const uint32_t cb = ((uint32_t) lu*(uint32_t) (items/2) + (uint32_t) (h >> 1))*RG + (uint32_t) grp;
+    uint32_t c, cb;
+    if constexpr (SM == 0) {
+        c  = ((uint32_t) lu*(uint32_t) items + (uint32_t) h)*RG + (uint32_t) grp;
+        cb = ((uint32_t) lu*(uint32_t) (items/2) + (uint32_t) (h >> 1))*RG + (uint32_t) grp;
+    } else {
+        const uint32_t hb = (uint32_t) h >> 1;
+        c  = ((((uint32_t) h / SM)*(uint32_t) U + (uint32_t) lu)*SM + (uint32_t) h % SM)*RG + (uint32_t) grp;
+        cb = (((hb / (SM/2))*(uint32_t) U + (uint32_t) lu)*(SM/2) + hb % (SM/2))*RG + (uint32_t) grp;
+    }
     return T::template load<P>(w, nh, c, cb, p);
 }
 template <class T, int TOFF, int P>
@@ -636,10 +663,10 @@ static __device__ __forceinline__ void mj_item(float & acc, const typename T::te
     }
 }
 // items it0+lane, it0+lane+L, .. < it1 of local unit lu; the first one from the prefetched registers if use_pf
-template <class T, int TOFF, int P, int L, int RG>
+template <class T, int TOFF, int P, int L, int RG, int SM = 0>
 static __device__ __forceinline__ float mj_unit(const uint8_t * __restrict__ w, const uint32_t nh, const int lu, const int items,
         const int lane, const int grp, const int it0, const int it1, const uint32_t yoff,
-        const bool use_pf, const typename T::template ld<P> & pf) {
+        const bool use_pf, const typename T::template ld<P> & pf, const int U = 0) {
     float acc = 0.0f;
     int it = it0 + lane;
     if (use_pf) {
@@ -647,13 +674,13 @@ static __device__ __forceinline__ float mj_unit(const uint8_t * __restrict__ w, 
         it += L;
     }
     for (; it < it1; it += L) {
-        const typename T::template ld<P> c = mj_load<T, P, RG>(w, nh, lu, items, grp, it);
+        const typename T::template ld<P> c = mj_load<T, P, RG, SM>(w, nh, lu, items, grp, it, U);
         mj_item<T, TOFF, P>(acc, c, it, yoff);
     }
     return acc;
 }
 
-template <class T0, class T1, int P, int L, int NW, int KS, int PFM = 1>   // PFM: prefetch the first item under the staging
+template <class T0, class T1, int P, int L, int NW, int KS, int PFM = 1, int SM = 0>   // PFM: prefetch the first item under the staging; SM: step-major layout
 __launch_bounds__(NW*64, 1)
 __global__ void gemv_mj(const block_q8_1 * __restrict__ yg, const int K, const mj_args a) {
     constexpr bool HAS1 = !std::is_same<T1, none_t>::value;
@@ -703,9 +730,9 @@ __global__ void gemv_mj(const block_q8_1 * __restrict__ yg, const int K, const m
         const mj_job & J = a.job[j];
         const int itp = min(it0 + lane, it1 - 1);
         if (!HAS1 || J.tsel == 0) {
-            pf0 = mj_load<T0, P, RG>(J.w, J.nh, uc - J.ubeg, items, grp, itp);
+            pf0 = mj_load<T0, P, RG, SM>(J.w, J.nh, uc - J.ubeg, items, grp, itp, J.U);
         } else {
-            if constexpr (HAS1) pf1 = mj_load<T1, P, RG>(J.w, J.nh, uc - J.ubeg, items, grp, itp);
+            if constexpr (HAS1) pf1 = mj_load<T1, P, RG, SM>(J.w, J.nh, uc - J.ubeg, items, grp, itp, J.U);
         }
     }
     sched_fence();
@@ -720,9 +747,9 @@ __global__ void gemv_mj(const block_q8_1 * __restrict__ yg, const int K, const m
             const int lu = u - J.ubeg;
             float acc;
             if (!HAS1 || J.tsel == 0) {
-                acc = mj_unit<T0, TOFF0, P, L, RG>(J.w, J.nh, lu, items, lane, grp, 0, ipr, YOFF, PFM && first, pf0);
+                acc = mj_unit<T0, TOFF0, P, L, RG, SM>(J.w, J.nh, lu, items, lane, grp, 0, ipr, YOFF, PFM && first, pf0, J.U);
             } else {
-                if constexpr (HAS1) acc = mj_unit<T1, TOFF1, P, L, RG>(J.w, J.nh, lu, items, lane, grp, 0, ipr, YOFF, PFM && first, pf1);
+                if constexpr (HAS1) acc = mj_unit<T1, TOFF1, P, L, RG, SM>(J.w, J.nh, lu, items, lane, grp, 0, ipr, YOFF, PFM && first, pf1, J.U);
                 else acc = 0.0f;
             }
             first = false;
@@ -743,9 +770,9 @@ __global__ void gemv_mj(const block_q8_1 * __restrict__ yg, const int K, const m
             if (act) {
                 float acc;
                 if (!HAS1 || J.tsel == 0) {
-                    acc = mj_unit<T0, TOFF0, P, L, RG>(J.w, J.nh, lu, items, lane, grp, it0, it1, YOFF, PFM && first, pf0);
+                    acc = mj_unit<T0, TOFF0, P, L, RG, SM>(J.w, J.nh, lu, items, lane, grp, it0, it1, YOFF, PFM && first, pf0, J.U);
                 } else {
-                    if constexpr (HAS1) acc = mj_unit<T1, TOFF1, P, L, RG>(J.w, J.nh, lu, items, lane, grp, it0, it1, YOFF, PFM && first, pf1);
+                    if constexpr (HAS1) acc = mj_unit<T1, TOFF1, P, L, RG, SM>(J.w, J.nh, lu, items, lane, grp, it0, it1, YOFF, PFM && first, pf1, J.U);
                     else acc = 0.0f;
                 }
                 const float v = group_sum<L>(acc);
@@ -1229,13 +1256,13 @@ static inline size_t lds_bytes(int K) {
 static inline bool supported(ggml_type t) { return t == GGML_TYPE_IQ3_S || t == GGML_TYPE_IQ3_XXS; }
 
 // src = original ggml blocks (N rows x K), dst = separate buffer of soa_bytes(t, N*K/256) bytes, RG = row interleave
-static inline bool repack(ggml_type t, const void * src, void * dst, int N, int K, int RG, hipStream_t st) {
-    if (K % 256 != 0 || N % RG != 0) return false;
+static inline bool repack(ggml_type t, const void * src, void * dst, int N, int K, int RG, hipStream_t st, int CPS = 0) {
+    if (K % 256 != 0 || N % RG != 0 || (CPS && ((K/128) % CPS != 0 || CPS % 2 != 0))) return false;
     const size_t nh = (size_t) N*(K/128);
     const int nthr = 256; const int nblk = (int) ((nh + nthr - 1)/nthr);
     switch (t) {
-        case GGML_TYPE_IQ3_S:   hipLaunchKernelGGL(repack_iq3_s,   dim3(nblk), dim3(nthr), 0, st, (const block_iq3_s *)   src, (uint8_t *) dst, N, K, RG); return true;
-        case GGML_TYPE_IQ3_XXS: hipLaunchKernelGGL(repack_iq3_xxs, dim3(nblk), dim3(nthr), 0, st, (const block_iq3_xxs *) src, (uint8_t *) dst, N, K, RG); return true;
+        case GGML_TYPE_IQ3_S:   hipLaunchKernelGGL(repack_iq3_s,   dim3(nblk), dim3(nthr), 0, st, (const block_iq3_s *)   src, (uint8_t *) dst, N, K, RG, CPS); return true;
+        case GGML_TYPE_IQ3_XXS: hipLaunchKernelGGL(repack_iq3_xxs, dim3(nblk), dim3(nthr), 0, st, (const block_iq3_xxs *) src, (uint8_t *) dst, N, K, RG, CPS); return true;
         default: return false;
     }
 }
