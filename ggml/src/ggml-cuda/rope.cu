@@ -1036,6 +1036,18 @@ struct ggml_cuda_attn_prep {
     const float * freq_factors;
 };
 
+// device-side cache of theta_scale^i for attn_prep_f32 (written by the first launch with the same powf; a key
+// mismatch, e.g. another model in the process, just falls back to powf)
+static __device__ float              g_attn_prep_pow[256];
+static __device__ unsigned long long g_attn_prep_pow_key = 0;
+
+static __device__ __forceinline__ unsigned long long attn_prep_pow_key(const float theta_scale, const int n_pairs) {
+    if (n_pairs <= 0 || n_pairs > 256) {
+        return 0;
+    }
+    return (1ull << 63) | ((unsigned long long) n_pairs << 32) | __float_as_uint(theta_scale);
+}
+
 // half(fma(a, b, c)) rounded once, like the v_fma_mixlo_f16 the compiler forms for ggml_cuda_cast<half>(x0*c - x1*s)
 // in rope_multi<float, half> on gfx9 (a plain fmaf + conversion rounds twice and differs by 1 ulp now and then)
 static __device__ __forceinline__ half attn_prep_fma_f16(const float a, const float b, const float c) {
@@ -1123,6 +1135,9 @@ static __global__ void attn_prep_f32(
         const float * src  = is_q ? q_src + t*q_s2 + h*q_s1 : k_src + t*k_s2 + h*k_s1;
         const float * w    = is_q ? wq : wk;
         const int64_t krow = is_q ? 0 : k_idx[t]; // uniform, issued early
+        // speculative load of the cached theta_scale^i of this lane (first pass), validated by the key below
+        const unsigned long long pow_key_seen = __atomic_load_n(&g_attn_prep_pow_key, __ATOMIC_RELAXED);
+        const float pw_pref = g_attn_prep_pow[tid];
 
         float wv[EPT];
         attn_prep_load<EPT>(src + e0, x);
@@ -1139,6 +1154,11 @@ static __global__ void attn_prep_f32(
             p4[2] = pos[t + 2*n_tokens];
             p4[3] = pos[t + 3*n_tokens];
         }
+        // theta_scale^i depends only on the model: after the first launch it comes from a device-side table written
+        // with the same powf (bit-identical); powf was ~1/3 of this latency-bound kernel
+        const unsigned long long pow_key = attn_prep_pow_key(theta_scale, n_pairs);
+        const bool pow_cached = pow_key != 0 && pow_key_seen == pow_key;
+        const bool pow_writer = pow_key != 0 && !pow_cached && b == 0 && t == 0;
         __shared__ float s_cos[HD/2];
         __shared__ float s_sin[HD/2];
         for (int i = tid; i < n_pairs; i += 64) {
@@ -1150,13 +1170,20 @@ static __global__ void attn_prep_f32(
                 p = p4[0];
             }
             const int   iw          = 2*i;
-            const float theta_base  = p*powf(theta_scale, iw/2.0f);
+            const float pw          = pow_cached ? (i == tid ? pw_pref : g_attn_prep_pow[i]) : powf(theta_scale, iw/2.0f);
+            if (pow_writer) {
+                g_attn_prep_pow[i] = pw;
+            }
+            const float theta_base  = p*pw;
             const float freq_factor = has_ff ? freq_factors[i] : 1.0f;
             float cos_theta;
             float sin_theta;
             rope_yarn<true>(theta_base/freq_factor, freq_scale, corr_dims, 2*i, ext_factor, attn_factor, cos_theta, sin_theta);
             s_cos[i] = cos_theta;
             s_sin[i] = sin_theta;
+        }
+        if (pow_writer) {
+            __threadfence(); // table entries visible before the key (published after the barrier below)
         }
 
         // sum of squares in the order of rms_norm_f32<128, 1, true> for 256 columns (float4 per thread, 32-lane
@@ -1190,6 +1217,9 @@ static __global__ void attn_prep_f32(
             ys[e0 + j] = x[j];
         }
         __syncthreads();
+        if (pow_writer && tid == 0) {
+            __atomic_store_n(&g_attn_prep_pow_key, pow_key, __ATOMIC_RELAXED);
+        }
 
         // rotated element e of pair (ia, ib): fma(P, cos, M*sin) with (P, M) = (x0, -x1) for ia and (x1, x0) for ib.
         // This is the exact contraction the compiler emits for rope_multi/rope_neox (x0*cos - x1*sin ->
