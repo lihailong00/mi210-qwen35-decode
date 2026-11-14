@@ -22,6 +22,13 @@ bool ggml_cuda_swiglu_q8(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
 bool ggml_cuda_unary_mul_q8(ggml_backend_cuda_context & ctx, ggml_tensor * unary_node, ggml_tensor * mul_node);
 
 // Single-token GEMV for IQ2_S/IQ2_XS/IQ2_XXS/Q2_K/IQ1_M on SoA re-laid-out weights (activation already quantized to q8_1).
+// Gated output norm of the linear-attention layers in one kernel (+ q8_1 of the result for the following GEMV):
+//   dst = silu(z) * (rms_norm(x) * w), rows of 128 (same arithmetic as rms_norm_f32<32, 1, true, true> + the
+//   UNARY(SILU)+MUL op). x, z, dst: [128, nrows] contiguous f32, w: [128].
+bool ggml_cuda_rms_norm_gated_q8_supported(const ggml_tensor * x, const ggml_tensor * w, const ggml_tensor * z, const ggml_tensor * dst);
+void ggml_cuda_rms_norm_gated_q8(ggml_backend_cuda_context & ctx, const ggml_tensor * x, const ggml_tensor * w, float eps,
+        const ggml_tensor * z, ggml_tensor * dst);
+
 // Single-token BF16 thin GEMV with an elementwise epilogue (fused graph chains, see ggml-cuda.cu):
 //   epi 0: dst = dot (+ bias)
 //   epi 1: dst = sigmoid(dot)                        (MUL_MAT -> RESHAPE -> SIGMOID)

@@ -133,6 +133,61 @@ static __global__ void __launch_bounds__(1024) rms_norm_mul_q8_kernel(const floa
     }
 }
 
+// one row of 128 per 32-thread block (as rms_norm_f32<32, 1, true, true>): rms_norm(x) * w, then silu(z) * that (as the
+// UNARY(SILU)+MUL op), + q8_1 of the result (8 consecutive threads hold one block of 32 values)
+static __global__ void __launch_bounds__(32) rms_norm_gated_q8_kernel(const float * __restrict__ x, const float * __restrict__ w,
+        const float * __restrict__ z, float * __restrict__ dst, block_q8_1 * __restrict__ y, int * __restrict__ ysum,
+        const int ncols, const float eps) {
+    __shared__ float s_sum[32];
+    const int row = blockIdx.x;
+    const int tid = threadIdx.x;
+    const float4 * x4 = (const float4 *) (x + (int64_t) row*ncols);
+    const float4 * z4 = (const float4 *) (z + (int64_t) row*ncols);
+    const float4 * m4 = (const float4 *) w;
+    float4       * d4 = (float4 *) (dst + (int64_t) row*ncols);
+
+    const float4 xs = x4[tid];
+    const float4 m  = m4[tid];
+    const float4 zv = z4[tid];
+    float tmp = 0.0f;
+    tmp += xs.x*xs.x + xs.y*xs.y + xs.z*xs.z + xs.w*xs.w;
+    tmp = block_reduce<block_reduce_method::SUM, 32>(tmp, s_sum);
+    const float scale = rsqrtf(tmp / ncols + eps);
+
+    float4 r = make_float4(scale*xs.x, scale*xs.y, scale*xs.z, scale*xs.w);
+    r.x *= m.x;
+    r.y *= m.y;
+    r.z *= m.z;
+    r.w *= m.w;
+    float4 o;
+    o.x = ggml_cuda_op_silu_single(zv.x) * r.x;
+    o.y = ggml_cuda_op_silu_single(zv.y) * r.y;
+    o.z = ggml_cuda_op_silu_single(zv.z) * r.z;
+    o.w = ggml_cuda_op_silu_single(zv.w) * r.w;
+    d4[tid] = o;
+
+    if (y) {
+        const int i = row*(ncols/4) + tid;   // float4 index in the flattened tensor
+        float amax = fmaxf(fmaxf(fabsf(o.x), fabsf(o.y)), fmaxf(fabsf(o.z), fabsf(o.w)));
+        amax = q8p_max8(amax);
+        const float d = amax / 127.0f;
+        const float inv_d = 1.0f / d;
+        const int8_t q0 = amax == 0.0f ? 0 : q8p_round_div(o.x, d, inv_d);
+        const int8_t q1 = amax == 0.0f ? 0 : q8p_round_div(o.y, d, inv_d);
+        const int8_t q2 = amax == 0.0f ? 0 : q8p_round_div(o.z, d, inv_d);
+        const int8_t q3 = amax == 0.0f ? 0 : q8p_round_div(o.w, d, inv_d);
+        int sum = (int) q0 + (int) q1 + (int) q2 + (int) q3;
+        sum = q8p_sum8(sum);
+        const uint32_t packed = (uint32_t) (uint8_t) q0 | ((uint32_t) (uint8_t) q1 << 8) |
+                                ((uint32_t) (uint8_t) q2 << 16) | ((uint32_t) (uint8_t) q3 << 24);
+        ((uint32_t *) y[i/8].qs)[i%8] = packed;
+        if (i % 8 == 0) {
+            y[i/8].ds = make_half2(d, d * sum);
+            ysum[i/8] = sum;
+        }
+    }
+}
+
 static bool q8p_single_row_f32(const ggml_tensor * t) {
     return t->type == GGML_TYPE_F32 && ggml_is_contiguous(t) && t->ne[1] == 1 && t->ne[2] == 1 && t->ne[3] == 1 &&
            t->ne[0] % 512 == 0 && ((uintptr_t) t->data) % 16 == 0;
@@ -190,6 +245,38 @@ bool ggml_cuda_rms_norm_mul_q8(ggml_backend_cuda_context & ctx, const ggml_tenso
     return true;
 }
 
+static bool q8p_gnorm_enabled() {
+    static const bool enabled = [] {
+        const char * v = getenv("GGML_Q8_PRODUCERS_GNORM");
+        return v == nullptr || v[0] != '0';
+    }();
+    return enabled;
+}
+
+bool ggml_cuda_rms_norm_gated_q8_supported(const ggml_tensor * x, const ggml_tensor * w, const ggml_tensor * z, const ggml_tensor * dst) {
+    if (!q8p_gnorm_enabled() || ggml_cuda_info().devices[ggml_cuda_get_device()].warp_size != 64) {
+        return false;
+    }
+    auto ok = [](const ggml_tensor * t) {
+        return t->type == GGML_TYPE_F32 && ggml_is_contiguous(t) && t->ne[0] == 128 && ((uintptr_t) t->data) % 16 == 0;
+    };
+    return ok(x) && ok(w) && ok(z) && ok(dst) && ggml_nelements(w) == 128 && ggml_are_same_shape(x, dst) &&
+           ggml_nelements(z) == ggml_nelements(dst) && ggml_nrows(dst) <= 65535;
+}
+
+void ggml_cuda_rms_norm_gated_q8(ggml_backend_cuda_context & ctx, const ggml_tensor * x, const ggml_tensor * w, float eps,
+        const ggml_tensor * z, ggml_tensor * dst) {
+    block_q8_1 * y = nullptr;
+    int * ysum = nullptr;
+    if (!q8p_enabled() || !q8p_flat_f32(dst) || !ggml_cuda_mmvq_cache_produce(ctx, dst, &y, &ysum)) {
+        y = nullptr;
+        ysum = nullptr;
+    }
+    rms_norm_gated_q8_kernel<<<ggml_nrows(dst), 32, 0, ctx.stream()>>>((const float *) x->data, (const float *) w->data,
+            (const float *) z->data, (float *) dst->data, y, ysum, 128, eps);
+    CUDA_CHECK(cudaGetLastError());
+}
+
 static bool gated_q8_launch(ggml_backend_cuda_context & ctx, const ggml_tensor * x, const ggml_tensor * g, ggml_tensor * dst, const int op) {
     if (!q8p_enabled() || ggml_cuda_info().devices[ctx.device].warp_size != 64) {
         return false;
@@ -236,6 +323,8 @@ bool ggml_cuda_unary_mul_q8(ggml_backend_cuda_context & ctx, ggml_tensor * unary
 #else
 
 bool ggml_cuda_rms_norm_mul_q8(ggml_backend_cuda_context &, const ggml_tensor *, ggml_tensor *) { return false; }
+bool ggml_cuda_rms_norm_gated_q8_supported(const ggml_tensor *, const ggml_tensor *, const ggml_tensor *, const ggml_tensor *) { return false; }
+void ggml_cuda_rms_norm_gated_q8(ggml_backend_cuda_context &, const ggml_tensor *, const ggml_tensor *, float, const ggml_tensor *, ggml_tensor *) {}
 bool ggml_cuda_swiglu_q8(ggml_backend_cuda_context &, ggml_tensor *) { return false; }
 bool ggml_cuda_unary_mul_q8(ggml_backend_cuda_context &, ggml_tensor *, ggml_tensor *) { return false; }
 
