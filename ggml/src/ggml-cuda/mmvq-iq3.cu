@@ -30,13 +30,13 @@ static bool iq3g_multi_enabled() {
     static const bool enabled = iq3g_env_on("GGML_MMVQ_IQ3_MULTI");
     return enabled;
 }
-// prologue of the single / gate+up kernel (GGML_MMVQ_IQ3_PF, default 5): 0 = previous one (every thread loads an activation
-// block, threads past the end all load the last one), 5 = only the owners of the blocks load them, 3 = split prologue
-// with the first item prefetched under the staging (single GEMVs only)
+// prologue of the single / gate+up kernel (GGML_MMVQ_IQ3_PF, default 7): 0 = previous one (every thread loads an activation
+// block, threads past the end all load the last one), 5 = only the owners of the blocks load them, 7 = 5 with the grid
+// words loaded first and all kernel arguments up front (r4-ffndown; also selects that load order in the multi-job kernel)
 static int iq3g_pf_mode() {
     static const int mode = [] {
         const char * v = getenv("GGML_MMVQ_IQ3_PF");
-        return v == nullptr ? 5 : atoi(v);
+        return v == nullptr ? 7 : atoi(v);
     }();
     return mode;
 }
@@ -120,12 +120,14 @@ static bool iq3g_launch(const uint8_t * wa, const uint8_t * wb, const block_q8_1
 template <class TA, class TB>
 static bool iq3g_launch_pf(const uint8_t * wa, const uint8_t * wb, const block_q8_1 * y, float * dst, const int K, const int N,
         const float * residual, const int ncu, hipStream_t stream, const int sm) {
-    const bool pf5 = iq3g_pf_mode() == 5;
+    const int pf = iq3g_pf_mode();
     if (sm) {
-        return (pf5 && iq3g_launch<TA, TB, 2, 5, IQ3G_SM>(wa, wb, y, dst, K, N, residual, ncu, stream)) ||
+        return (pf == 7 && iq3g_launch<TA, TB, 2, 7, IQ3G_SM>(wa, wb, y, dst, K, N, residual, ncu, stream)) ||
+               (pf == 5 && iq3g_launch<TA, TB, 2, 5, IQ3G_SM>(wa, wb, y, dst, K, N, residual, ncu, stream)) ||
                iq3g_launch<TA, TB, 2, 0, IQ3G_SM>(wa, wb, y, dst, K, N, residual, ncu, stream);
     }
-    return (pf5 && iq3g_launch<TA, TB, 2, 5, 0>(wa, wb, y, dst, K, N, residual, ncu, stream)) ||
+    return (pf == 7 && iq3g_launch<TA, TB, 2, 7, 0>(wa, wb, y, dst, K, N, residual, ncu, stream)) ||
+           (pf == 5 && iq3g_launch<TA, TB, 2, 5, 0>(wa, wb, y, dst, K, N, residual, ncu, stream)) ||
            iq3g_launch<TA, TB, 2, 0, 0>(wa, wb, y, dst, K, N, residual, ncu, stream);
 }
 
@@ -198,18 +200,18 @@ bool ggml_cuda_mmvq_iq3(ggml_backend_cuda_context & ctx, const ggml_tensor * src
 static constexpr int IQ3G_MJ_NW = 16;
 static constexpr int IQ3G_MJ_L  = 16;
 
-template <int SM>
+template <int SM, bool ORD>
 static void iq3g_launch_mj(const bool hs, const bool hx, const block_q8_1 * y, const int K, const iq3g::mj_args & a, const int ncu,
         hipStream_t stream) {
     using namespace iq3g;
     constexpr int NW = IQ3G_MJ_NW, L = IQ3G_MJ_L;
     static_assert(64/L == IQ3G_RG, "kernel config must match the repack row interleave");
     if (hs && hx) {
-        gemv_mj<iq3s_t, iq3xxs_t, 2, L, NW, 1, 0, SM><<<ncu, dim3(64, NW), lds_bytes_mj<iq3s_t, iq3xxs_t>(K, 1, NW, L), stream>>>(y, K, a);
+        gemv_mj<iq3s_t, iq3xxs_t, 2, L, NW, 1, 0, SM, ORD><<<ncu, dim3(64, NW), lds_bytes_mj<iq3s_t, iq3xxs_t>(K, 1, NW, L), stream>>>(y, K, a);
     } else if (hs) {
-        gemv_mj<iq3s_t, none_t, 2, L, NW, 1, 0, SM><<<ncu, dim3(64, NW), lds_bytes_mj<iq3s_t, none_t>(K, 1, NW, L), stream>>>(y, K, a);
+        gemv_mj<iq3s_t, none_t, 2, L, NW, 1, 0, SM, ORD><<<ncu, dim3(64, NW), lds_bytes_mj<iq3s_t, none_t>(K, 1, NW, L), stream>>>(y, K, a);
     } else {
-        gemv_mj<iq3xxs_t, none_t, 2, L, NW, 1, 0, SM><<<ncu, dim3(64, NW), lds_bytes_mj<iq3xxs_t, none_t>(K, 1, NW, L), stream>>>(y, K, a);
+        gemv_mj<iq3xxs_t, none_t, 2, L, NW, 1, 0, SM, ORD><<<ncu, dim3(64, NW), lds_bytes_mj<iq3xxs_t, none_t>(K, 1, NW, L), stream>>>(y, K, a);
     }
 }
 
@@ -278,10 +280,13 @@ bool ggml_cuda_mmvq_iq3_multi(ggml_backend_cuda_context & ctx, const ggml_tensor
     a.utot = ub;
     const int ncu = ggml_cuda_info().devices[device].nsm;
     // no first-item prefetch under the staging (PFM 0): slower with IQ3_XXS in the bench and for IQ3_S groups in situ
+    const bool ord = iq3g_pf_mode() == 7;
     if (iq3g_sm(K)) {
-        iq3g_launch_mj<IQ3G_SM>(hs, hx, src1_q8_1, K, a, ncu, stream);
+        if (ord) iq3g_launch_mj<IQ3G_SM, true>(hs, hx, src1_q8_1, K, a, ncu, stream);
+        else     iq3g_launch_mj<IQ3G_SM, false>(hs, hx, src1_q8_1, K, a, ncu, stream);
     } else {
-        iq3g_launch_mj<0>(hs, hx, src1_q8_1, K, a, ncu, stream);
+        if (ord) iq3g_launch_mj<0, true>(hs, hx, src1_q8_1, K, a, ncu, stream);
+        else     iq3g_launch_mj<0, false>(hs, hx, src1_q8_1, K, a, ncu, stream);
     }
     CUDA_CHECK(cudaGetLastError());
     return true;
