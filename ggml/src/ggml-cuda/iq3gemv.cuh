@@ -282,6 +282,45 @@ static __device__ __forceinline__ void stage_y(int * __restrict__ rec, const blo
     }
 }
 
+// Prologue with all global loads issued up front (activation blocks + grid words), then all LDS writes:
+// one L2 round trip instead of three serialized ones. TB is staged only if TWO (gate/up of different types).
+template <class T> static __device__ __forceinline__ uint32_t grid_word(const int i) {
+    if constexpr (T::TAB_WORDS == 8192) return iq3s_grid[i]; else return iq3xxs_grid[i];
+}
+template <class TA, class TB, bool TWO, int NT>
+static __device__ __forceinline__ void prologue(uint32_t * smem, const int toff_b, const int yoff, const block_q8_1 * __restrict__ yg,
+        const int K, const int tid) {
+    constexpr int GA = TA::TAB_WORDS/16, GB = TWO ? TB::TAB_WORDS/16 : 1;
+    if (NT % 512 == 0 && TA::TAB_WORDS % NT == 0 && (!TWO || TB::TAB_WORDS % NT == 0) && K/32 <= NT) {
+        const int nrec = K/32;
+        const int sy = min(tid, nrec - 1);   // unconditional (clamped) loads and writes: no branches, nothing sinks
+        const uint8_t * b = (const uint8_t *) (yg + sy);
+        const uint4 q0 = *(const uint4 *) (b + 4), q1 = *(const uint4 *) (b + 20);
+        const uint32_t ds = *(const uint32_t *) b;
+        const uint32_t ga = grid_word<TA>(tid % GA);
+        uint32_t gb = 0;
+        if constexpr (TWO) gb = grid_word<TB>(tid % GB);
+#pragma unroll
+        for (int i = 0; i < TA::TAB_WORDS/NT; ++i) { const int e = tid + NT*i; smem[e] = apply_signs(ga, (uint32_t) (e / GA)); }
+        if constexpr (TWO) {
+#pragma unroll
+            for (int i = 0; i < TB::TAB_WORDS/NT; ++i) { const int e = tid + NT*i; smem[toff_b/4 + e] = apply_signs(gb, (uint32_t) (e / GB)); }
+        }
+        int * rec = (int *) (smem + yoff/4);
+        {   // threads >= nrec rewrite record nrec-1 with identical data (benign)
+            int * r = rec + (sy >> 2)*YREC_W + 8*(sy & 3);
+            *(int4 *) r       = make_int4((int) q0.x, (int) q0.y, (int) q0.z, (int) q0.w);
+            *(int4 *) (r + 4) = make_int4((int) q1.x, (int) q1.y, (int) q1.z, (int) q1.w);
+            ((float *) rec)[(sy >> 2)*YREC_W + 32 + (sy & 3)] = h2f(ds & 0xFFFFu);
+        }
+    }
+    if (!(NT % 512 == 0 && TA::TAB_WORDS % NT == 0 && (!TWO || TB::TAB_WORDS % NT == 0)) || K/32 > NT) {
+        TA::stage_table(smem, tid, NT);
+        if constexpr (TWO) TB::stage_table(smem + toff_b/4, tid, NT);
+        stage_y((int *) (smem + yoff/4), yg, K, tid, NT);
+    }
+}
+
 // ------------------------------------------------------------------------------------------------ reduction
 template <int L> static __device__ __forceinline__ float group_sum(float v) {
 #if defined(__HIP_DEVICE_COMPILE__)
@@ -353,9 +392,7 @@ __global__ void gemv(const uint8_t * __restrict__ wa, const uint8_t * __restrict
     if ((PF || DBG == 2) && u < U) load_item(u, lane);   // PF 1: pipelined; PF 2: only the first item is prefetched (overlaps the prologue)
     bool first = true;
 
-    TA::stage_table(smem + TOFF_A/4, tid, NW*64);
-    if constexpr (GLU && !SAME) TB::stage_table(smem + TOFF_B/4, tid, NW*64);
-    stage_y((int *) (smem + YOFF/4), yg, K, tid, NW*64);
+    prologue<TA, TB, GLU && !SAME, NW*64>(smem, TOFF_B, YOFF, yg, K, tid);
     __syncthreads();
     if constexpr (DBG == 4) {   // prologue only (timing)
         if (tid == 0 && smem[YOFF/4 + 5] == 0x12345678u) dst[0] = 1.0f;
@@ -440,6 +477,101 @@ __global__ void gemv(const uint8_t * __restrict__ wa, const uint8_t * __restrict
             } else {
                 if (lane == 0) dst[row] = residual ? v + residual[row] : v;
             }
+        }
+    }
+}
+
+// ------------------------------------------------------------------------------------------------ batched kernel
+// Same as gemv (R = 1), but each lane issues the loads of B items (it, it+L, .., it+(B-1)L, clamped) before decoding
+// any of them: B x more bytes in flight per wave and one exposed memory latency per batch instead of per item.
+template <class TA, class TB, int P, int L, int NW, int B>
+__launch_bounds__(NW*64, 1)
+__global__ void gemv_b(const uint8_t * __restrict__ wa, const uint8_t * __restrict__ wb, const block_q8_1 * __restrict__ yg,
+        float * __restrict__ dst, const int K, const int N, const float * __restrict__ residual) {
+    constexpr bool GLU  = !std::is_same<TB, none_t>::value;
+    constexpr bool SAME = std::is_same<TA, TB>::value;
+    constexpr int TOFF_A = 0;
+    constexpr int TOFF_B = (GLU && !SAME) ? TA::TAB_WORDS*4 : 0;
+    constexpr int YOFF   = TA::TAB_WORDS*4 + ((GLU && !SAME) ? TB::TAB_WORDS*4 : 0);
+    constexpr int G  = 64/L;
+    constexpr int RG = G;
+    constexpr int IPC = 4/P;
+    extern __shared__ uint32_t smem[];
+#if defined(__HIP_DEVICE_COMPILE__)
+    if ((uint32_t) (size_t) (__attribute__((address_space(3))) uint32_t *) smem != 0) __builtin_trap();
+#endif
+    const int tid  = threadIdx.y*64 + threadIdx.x;
+    const int lane = threadIdx.x % L, grp = threadIdx.x / L;
+    const int items = K / 128;
+    const int ipr   = items*IPC;
+    const size_t nh = (size_t) N*items;
+    const int U = N / RG;
+    const int ustep = gridDim.x*NW;
+    int u = threadIdx.y*gridDim.x + blockIdx.x;
+
+    prologue<TA, TB, GLU && !SAME, NW*64>(smem, TOFF_B, YOFF, yg, K, tid);
+    __syncthreads();
+
+    for (; u < U; u += ustep) {
+        float acc = 0.0f, accb = 0.0f;
+        for (int it0 = lane; it0 < ipr; it0 += L*B) {
+            typename TA::template ld<P> la[B];
+            typename TB::template ld<P> lb[GLU ? B : 1];
+#pragma unroll
+            for (int b = 0; b < B; ++b) {
+                const int it = min(it0 + b*L, ipr - 1);
+                const int h = it / IPC, p = it % IPC;
+                const uint32_t c  = ((uint32_t) u*(uint32_t) items + (uint32_t) h)*RG + (uint32_t) grp;
+                const uint32_t cb = ((uint32_t) u*(uint32_t) (items/2) + (uint32_t) (h >> 1))*RG + (uint32_t) grp;
+                la[b] = TA::template load<P>(wa, nh, c, cb, p);
+                if constexpr (GLU) lb[b] = TB::template load<P>(wb, nh, c, cb, p);
+            }
+#pragma unroll
+            for (int b = 0; b < B; ++b) {
+                const int it = it0 + b*L;
+                if (it >= ipr) break;
+                const int h = it / IPC, p = it % IPC;
+                const uint32_t ya = YOFF + (uint32_t) h*(YREC_W*4) + (uint32_t) p*(32*P);
+                const uint32_t yd_addr = YOFF + (uint32_t) h*(YREC_W*4) + 128 + (uint32_t) p*(4*P);
+                float dy4[P];
+#if defined(__HIP_DEVICE_COMPILE__)
+                if constexpr (P == 4) {
+                    const float4 v = *(__attribute__((address_space(3))) const float4 *) (size_t) yd_addr;
+                    dy4[0] = v.x; dy4[1] = v.y; dy4[2] = v.z; dy4[3] = v.w;
+                } else {
+                    const float2 v = *(__attribute__((address_space(3))) const float2 *) (size_t) yd_addr;
+                    dy4[0] = v.x; dy4[1] = v.y;
+                }
+#else
+                for (int j = 0; j < P; ++j) dy4[j] = 0.0f;
+#endif
+                const typename TA::template dec<P> da = TA::template prep<P>(la[b]);
+                const float dwa = TA::template dw<P>(da);
+                typename TB::template dec<P> db;
+                float dwb = 0.0f;
+                if constexpr (GLU) { db = TB::template prep<P>(lb[b]); dwb = TB::template dw<P>(db); }
+#pragma unroll
+                for (int j = 0; j < P; ++j) {
+                    int y[8];
+#if defined(__HIP_DEVICE_COMPILE__)
+                    const int4 y0 = *(__attribute__((address_space(3))) const int4 *) (size_t) (ya + 32*j);
+                    const int4 y1 = *(__attribute__((address_space(3))) const int4 *) (size_t) (ya + 32*j + 16);
+                    y[0] = y0.x; y[1] = y0.y; y[2] = y0.z; y[3] = y0.w; y[4] = y1.x; y[5] = y1.y; y[6] = y1.z; y[7] = y1.w;
+#else
+                    for (int k = 0; k < 8; ++k) y[k] = 0;
+#endif
+                    acc += (dwa*dy4[j]) * (float) TA::template sub<P, TOFF_A>(da, j, y);
+                    if constexpr (GLU) accb += (dwb*dy4[j]) * (float) TB::template sub<P, TOFF_B>(db, j, y);
+                }
+            }
+        }
+        const int row = u*RG + grp;
+        const float v = group_sum<L>(acc);
+        if constexpr (GLU) {
+            const float vb = group_sum<L>(accb);
+            if (lane == 0) dst[row] = vb * silu(v);
+        } else {
+            if (lane == 0) dst[row] = residual ? v + residual[row] : v;
         }
     }
 }
@@ -642,9 +774,7 @@ __global__ void gemv_pp(const uint8_t * __restrict__ wa, const uint8_t * __restr
         load_step(A, Ab, lu, ls);
         if (++ls == S) { ls = 0; lu += ustep; }
     }
-    TA::stage_table(smem + TOFF_A/4, tid, NW*64);
-    if constexpr (GLU && !SAME) TB::stage_table(smem + TOFF_B/4, tid, NW*64);
-    stage_y((int *) (smem + YOFF/4), yg, K, tid, NW*64);
+    prologue<TA, TB, GLU && !SAME, NW*64>(smem, TOFF_B, YOFF, yg, K, tid);
     __syncthreads();
 
     int cu = u0, cs = 0;                 // compute cursor
@@ -698,23 +828,20 @@ __global__ void gemv_sk(const uint8_t * __restrict__ wa, const uint8_t * __restr
     const int S     = ipr / L;                   // steps per unit
     const size_t nh = (size_t) N*items;
     const int U = N / RG;
-    const int64_t T = (int64_t) U*S;
-    const int W = (int) min((int64_t) gridDim.x*NW, T);
+    const uint32_t T = (uint32_t) U*(uint32_t) S;          // host guarantees W*T < 2^32
+    const uint32_t W = min((uint32_t) gridDim.x*NW, T);
     const int w = threadIdx.y*gridDim.x + blockIdx.x;
 
-    TA::stage_table(smem + TOFF_A/4, tid, NW*64);
-    if constexpr (GLU && !SAME) TB::stage_table(smem + TOFF_B/4, tid, NW*64);
-    stage_y((int *) (smem + YOFF/4), yg, K, tid, NW*64);
+    prologue<TA, TB, GLU && !SAME, NW*64>(smem, TOFF_B, YOFF, yg, K, tid);
     __syncthreads();
-    if (w >= W) return;
+    if ((uint32_t) w >= W) return;
 
-    auto wstart = [&](const int x) -> int64_t { return (int64_t) x*T/W; };
-    int64_t t = wstart(w);
-    const int64_t tend = wstart(w + 1);
+    auto wstart = [&](const uint32_t x) -> uint32_t { return x*T/W; };
+    uint32_t t = wstart(w);
+    const uint32_t tend = wstart(w + 1);
+    int u = (int) (t / (uint32_t) S), s0 = (int) (t - (uint32_t) u*S);   // one division; then incremental
     while (t < tend) {
-        const int u  = (int) (t / S);
-        const int s0 = (int) (t - (int64_t) u*S);
-        const int s1 = (int) min((int64_t) S, s0 + (tend - t));
+        const int s1 = (int) min((uint32_t) S, (uint32_t) s0 + (tend - t));
         float acc = 0.0f, accb = 0.0f;
         for (int s = s0; s < s1; ++s) {
             const int it = s*L + lane;
@@ -755,37 +882,39 @@ __global__ void gemv_sk(const uint8_t * __restrict__ wa, const uint8_t * __restr
                 if constexpr (GLU) accb += (dwb*dy4[j]) * (float) TB::template sub<P, TOFF_B>(cbw, j, y);
             }
         }
-        t += s1 - s0;
-        const int row = u*RG + grp;
+        t += (uint32_t) (s1 - s0);
+        const int cu = u, cs0 = s0;
+        u += 1; s0 = 0;                          // the next piece starts at the next unit
+        const int row = cu*RG + grp;
         const float v  = group_sum<L>(acc);
         const float vb = GLU ? group_sum<L>(accb) : 0.0f;
-        if (s0 == 0 && s1 == S) {
+        if (cs0 == 0 && s1 == S) {
             if (lane == 0) dst[row] = GLU ? vb * silu(v) : (residual ? v + residual[row] : v);
             continue;
         }
         // split unit: pieces = waves whose (non-empty) ranges intersect [ub, ue)
-        const int64_t ub = (int64_t) u*S, ue = ub + S;
-        int wf = w; while (wf > 0 && wstart(wf) > ub) --wf;
-        int wl = w; while (wl + 1 < W && wstart(wl + 1) < ue) ++wl;
-        const int slot = w - wf, npieces = wl - wf + 1;
-        float * pp = part + ((size_t) u*S + slot)*(RG*2);
+        const uint32_t ub = (uint32_t) cu*(uint32_t) S, ue = ub + (uint32_t) S;
+        uint32_t wf = w; while (wf > 0 && wstart(wf) > ub) --wf;
+        uint32_t wl = w; while (wl + 1 < W && wstart(wl + 1) < ue) ++wl;
+        const int slot = (int) (w - wf), npieces = (int) (wl - wf + 1);
+        float * pp = part + ((size_t) cu*S + slot)*(RG*2);
         if (lane == 0) { pp[2*grp] = v; pp[2*grp + 1] = vb; }
         __threadfence();
         int old = 0;
-        if (threadIdx.x == 0) old = atomicAdd(cnt + u, 1);
+        if (threadIdx.x == 0) old = atomicAdd(cnt + cu, 1);
         old = __shfl(old, 0, 64);
         if (old == npieces - 1) {
             __threadfence();
             if (lane == 0) {
                 float sv = 0.0f, svb = 0.0f;
                 for (int k = 0; k < npieces; ++k) {
-                    const float * q = part + ((size_t) u*S + k)*(RG*2);
+                    const float * q = part + ((size_t) cu*S + k)*(RG*2);
                     sv += __builtin_nontemporal_load(q + 2*grp);
                     if constexpr (GLU) svb += __builtin_nontemporal_load(q + 2*grp + 1);
                 }
                 dst[row] = GLU ? svb * silu(sv) : (residual ? sv + residual[row] : sv);
             }
-            if (threadIdx.x == 0) cnt[u] = 0;
+            if (threadIdx.x == 0) cnt[cu] = 0;
         }
     }
 }
