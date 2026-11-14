@@ -1973,6 +1973,27 @@ void ggml_cuda_mul_mat_vec_q(
         ne03,              ne3,           s03, s13,              s3,               ids_stride, stream);
 }
 
+bool ggml_cuda_mul_mat_vec_q_multi(ggml_backend_cuda_context & ctx,
+        const ggml_tensor * const * src0, const ggml_tensor * src1, ggml_tensor * const * dst, const int n) {
+#if defined(GGML_USE_HIP)
+    if (src1->type != GGML_TYPE_F32 || !ggml_is_contiguous(src1) || src1->ne[1] != 1 || src1->ne[2] != 1 || src1->ne[3] != 1 ||
+            !ggml_cuda_mmvq_iq3_multi_ok(src0, n)) {
+        return false;
+    }
+    const int64_t ne10        = src1->ne[0];
+    const int64_t ne10_padded = GGML_PAD(ne10, MATRIX_ROW_PADDING);
+    const block_q8_1 * q8 = nullptr;
+    const int * sums = nullptr;
+    if (!mmvq_q8_cache_get(ctx, src1, ne10, ne10_padded, &q8, &sums)) {
+        return false;
+    }
+    return ggml_cuda_mmvq_iq3_multi(ctx, src0, dst, n, q8);
+#else
+    GGML_UNUSED_VARS(ctx, src0, src1, dst, n);
+    return false;
+#endif
+}
+
 void ggml_cuda_op_mul_mat_vec_q(
     ggml_backend_cuda_context & ctx,
     const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst, const char * src0_dd_i, const float * src1_ddf_i,

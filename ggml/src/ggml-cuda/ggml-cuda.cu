@@ -4723,6 +4723,45 @@ static int ggml_cuda_try_fuse_bf16_epi(ggml_backend_cuda_context * cuda_ctx, ggm
     }
     return l2 > 0 ? j + l2 - 1 - i : l1 - 1;
 }
+
+// Single-token GEMVs that read the same activation back to back, with only views/no-ops in between (qkv + z of the
+// linear-attention layers, q/k/v of the attention layers): one multi-output launch (ggml_cuda_mul_mat_vec_q_multi).
+// The group is the longest prefix (2..3 GEMVs) the module accepts; returns the number of nodes to skip.
+static int ggml_cuda_try_fuse_mmvq_multi(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, const int i) {
+    const ggml_tensor * node = cgraph->nodes[i];
+    const ggml_tensor * src1 = node->src[1];
+    if (src1->type != GGML_TYPE_F32 || src1->ne[1] != 1 || src1->ne[2] != 1 || src1->ne[3] != 1 || !ggml_is_quantized(node->src[0]->type)) {
+        return 0;
+    }
+    auto is_gemv = [&](const ggml_tensor * t) {
+        return t->op == GGML_OP_MUL_MAT && t->src[1] == src1 && (t->flags & GGML_TENSOR_FLAG_COMPUTE) &&
+               t->type == GGML_TYPE_F32 && ggml_is_contiguous(t) && ggml_nelements(t) == t->src[0]->ne[1] &&
+               t->src[0]->ne[0] == node->src[0]->ne[0];
+    };
+    if (!is_gemv(node)) {
+        return 0;
+    }
+    const ggml_tensor * w[3] = { node->src[0], nullptr, nullptr };
+    ggml_tensor *       d[3] = { cgraph->nodes[i], nullptr, nullptr };
+    int idx[3] = { i, i, i };
+    int n = 1;
+    for (int j = i + 1; j < cgraph->n_nodes && n < 3; ++j) {
+        ggml_tensor * t = cgraph->nodes[j];
+        if (ggml_cuda_is_view_or_noop(t)) {
+            continue;
+        }
+        if (!is_gemv(t)) {
+            break;
+        }
+        w[n] = t->src[0]; d[n] = t; idx[n] = j; n++;
+    }
+    for (; n >= 2; --n) {
+        if (ggml_cuda_mul_mat_vec_q_multi(*cuda_ctx, w, src1, d, n)) {
+            return idx[n - 1] - i;
+        }
+    }
+    return 0;
+}
 #endif // defined(GGML_USE_HIP)
 
 static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
@@ -5405,6 +5444,16 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     if (fused_mul_mat_vec) {
         return fused_node_count - 1;
     }
+
+#if defined(GGML_USE_HIP)
+    // GEMVs on the same activation (qkv + z, k + v) in one launch; after the gate/up GLU fusion, which takes precedence
+    if (node->op == GGML_OP_MUL_MAT && cuda_ctx->stream_context().concurrent_events.empty()) {
+        const int nodes_to_skip = ggml_cuda_try_fuse_mmvq_multi(cuda_ctx, cgraph, i);
+        if (nodes_to_skip > 0) {
+            return nodes_to_skip;
+        }
+    }
+#endif
 
     fused_mul_mat_vec = false;
     fused_node_count  = 0;

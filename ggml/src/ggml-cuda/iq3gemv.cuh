@@ -321,6 +321,77 @@ static __device__ __forceinline__ void prologue(uint32_t * smem, const int toff_
     }
 }
 
+// Split prologue: all global loads of the staging (activation block + grid word per thread) first (pro_load), the LDS
+// writes later (pro_store). The kernels issue the weight loads of their first item in between, so the staging overlaps
+// the first HBM round trip (loads return in order: the staging loads, issued first, are consumed while the weight
+// prefetch is still in flight; prefetching before the staging loads would serialize them behind the weights).
+// Requires NT % 512 == 0, TAB_WORDS % NT == 0 and K/32 <= NT (host checks: pro_split_ok).
+template <class TA, class TB, bool TWO> struct pro_regs { uint4 q0, q1; uint32_t ds, ga, gb; };
+template <class TA, class TB, bool TWO, int NT>
+static __host__ __device__ constexpr bool pro_split_cfg_ok() {
+    return NT >= TA::TAB_WORDS/16 && (!TWO || NT >= TB::TAB_WORDS/16);
+}
+// sign-expanded table from one grid word per thread (thread t: grid word t % GA). Any NT >= GA: with NT % GA != 0
+// the first (NT/GA)*GA threads write the 16 sign variants of their grid word in NT/GA parallel groups.
+template <class T, int NT>
+static __device__ __forceinline__ void tab_store(uint32_t * tab, const uint32_t gw, const int tid) {
+    constexpr int GA = T::TAB_WORDS/16;
+    if constexpr (T::TAB_WORDS % NT == 0 && NT % GA == 0) {
+#pragma unroll
+        for (int i = 0; i < T::TAB_WORDS/NT; ++i) { const int e = tid + NT*i; tab[e] = apply_signs(gw, (uint32_t) (e / GA)); }
+    } else {
+        static_assert(NT >= GA, "table staging needs one thread per grid word");
+        constexpr int TPG = NT/GA, SPT = (16 + TPG - 1)/TPG;
+        if (tid < TPG*GA) {
+            const int g = tid % GA, s0 = tid / GA;
+#pragma unroll
+            for (int k = 0; k < SPT; ++k) {
+                const int s = s0 + TPG*k;
+                if (s < 16) tab[s*GA + g] = apply_signs(gw, (uint32_t) s);
+            }
+        }
+    }
+}
+// CY (conditional activation loads): only the K/32 threads that own a q8_1 block load it (the other waves issue no
+// activation loads at all: no hot spot on the last block, no extra address-unit work). Without CY (needed when a
+// prefetch follows: the load count must not depend on the path) the other threads load another valid block.
+template <class TA, class TB, bool TWO, int NT, bool CY = false>
+static __device__ __forceinline__ void pro_load(pro_regs<TA, TB, TWO> & r, const block_q8_1 * __restrict__ yg, const int K, const int tid) {
+    constexpr int GA = TA::TAB_WORDS/16;
+    if (!CY || tid < K/32) {
+        const int sy = CY ? tid : tid % (K/32);
+        const uint8_t * b = (const uint8_t *) (yg + sy);
+        r.q0 = *(const uint4 *) (b + 4);
+        r.q1 = *(const uint4 *) (b + 20);
+        r.ds = *(const uint32_t *) b;
+    } else {
+        r.q0 = make_uint4(0, 0, 0, 0); r.q1 = r.q0; r.ds = 0;
+    }
+    r.ga = grid_word<TA>(tid % GA);
+    r.gb = 0;
+    if constexpr (TWO) { constexpr int GB = TB::TAB_WORDS/16; r.gb = grid_word<TB>(tid % GB); }
+}
+template <class TA, class TB, bool TWO, int NT>
+static __device__ __forceinline__ void pro_store(const pro_regs<TA, TB, TWO> & r, uint32_t * smem, const int toff_b, const int yoff,
+        const int K, const int tid) {
+    tab_store<TA, NT>(smem, r.ga, tid);
+    if constexpr (TWO) tab_store<TB, NT>(smem + toff_b/4, r.gb, tid);
+    if (tid < K/32) {
+        const int sy = tid;
+        int * rec = (int *) (smem + yoff/4);
+        int * rr = rec + (sy >> 2)*YREC_W + 8*(sy & 3);
+        *(int4 *) rr       = make_int4((int) r.q0.x, (int) r.q0.y, (int) r.q0.z, (int) r.q0.w);
+        *(int4 *) (rr + 4) = make_int4((int) r.q1.x, (int) r.q1.y, (int) r.q1.z, (int) r.q1.w);
+        ((float *) rec)[(sy >> 2)*YREC_W + 32 + (sy & 3)] = h2f(r.ds & 0xFFFFu);
+    }
+}
+
+static __device__ __forceinline__ void sched_fence() {
+#if defined(__HIP_DEVICE_COMPILE__)
+    __builtin_amdgcn_sched_barrier(0);
+#endif
+}
+
 // ------------------------------------------------------------------------------------------------ reduction
 template <int L> static __device__ __forceinline__ float group_sum(float v) {
 #if defined(__HIP_DEVICE_COMPILE__)
@@ -389,10 +460,27 @@ __global__ void gemv(const uint8_t * __restrict__ wa, const uint8_t * __restrict
             if constexpr (GLU) rb[r] = TB::template load<P>(wb, nh, c, cb, p);
         }
     };
-    if ((PF || DBG == 2) && u < U) load_item(u, lane);   // PF 1: pipelined; PF 2: only the first item is prefetched (overlaps the prologue)
     bool first = true;
-
-    prologue<TA, TB, GLU && !SAME, NW*64>(smem, TOFF_B, YOFF, yg, K, tid);
+    if constexpr (PF == 3) {
+        // PF 3: staging loads, then the first item's weight loads, then the LDS writes (split prologue)
+        static_assert(pro_split_cfg_ok<TA, TB, GLU && !SAME, NW*64>(), "split prologue config");
+        pro_regs<TA, TB, GLU && !SAME> pr;
+        pro_load<TA, TB, GLU && !SAME, NW*64>(pr, yg, K, tid);
+        sched_fence();
+        load_item(min(u, U - 1), lane);   // unconditional (clamped): a conditional load makes the staging wait for it (vmcnt(0))
+        sched_fence();
+        pro_store<TA, TB, GLU && !SAME, NW*64>(pr, smem, TOFF_B, YOFF, K, tid);
+    } else if constexpr (PF == 4 || PF == 5) {
+        // PF 4: split prologue without prefetch, activation loads spread over the blocks (no hot spot);
+        // PF 5: same, but only the owners of the activation blocks load them (conditional loads)
+        static_assert(pro_split_cfg_ok<TA, TB, GLU && !SAME, NW*64>(), "split prologue config");
+        pro_regs<TA, TB, GLU && !SAME> pr;
+        pro_load<TA, TB, GLU && !SAME, NW*64, PF == 5>(pr, yg, K, tid);
+        pro_store<TA, TB, GLU && !SAME, NW*64>(pr, smem, TOFF_B, YOFF, K, tid);
+    } else {
+        if ((PF || DBG == 2) && u < U) load_item(u, lane);   // PF 1: pipelined; PF 2: only the first item is prefetched (before the prologue)
+        prologue<TA, TB, GLU && !SAME, NW*64>(smem, TOFF_B, YOFF, yg, K, tid);
+    }
     __syncthreads();
     if constexpr (DBG == 4) {   // prologue only (timing)
         if (tid == 0 && smem[YOFF/4 + 5] == 0x12345678u) dst[0] = 1.0f;
@@ -404,7 +492,7 @@ __global__ void gemv(const uint8_t * __restrict__ wa, const uint8_t * __restrict
 #pragma unroll
         for (int r = 0; r < R; ++r) { acc[r] = 0.0f; if constexpr (GLU) accb[r] = 0.0f; }
         for (int it = lane; it < ipr; it += L) {
-            if ((PF == 0 || (PF == 2 && !first)) && DBG != 2) load_item(u, it);
+            if ((PF == 0 || PF == 4 || PF == 5 || ((PF == 2 || PF == 3) && !first)) && DBG != 2) load_item(u, it);
             first = false;
             typename TA::template ld<P> ca[R];
             typename TB::template ld<P> cb[GLU ? R : 1];
@@ -479,6 +567,208 @@ __global__ void gemv(const uint8_t * __restrict__ wa, const uint8_t * __restrict
             }
         }
     }
+}
+
+// ------------------------------------------------------------------------------------------------ multi-job kernel
+// One launch for up to MJ_MAX GEMVs that read the same activation (qkv + z, k + v, ...): the jobs' units (RG = 64/L rows
+// each, R = 1) are concatenated, every job has its own weights (type T0 or T1, tsel), N, output and optional residual.
+// One prologue (codebook tables + activation) for all of them, the staging overlapped with the first weight loads.
+// KS > 1: K-split for small N - every unit is processed by KS waves of one workgroup (piece q = items
+// [q*ipr/KS, (q+1)*ipr/KS)), partial row sums combined through LDS in piece order (deterministic).
+static constexpr int MJ_MAX = 3;
+struct mj_job {
+    const uint8_t * w;      // SoA copy (chunk interleave RG)
+    float         * dst;
+    const float   * res;    // residual (dst = dot + res) or nullptr
+    uint32_t        nh;     // chunks of the matrix = N*K/128
+    int             ubeg;   // first unit of the job in the concatenated unit space (unused jobs: INT_MAX)
+    int             tsel;   // 0: T0, 1: T1
+    int             pad_;
+};
+struct mj_args {
+    mj_job job[MJ_MAX];
+    int    njob;
+    int    utot;
+};
+static __device__ __forceinline__ int mj_find(const mj_args & a, const int u) {
+    return (u >= a.job[1].ubeg) + (u >= a.job[2].ubeg);
+}
+template <class T, int P, int RG>
+static __device__ __forceinline__ typename T::template ld<P> mj_load(const uint8_t * __restrict__ w, const uint32_t nh, const int lu,
+        const int items, const int grp, const int it) {
+    constexpr int IPC = 4/P;
+    const int h = it / IPC, p = it % IPC;
+    const uint32_t c  = ((uint32_t) lu*(uint32_t) items + (uint32_t) h)*RG + (uint32_t) grp;
+    const uint32_t cb = ((uint32_t) lu*(uint32_t) (items/2) + (uint32_t) (h >> 1))*RG + (uint32_t) grp;
+    return T::template load<P>(w, nh, c, cb, p);
+}
+template <class T, int TOFF, int P>
+static __device__ __forceinline__ void mj_item(float & acc, const typename T::template ld<P> & c, const int it, const uint32_t yoff) {
+    constexpr int IPC = 4/P;
+    const int h = it / IPC, p = it % IPC;
+    const uint32_t ya      = yoff + (uint32_t) h*(YREC_W*4) + (uint32_t) p*(32*P);
+    const uint32_t yd_addr = yoff + (uint32_t) h*(YREC_W*4) + 128 + (uint32_t) p*(4*P);
+    float dy4[P];
+#if defined(__HIP_DEVICE_COMPILE__)
+    if constexpr (P == 4) {
+        const float4 v = *(__attribute__((address_space(3))) const float4 *) (size_t) yd_addr;
+        dy4[0] = v.x; dy4[1] = v.y; dy4[2] = v.z; dy4[3] = v.w;
+    } else {
+        const float2 v = *(__attribute__((address_space(3))) const float2 *) (size_t) yd_addr;
+        dy4[0] = v.x; dy4[1] = v.y;
+    }
+#else
+    for (int j = 0; j < P; ++j) dy4[j] = 0.0f;
+#endif
+    const typename T::template dec<P> d = T::template prep<P>(c);
+    const float dw = T::template dw<P>(d);
+#pragma unroll
+    for (int j = 0; j < P; ++j) {
+        int y[8];
+#if defined(__HIP_DEVICE_COMPILE__)
+        const int4 y0 = *(__attribute__((address_space(3))) const int4 *) (size_t) (ya + 32*j);
+        const int4 y1 = *(__attribute__((address_space(3))) const int4 *) (size_t) (ya + 32*j + 16);
+        y[0] = y0.x; y[1] = y0.y; y[2] = y0.z; y[3] = y0.w; y[4] = y1.x; y[5] = y1.y; y[6] = y1.z; y[7] = y1.w;
+#else
+        for (int k = 0; k < 8; ++k) y[k] = 0;
+#endif
+        acc += (dw*dy4[j]) * (float) T::template sub<P, TOFF>(d, j, y);
+    }
+}
+// items it0+lane, it0+lane+L, .. < it1 of local unit lu; the first one from the prefetched registers if use_pf
+template <class T, int TOFF, int P, int L, int RG>
+static __device__ __forceinline__ float mj_unit(const uint8_t * __restrict__ w, const uint32_t nh, const int lu, const int items,
+        const int lane, const int grp, const int it0, const int it1, const uint32_t yoff,
+        const bool use_pf, const typename T::template ld<P> & pf) {
+    float acc = 0.0f;
+    int it = it0 + lane;
+    if (use_pf) {
+        if (it < it1) mj_item<T, TOFF, P>(acc, pf, it, yoff);
+        it += L;
+    }
+    for (; it < it1; it += L) {
+        const typename T::template ld<P> c = mj_load<T, P, RG>(w, nh, lu, items, grp, it);
+        mj_item<T, TOFF, P>(acc, c, it, yoff);
+    }
+    return acc;
+}
+
+template <class T0, class T1, int P, int L, int NW, int KS, int PFM = 1>   // PFM: prefetch the first item under the staging
+__launch_bounds__(NW*64, 1)
+__global__ void gemv_mj(const block_q8_1 * __restrict__ yg, const int K, const mj_args a) {
+    constexpr bool HAS1 = !std::is_same<T1, none_t>::value;
+    constexpr bool TWO  = HAS1 && !std::is_same<T0, T1>::value;
+    constexpr int TOFF0 = 0;
+    constexpr int TOFF1 = TWO ? T0::TAB_WORDS*4 : 0;
+    constexpr int YOFF  = T0::TAB_WORDS*4 + (TWO ? T1::TAB_WORDS*4 : 0);
+    constexpr int RG  = 64/L;
+    constexpr int IPC = 4/P;
+    constexpr int UPW = KS > 1 ? NW/KS : 1;       // units per workgroup round (K-split)
+    static_assert(pro_split_cfg_ok<T0, T1, TWO, NW*64>(), "split prologue config");
+    extern __shared__ uint32_t smem[];
+#if defined(__HIP_DEVICE_COMPILE__)
+    if ((uint32_t) (size_t) (__attribute__((address_space(3))) uint32_t *) smem != 0) __builtin_trap();
+#endif
+    const int tid  = threadIdx.y*64 + threadIdx.x;
+    const int lane = threadIdx.x % L, grp = threadIdx.x / L;
+    const int items = K / 128;
+    const int ipr   = items*IPC;
+#if defined(__HIP_DEVICE_COMPILE__)
+    const int w = __builtin_amdgcn_readfirstlane(threadIdx.y);
+#else
+    const int w = threadIdx.y;
+#endif
+    int u, ustep, piece = 0, it0 = 0, it1 = ipr;
+    bool wave_ok = true;
+    if constexpr (KS == 1) {
+        u = w*gridDim.x + blockIdx.x; ustep = gridDim.x*NW;
+    } else {
+        const int uw = w / KS;
+        piece = w % KS;
+        wave_ok = uw < UPW;
+        u = blockIdx.x*UPW + uw; ustep = gridDim.x*UPW;
+        it0 = (piece*ipr)/KS; it1 = ((piece + 1)*ipr)/KS;
+    }
+
+    pro_regs<T0, T1, TWO> pr;
+    pro_load<T0, T1, TWO, NW*64, PFM == 0>(pr, yg, K, tid);   // conditional activation loads unless a prefetch follows
+    sched_fence();
+    // prefetch of the first item, unconditional (clamped unit; both type paths issue 3 loads) so that the staging
+    // below only waits for its own loads (vmcnt(3)) - a conditional prefetch makes it wait for everything
+    typename T0::template ld<P> pf0;
+    typename T1::template ld<P> pf1;
+    if constexpr (PFM != 0) {
+        const int uc = (wave_ok && u < a.utot) ? u : u % a.utot;   // idle waves: spread, not all on one unit
+        const int j = mj_find(a, uc);
+        const mj_job & J = a.job[j];
+        const int itp = min(it0 + lane, it1 - 1);
+        if (!HAS1 || J.tsel == 0) {
+            pf0 = mj_load<T0, P, RG>(J.w, J.nh, uc - J.ubeg, items, grp, itp);
+        } else {
+            if constexpr (HAS1) pf1 = mj_load<T1, P, RG>(J.w, J.nh, uc - J.ubeg, items, grp, itp);
+        }
+    }
+    sched_fence();
+    pro_store<T0, T1, TWO, NW*64>(pr, smem, TOFF1, YOFF, K, tid);
+    __syncthreads();
+
+    bool first = true;
+    if constexpr (KS == 1) {
+        for (; u < a.utot; u += ustep) {
+            const int j = mj_find(a, u);
+            const mj_job & J = a.job[j];
+            const int lu = u - J.ubeg;
+            float acc;
+            if (!HAS1 || J.tsel == 0) {
+                acc = mj_unit<T0, TOFF0, P, L, RG>(J.w, J.nh, lu, items, lane, grp, 0, ipr, YOFF, PFM && first, pf0);
+            } else {
+                if constexpr (HAS1) acc = mj_unit<T1, TOFF1, P, L, RG>(J.w, J.nh, lu, items, lane, grp, 0, ipr, YOFF, PFM && first, pf1);
+                else acc = 0.0f;
+            }
+            first = false;
+            const float v = group_sum<L>(acc);
+            if (lane == 0) {
+                const int row = lu*RG + grp;
+                J.dst[row] = J.res ? v + J.res[row] : v;
+            }
+        }
+    } else {
+        const uint32_t red = (uint32_t) YOFF + (uint32_t) items*(YREC_W*4);   // [NW][RG] partial sums
+        for (int ub = blockIdx.x*UPW; ub < a.utot; ub += ustep) {            // workgroup-uniform trip count
+            const int uu = ub + (w / KS);
+            const bool act = wave_ok && uu < a.utot;
+            const int j = act ? mj_find(a, uu) : 0;
+            const mj_job & J = a.job[j];
+            const int lu = uu - J.ubeg;
+            if (act) {
+                float acc;
+                if (!HAS1 || J.tsel == 0) {
+                    acc = mj_unit<T0, TOFF0, P, L, RG>(J.w, J.nh, lu, items, lane, grp, it0, it1, YOFF, PFM && first, pf0);
+                } else {
+                    if constexpr (HAS1) acc = mj_unit<T1, TOFF1, P, L, RG>(J.w, J.nh, lu, items, lane, grp, it0, it1, YOFF, PFM && first, pf1);
+                    else acc = 0.0f;
+                }
+                const float v = group_sum<L>(acc);
+                if (lane == 0) smem[red/4 + w*RG + grp] = __float_as_uint(v);
+            }
+            first = false;
+            __syncthreads();
+            if (act && piece == 0 && lane == 0) {
+                float s = 0.0f;
+#pragma unroll
+                for (int q = 0; q < KS; ++q) s += __uint_as_float(smem[red/4 + (w + q)*RG + grp]);
+                const int row = lu*RG + grp;
+                J.dst[row] = J.res ? s + J.res[row] : s;
+            }
+            __syncthreads();
+        }
+    }
+}
+template <class T0, class T1>
+static inline size_t lds_bytes_mj(int K, int KS, int NW, int L) {
+    constexpr bool TWO = !std::is_same<T1, none_t>::value && !std::is_same<T0, T1>::value;
+    return (size_t) T0::TAB_WORDS*4 + (TWO ? (size_t) T1::TAB_WORDS*4 : 0) + (size_t) (K/128)*YREC_W*4 +
+        (KS > 1 ? (size_t) NW*(64/L)*4 : 0);
 }
 
 // ------------------------------------------------------------------------------------------------ batched kernel
