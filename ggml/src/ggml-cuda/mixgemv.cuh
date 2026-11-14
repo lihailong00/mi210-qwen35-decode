@@ -49,7 +49,7 @@ static __device__ __forceinline__ void part4(const iq4k::soa s4, float * __restr
     const int ipr = bpr*T4::IPB;
     const int q   = ipr / L;                       // steps per unit (host: ipr % L == 0)
     const int nunits = N4 / GR;
-    const int myu = w < nunits ? (nunits - 1 - w)/nwv + 1 : 0;
+    const int myu = w < nunits ? (int) ((uint32_t) (nunits - 1 - w)/(uint32_t) nwv) + 1 : 0;   // operands >= 0
     if (myu == 0) {
         return;
     }
@@ -57,7 +57,7 @@ static __device__ __forceinline__ void part4(const iq4k::soa s4, float * __restr
     const typename T4::lc c = T4::lane_consts(lane);
     typedef typename T4::raw raw;
     raw A, B;
-    const int ue = (e - 1)/q, ke = (e - 1) % q;   // last real step
+    const int ue = myu - 1, ke = q - 1;           // last real step (= (e - 1)/q, (e - 1) % q with e = myu*q, myu >= 1)
     int ls = 0, lu = 0, lk = 0;                   // load cursor
     const uint32_t qlane = lane*GR + grp, slane = (lane/T4::IPB)*GR + grp;
     const uint32_t boff = 4*bpr*GR;
@@ -237,7 +237,7 @@ __global__ void gemv_pair(const uint8_t * __restrict__ w3, float * __restrict__ 
     }
 
     const int nwv4 = na > 0 ? (NW - na)*gridDim.x : nwv;
-    const int nunits4 = N4/RG, maxu4 = (nunits4 + nwv4 - 1)/nwv4;
+    const int nunits4 = N4/RG, maxu4 = (int) ((uint32_t) (nunits4 + nwv4 - 1)/(uint32_t) nwv4);   // operands >= 0
     float * ow = (float *) (ys4 + (K/32/T4::YPI)*T4::YW) + wy*maxu4*RG;
     if (na > 0) {
         if (wy < na) {
@@ -247,7 +247,7 @@ __global__ void gemv_pair(const uint8_t * __restrict__ w3, float * __restrict__ 
         }
         return;
     }
-    const int w2 = (w + nwv - rot) % nwv;
+    const int w2 = w >= rot ? w - rot : w + nwv - rot;   // = (w + nwv - rot) % nwv for 0 <= w, rot < nwv (host: rot = x % nwv)
     if (na < 0) {
         // alternating: the wave's IQ3 units (w, w + nwv, ..) and IQ4 units (w2, w2 + nwv, ..) one after the other, so that
         // compute-heavy IQ3 units and memory-bound IQ4 units are mixed on every SIMD all the time

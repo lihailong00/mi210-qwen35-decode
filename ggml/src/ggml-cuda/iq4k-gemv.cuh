@@ -402,12 +402,14 @@ __global__ void gemv(const soa s, const soa sg, const block_q8_1 * __restrict__ 
     const int64_t W  = (int64_t) nunits*q;
     // SK: contiguous range [b, e) of the global step stream (units u = step/q).
     // !SK: round robin units w, w + nwaves, ... (all complete); local unit counter cu -> global unit w + cu*nwaves.
-    const int myu    = SK ? 0 : (w < nunits ? (nunits - 1 - w)/nwaves + 1 : 0);
+    // diet-gemv: !SK without signed divisions - myu by one unsigned division (operands >= 0), maxu = ceil(nunits/nwaves)
+    // = units of wave 0 = myu + (wave 0 has a unit at myu*nwaves), the last step (ue, ke) = (myu - 1, q - 1) below
+    const int myu    = SK ? 0 : (w < nunits ? (int) ((uint32_t) (nunits - 1 - w)/(uint32_t) nwaves) + 1 : 0);
     const skgeo geo  = sk_geo(W, nwaves);
     // SK+RT: equal ranges of geo.T steps (waves >= nact idle); plain SK: proportional ranges
     const int b      = SK ? (RT ? (w < geo.nact ? w*geo.T : (int) W) : (int) ((int64_t) w*W/nwaves)) : 0;
     const int e      = SK ? (RT ? (w < geo.nact - 1 ? b + geo.T : (int) W) : (int) ((int64_t) (w + 1)*W/nwaves)) : myu*q;
-    const int maxu   = SK ? (int) (((W + nwaves - 1)/nwaves + q - 1)/q) + 1 : (nunits + nwaves - 1)/nwaves;
+    const int maxu   = SK ? (int) (((W + nwaves - 1)/nwaves + q - 1)/q) + 1 : myu + (myu*nwaves < nunits ? 1 : 0);
     const int u0     = b / q;
     auto gunit = [&](const int cu) -> int { return SK ? cu : w + cu*nwaves; };
     float * ow = (float *) (ysm + (K/32/T::YPI)*T::YW) + wy*maxu*NV*GR;   // this wave's unit results [maxu][NV][GR]
@@ -417,8 +419,9 @@ __global__ void gemv(const soa s, const soa sg, const block_q8_1 * __restrict__ 
     raw A[U*R], B[U*R];
     raw Ag[GLU ? U*R : 1], Bg[GLU ? U*R : 1];
 
-    const int ue = (e - 1)/q, ke = (e - 1) % q;   // last real step
-    int ls = b, lu = u0, lk = b % q;              // load cursor
+    // last real step; !SK: e = myu*q, so (e - 1)/q = myu - 1 and (e - 1) % q = q - 1 (only used when e > b = 0, i.e. myu >= 1)
+    const int ue = SK ? (e - 1)/q : myu - 1, ke = SK ? (e - 1) % q : q - 1;
+    int ls = b, lu = u0, lk = SK ? b % q : 0;     // load cursor
     const size_t nbk = (size_t) N*bpr;
     // EX (exact: ipr % L == 0, round robin or round-tiled): chunk indices = uniform base + lane constant
     uint32_t qlane[R], slane[R];

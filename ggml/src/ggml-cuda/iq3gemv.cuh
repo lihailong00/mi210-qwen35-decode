@@ -351,7 +351,20 @@ static __host__ __device__ constexpr bool pro_split_cfg_ok() {
 template <class T, int NT>
 static __device__ __forceinline__ void tab_store(uint32_t * tab, const uint32_t gw, const int tid) {
     constexpr int GA = T::TAB_WORDS/16;
-    if constexpr (T::TAB_WORDS % NT == 0 && NT % GA == 0) {
+    constexpr int SL = NT/GA > 0 ? NT/GA : 1;
+    if constexpr (T::TAB_WORDS % NT == 0 && NT % GA == 0 && (SL & (SL - 1)) == 0) {
+        // diet-gemv: entry e = tid + NT*i has sign index e/GA = s0 + SL*i with s0 = tid/GA < SL (SL a power of 2): s0 and
+        // SL*i set disjoint bits, i.e. negate disjoint bytes. All grid bytes are >= 1 (IQ3_S 1..15, IQ3_XXS 4..62), so
+        // apply_signs has no borrow between bytes and the bytes of SL*i can be negated on top of apply_signs(gw, s0) with
+        // compile-time constants: 2 instructions per entry instead of 7, the same table words.
+        const uint32_t base = apply_signs(gw, (uint32_t) (tid / GA));
+        tab[tid] = base;
+#pragma unroll
+        for (int i = 1; i < T::TAB_WORDS/NT; ++i) {
+            const uint32_t ones = ((uint32_t) (SL*i) * 0x00204081u) & 0x01010101u;   // constant after unrolling
+            tab[tid + NT*i] = (base - ones) ^ (ones * 255u);
+        }
+    } else if constexpr (T::TAB_WORDS % NT == 0 && NT % GA == 0) {
 #pragma unroll
         for (int i = 0; i < T::TAB_WORDS/NT; ++i) { const int e = tid + NT*i; tab[e] = apply_signs(gw, (uint32_t) (e / GA)); }
     } else {
