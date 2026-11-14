@@ -4706,6 +4706,84 @@ static int ggml_cuda_bf16_epi_chain(const ggml_cgraph * cgraph, const int k, con
     return 0;
 }
 
+// Linear-attention gated output norm:
+//   RMS_NORM(x) -> MUL(w) -> [views] -> MUL_MAT (z GEMV) -> [views] -> UNARY(SILU)(z) -> MUL(normed, silu(z))
+// The z GEMV does not depend on the norm, so it is computed first; then one kernel computes
+// silu(z) * (rms_norm(x) * w) and its q8_1 for the ssm_out GEMV (2 launches -> 1). Returns the nodes to skip.
+static int ggml_cuda_try_fuse_gated_norm(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, const int i) {
+    const int n = cgraph->n_nodes;
+    if (i + 4 >= n) {
+        return 0;
+    }
+    ggml_tensor * norm = cgraph->nodes[i];
+    ggml_tensor * mul  = cgraph->nodes[i + 1];
+    if (norm->op != GGML_OP_RMS_NORM || mul->op != GGML_OP_MUL || (mul->src[0] != norm && mul->src[1] != norm)) {
+        return 0;
+    }
+    const ggml_tensor * w = mul->src[0] == norm ? mul->src[1] : mul->src[0];
+    int j = i + 2;
+    while (j < n && ggml_cuda_is_view_or_noop(cgraph->nodes[j])) {
+        j++;
+    }
+    if (j >= n || cgraph->nodes[j]->op != GGML_OP_MUL_MAT) {
+        return 0;
+    }
+    ggml_tensor * mm = cgraph->nodes[j];
+    j++;
+    while (j < n && ggml_cuda_is_view_or_noop(cgraph->nodes[j])) {
+        j++;
+    }
+    if (j + 1 >= n) {
+        return 0;
+    }
+    ggml_tensor * un = cgraph->nodes[j];
+    ggml_tensor * gm = cgraph->nodes[j + 1];
+    if (un->op != GGML_OP_UNARY || ggml_get_unary_op(un) != GGML_UNARY_OP_SILU || gm->op != GGML_OP_MUL ||
+            !((gm->src[0] == mul && gm->src[1] == un) || (gm->src[0] == un && gm->src[1] == mul))) {
+        return 0;
+    }
+    auto base = [](const ggml_tensor * t) {
+        while (t->view_src) {
+            t = t->view_src;
+        }
+        return t;
+    };
+    const ggml_tensor * z = un->src[0];
+    if (base(z) != mm) {
+        return 0;
+    }
+    for (int s = 0; s < GGML_MAX_SRC; ++s) {
+        if (mm->src[s] && (base(mm->src[s]) == norm || base(mm->src[s]) == mul)) {
+            return 0;
+        }
+    }
+    const int flags = norm->flags | mul->flags | un->flags;
+    if ((flags & GGML_TENSOR_FLAG_OUTPUT) || !(norm->flags & mul->flags & un->flags & gm->flags & mm->flags & GGML_TENSOR_FLAG_COMPUTE) ||
+            !ggml_node_has_n_uses(cgraph, i, 1) || !ggml_node_has_n_uses(cgraph, i + 1, 1) || !ggml_node_has_n_uses(cgraph, j, 1)) {
+        return 0;
+    }
+    const ggml_tensor * x = norm->src[0];
+    if (!ggml_cuda_rms_norm_gated_q8_supported(x, w, z, gm)) {
+        return 0;
+    }
+    // memory: the early z GEMV must not overwrite x; dst may alias x / z only exactly (elementwise in place)
+    auto overlap = [](const ggml_tensor * a, const ggml_tensor * b) {
+        const char * a0 = (const char *) a->data, * a1 = a0 + ggml_nbytes(a);
+        const char * b0 = (const char *) b->data, * b1 = b0 + ggml_nbytes(b);
+        return a0 < b1 && b0 < a1;
+    };
+    if (overlap(mm, x) || (overlap(gm, x) && gm->data != x->data) || (overlap(gm, z) && gm->data != z->data)) {
+        return 0;
+    }
+    if (!ggml_cuda_compute_forward(*cuda_ctx, mm)) {
+        GGML_ABORT("%s: z GEMV %s failed", __func__, mm->name);
+    }
+    float eps;
+    memcpy(&eps, norm->op_params, sizeof(float));
+    ggml_cuda_rms_norm_gated_q8(*cuda_ctx, x, w, eps, z, gm);
+    return j + 1 - i;
+}
+
 // one launch for the chain at i and, if the next non-view node starts another chain on the same activation, that one too
 static int ggml_cuda_try_fuse_bf16_epi(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, const int i) {
     ggml_cuda_bf16_epi_job jobs[2];
@@ -4741,6 +4819,24 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     }
 
 #if defined(GGML_USE_HIP)
+    // CONT(strided view) -> UNARY(SIGMOID/SILU) -> MUL (attention output gate): read the gate through the view
+    if (node->op == GGML_OP_CONT && i + 2 < cgraph->n_nodes && cuda_ctx->stream_context().concurrent_events.empty()) {
+        ggml_tensor * un = cgraph->nodes[i + 1];
+        ggml_tensor * mu = cgraph->nodes[i + 2];
+        const int out = i + 2;
+        if (un->op == GGML_OP_UNARY && un->src[0] == node && mu->op == GGML_OP_MUL && (mu->src[0] == un || mu->src[1] == un) &&
+                ggml_can_fuse_subgraph(cgraph, i, { GGML_OP_CONT, GGML_OP_UNARY, GGML_OP_MUL }, { out }) &&
+                ggml_cuda_check_fusion_memory_ranges(cgraph, i, 3, &out, 1) &&
+                ggml_cuda_cont_unary_mul_q8(*cuda_ctx, node, un, mu)) {
+            return 2;
+        }
+    }
+    if (node->op == GGML_OP_RMS_NORM && cuda_ctx->stream_context().concurrent_events.empty()) {
+        const int nodes_to_skip = ggml_cuda_try_fuse_gated_norm(cuda_ctx, cgraph, i);
+        if (nodes_to_skip > 0) {
+            return nodes_to_skip;
+        }
+    }
     if (node->op == GGML_OP_MUL_MAT && node->src[0]->type == GGML_TYPE_BF16 && cuda_ctx->stream_context().concurrent_events.empty()) {
         const int nodes_to_skip = ggml_cuda_try_fuse_bf16_epi(cuda_ctx, cgraph, i);
         if (nodes_to_skip > 0) {

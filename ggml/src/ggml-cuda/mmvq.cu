@@ -1585,7 +1585,7 @@ static codex_cfg codex_get_cfg(const bool xxs, const bool fused, const int K) {
     const char * v = getenv(names[xxs][fused]);   // format "R,NT"
     if (v) {
         int r = 0, nt = 0;
-        if (sscanf(v, "%d,%d", &r, &nt) == 2 && (r == 1 || r == 2 || r == 4) && (nt == 64 || nt == 128 || nt == 192 || nt == 256)) {
+        if (sscanf(v, "%d,%d", &r, &nt) == 2 && (r == 1 || r == 2 || r == 4 || r == 8) && (nt == 64 || nt == 128 || nt == 192 || nt == 256)) {
             c = { r, nt };
         }
     }
@@ -1626,6 +1626,10 @@ static void codex_iq3_launch_packed(ggml_backend_cuda_context & ctx,
     else if (c.R == 2 && c.NT == 256) { CODEX_LAUNCH(2, 256) }
     else if (c.R == 4 && c.NT ==  64) { CODEX_LAUNCH(4,  64) }
     else if (c.R == 4 && c.NT == 128) { CODEX_LAUNCH(4, 128) }
+    else if (c.R == 4 && c.NT == 192) { CODEX_LAUNCH(4, 192) }
+    else if (c.R == 4 && c.NT == 256) { CODEX_LAUNCH(4, 256) }
+    else if (c.R == 1 && c.NT == 192) { CODEX_LAUNCH(1, 192) }
+    else if (c.R == 8 && c.NT ==  64) { CODEX_LAUNCH(8,  64) }
     else                              { CODEX_LAUNCH(1, 128) }
 #undef CODEX_LAUNCH
 }
