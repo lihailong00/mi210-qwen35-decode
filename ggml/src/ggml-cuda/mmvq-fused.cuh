@@ -30,7 +30,8 @@ static constexpr int COOP_KMAX = 32768;
 
 struct params {
     coop_state  * coop;      // nullptr: every workgroup quantizes x itself
-    char        * q8;        // global q8 buffer for the cooperative mode
+    char        * q8;        // global q8 buffer for the cooperative / pre-quantized modes
+    int           q8_pre;    // 1: q8 already holds the quantized activation (SoA): just copy it to LDS
     const char  * vx;        // weights
     const char  * vg;        // gate weights (same type/layout as vx) for the fused swiglu, or nullptr
     const char  * mx;        // side data of vx (packed IQ3 meta)
@@ -729,13 +730,15 @@ static constexpr __host__ __device__ int smem_bytes(int K) {
 // and the very first loads are issued before the activation prologue.
 
 // packed IQ3 (codex layout: codes[count*32 u32] then meta[count] 6 B)
-template <bool xxs>
+// MM: meta layout. 0 = codex 6-byte meta (2 small loads), 1 = 8-byte meta {d, pad, scales[4]} (one 8-byte load),
+// 2 = no meta loads (timing experiments only, wrong results)
+template <bool xxs, int MM = 0>
 struct pipe_pk {
     static constexpr bool soa_y     = true;
     static constexpr int  cpb       = 8;
     static constexpr int  qk        = 256;
     static constexpr int  tab_words = 0;
-    struct raw_t { uint4 c; uint16_t d; uint8_t s; };
+    struct raw_t { uint4 c; uint32_t d; uint32_t s; };
 
     static __device__ __forceinline__ void load_table(uint32_t *, const int, const int) {}
 
@@ -743,9 +746,18 @@ struct pipe_pk {
         const size_t pos = (size_t) row*stride_row + t;
         raw_t r;
         r.c = ((const uint4 *) vx)[pos];
-        const codex_iq3_meta * m = (const codex_iq3_meta *) mx + pos/8;
-        r.d = *(const uint16_t *) &m->d;
-        r.s = m->scales[(t & 7)/2];
+        if constexpr (MM == 0) {
+            const codex_iq3_meta * m = (const codex_iq3_meta *) mx + pos/8;
+            r.d = *(const uint16_t *) &m->d;
+            r.s = m->scales[(t & 7)/2];
+        } else if constexpr (MM == 1) {
+            const uint2 m = ((const uint2 *) mx)[pos/8];
+            r.d = m.x;
+            r.s = m.y;
+        } else {
+            r.d = 0x3c00;
+            r.s = 0x55555555;
+        }
         return r;
     }
 
@@ -753,7 +765,8 @@ struct pipe_pk {
         const int * y = soa_qs(smem, t);
         const int4 y0 = ((const int4 *) y)[0];
         const int4 y1 = ((const int4 *) y)[1];
-        const int sc = (r.s >> ((t & 1)*4)) & 15;
+        const uint32_t sbyte = MM == 0 ? r.s : (r.s >> (8*((t & 7)/2)));
+        const int sc = (sbyte >> ((t & 1)*4)) & 15;
         int value = 0;
         if constexpr (xxs) {
             alignas(4) static constexpr int8_t lv[16] = { 4, 12, 20, 28, 36, 44, 52, 62, -4,-12,-20,-28,-36,-44,-52,-62 };
@@ -782,7 +795,7 @@ struct pipe_pk {
             value = 2*value - 15*soa_sum(smem, K, t);
             value *= 1 + 2*sc;
         }
-        const float d = __half2float(__ushort_as_half(r.d)) * soa_d(smem, K, t);
+        const float d = __half2float(__ushort_as_half((uint16_t) (r.d & 0xFFFF))) * soa_d(smem, K, t);
         return d*value;
     }
 };
@@ -1122,7 +1135,12 @@ static __global__ void mmvqf_batch_kernel(const params p) {
     if constexpr (YG) {
         // activation already quantized (SoA) in global memory: no prologue
     } else if constexpr (D::soa_y) {
-        if (p.coop) {
+        if (p.q8_pre) {
+            const int n16 = lds_y_bytes<true>(K) / 16;
+            for (int i = tid; i < n16; i += NT) {
+                ((int4 *) smem)[i] = ((const int4 *) p.q8)[i];
+            }
+        } else if (p.coop) {
             coop_quantize_to_lds<NT>(p, smem, K, tid);
         } else {
             quantize_x_lds<NT, true>(p.x, smem, K);

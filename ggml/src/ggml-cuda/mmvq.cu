@@ -1506,40 +1506,85 @@ static __device__ __forceinline__ float codex_iq3_xxs_block_dot(const uint32_t *
     return d*value;
 }
 
-template<bool fused, bool add_residual, bool xxs>
+// R rows per workgroup of NT threads: every thread has R (2R when fused) independent weight streams in flight and
+// the activation / sum loads are shared by the R rows. (R=1, NT=128 is the original retained kernel.)
+template<bool fused, bool add_residual, bool xxs, int R, int NT>
+__launch_bounds__(NT)
 static __global__ void codex_iq3_packed_gemv(const uint32_t * up, const codex_iq3_meta * up_meta,
         const uint32_t * gate, const codex_iq3_meta * gate_meta, const block_q8_1 * x,
         const int * sums, float * out, int groups, const float * residual) {
-    const int row = blockIdx.x, lane = threadIdx.x;
-    float result = 0.f, gate_result = 0.f;
-    for (int g = lane; g < groups; g += 128) {
-        const size_t pos = size_t(row)*groups+g;
-        if constexpr (xxs) {
-            result += codex_iq3_xxs_block_dot(up+pos*4,up_meta[pos/8],x[g],g&7);
-            if constexpr (fused) gate_result += codex_iq3_xxs_block_dot(gate+pos*4,gate_meta[pos/8],x[g],g&7);
-        } else {
-            result += codex_iq3_block_dot(up+pos*4,up_meta[pos/8],x[g],sums[g],g&7);
-            if constexpr (fused) gate_result += codex_iq3_block_dot(gate+pos*4,gate_meta[pos/8],x[g],sums[g],g&7);
+    constexpr int NWV = NT/64;
+    const int row0 = blockIdx.x*R, lane = threadIdx.x;
+    float result[R], gate_result[R];
+#pragma unroll
+    for (int r = 0; r < R; ++r) {
+        result[r] = 0.f;
+        gate_result[r] = 0.f;
+    }
+    for (int g = lane; g < groups; g += NT) {
+#pragma unroll
+        for (int r = 0; r < R; ++r) {
+            const size_t pos = size_t(row0 + r)*groups+g;
+            if constexpr (xxs) {
+                result[r] += codex_iq3_xxs_block_dot(up+pos*4,up_meta[pos/8],x[g],g&7);
+                if constexpr (fused) gate_result[r] += codex_iq3_xxs_block_dot(gate+pos*4,gate_meta[pos/8],x[g],g&7);
+            } else {
+                result[r] += codex_iq3_block_dot(up+pos*4,up_meta[pos/8],x[g],sums[g],g&7);
+                if constexpr (fused) gate_result[r] += codex_iq3_block_dot(gate+pos*4,gate_meta[pos/8],x[g],sums[g],g&7);
+            }
         }
     }
-    __shared__ float upper[64];
-    __shared__ float upper_gate[fused ? 64 : 1];
-    if (lane >= 64) {
-        upper[lane-64] = result;
-        if constexpr (fused) upper_gate[lane-64] = gate_result;
-    }
-    __syncthreads();
-    if (lane < 64) {
-        result = warp_reduce_sum<64>(result+upper[lane]);
-        if constexpr (fused) {
-            gate_result = warp_reduce_sum<64>(gate_result+upper_gate[lane]);
-            result *= ggml_cuda_op_silu_single(gate_result);
-        }
-        if (lane == 0) {
-            if constexpr (add_residual) result += residual[row];
-            out[row] = result;
+    __shared__ float part[NWV > 1 ? NWV : 1][R][2];
+#pragma unroll
+    for (int r = 0; r < R; ++r) {
+        result[r] = warp_reduce_sum<64>(result[r]);
+        if constexpr (fused) gate_result[r] = warp_reduce_sum<64>(gate_result[r]);
+        if constexpr (NWV > 1) {
+            if (lane % 64 == 0) {
+                part[lane/64][r][0] = result[r];
+                part[lane/64][r][1] = gate_result[r];
+            }
         }
     }
+    if constexpr (NWV > 1) {
+        __syncthreads();
+    }
+    if (lane == 0) {
+#pragma unroll
+        for (int r = 0; r < R; ++r) {
+            float res  = result[r];
+            float gres = gate_result[r];
+            if constexpr (NWV > 1) {
+#pragma unroll
+                for (int w = 1; w < NWV; ++w) {
+                    res  += part[w][r][0];
+                    gres += part[w][r][1];
+                }
+            }
+            if constexpr (fused) res *= ggml_cuda_op_silu_single(gres);
+            if constexpr (add_residual) res += residual[row0 + r];
+            out[row0 + r] = res;
+        }
+    }
+}
+
+// (rows per workgroup, threads per workgroup) for the packed IQ3 GEMV; tuned on MI210, env-overridable
+struct codex_cfg { int R, NT; };
+static codex_cfg codex_get_cfg(const bool xxs, const bool fused) {
+    static const codex_cfg cfg[2][2] = {
+        { { 2, 256 }, { 1, 128 } },   // IQ3_S:   single, fused gate+up
+        { { 2,  64 }, { 1,  64 } },   // IQ3_XXS: single, fused gate+up
+    };
+    codex_cfg c = cfg[xxs][fused];
+    const char * names[2][2] = { { "GGML_CODEX_S", "GGML_CODEX_S_FUSED" }, { "GGML_CODEX_XXS", "GGML_CODEX_XXS_FUSED" } };
+    const char * v = getenv(names[xxs][fused]);   // format "R,NT"
+    if (v) {
+        int r = 0, nt = 0;
+        if (sscanf(v, "%d,%d", &r, &nt) == 2 && (r == 1 || r == 2 || r == 4) && (nt == 64 || nt == 128 || nt == 256)) {
+            c = { r, nt };
+        }
+    }
+    return c;
 }
 template<bool xxs>
 static void codex_iq3_launch_packed(ggml_backend_cuda_context & ctx,
@@ -1554,18 +1599,29 @@ static void codex_iq3_launch_packed(ggml_backend_cuda_context & ctx,
             sums = sums_alloc.get();
         }
     }
-    const auto * up_meta = reinterpret_cast<const codex_iq3_meta *>(up+count*32);
-    if (gate) {
-        const auto * gate_meta = reinterpret_cast<const codex_iq3_meta *>(gate+count*32);
-        codex_iq3_packed_gemv<true,false,xxs><<<rows,128,0,stream>>>(
-                up,up_meta,gate,gate_meta,q8,sums,dst,groups,nullptr);
-    } else if (residual) {
-        codex_iq3_packed_gemv<false,true,xxs><<<rows,128,0,stream>>>(
-                up,up_meta,nullptr,nullptr,q8,sums,dst,groups,residual);
-    } else {
-        codex_iq3_packed_gemv<false,false,xxs><<<rows,128,0,stream>>>(
-                up,up_meta,nullptr,nullptr,q8,sums,dst,groups,nullptr);
+    const auto * up_meta   = reinterpret_cast<const codex_iq3_meta *>(up+count*32);
+    const auto * gate_meta = gate ? reinterpret_cast<const codex_iq3_meta *>(gate+count*32) : nullptr;
+    codex_cfg c = codex_get_cfg(xxs, gate != nullptr);
+    while (rows % c.R != 0) {
+        c.R /= 2;
     }
+#define CODEX_LAUNCH(RR, NTT) \
+    if (gate) { \
+        codex_iq3_packed_gemv<true,false,xxs,RR,NTT><<<rows/RR,NTT,0,stream>>>(up,up_meta,gate,gate_meta,q8,sums,dst,groups,nullptr); \
+    } else if (residual) { \
+        codex_iq3_packed_gemv<false,true,xxs,RR,NTT><<<rows/RR,NTT,0,stream>>>(up,up_meta,nullptr,nullptr,q8,sums,dst,groups,residual); \
+    } else { \
+        codex_iq3_packed_gemv<false,false,xxs,RR,NTT><<<rows/RR,NTT,0,stream>>>(up,up_meta,nullptr,nullptr,q8,sums,dst,groups,nullptr); \
+    }
+    if      (c.R == 1 && c.NT ==  64) { CODEX_LAUNCH(1,  64) }
+    else if (c.R == 1 && c.NT == 256) { CODEX_LAUNCH(1, 256) }
+    else if (c.R == 2 && c.NT ==  64) { CODEX_LAUNCH(2,  64) }
+    else if (c.R == 2 && c.NT == 128) { CODEX_LAUNCH(2, 128) }
+    else if (c.R == 2 && c.NT == 256) { CODEX_LAUNCH(2, 256) }
+    else if (c.R == 4 && c.NT ==  64) { CODEX_LAUNCH(4,  64) }
+    else if (c.R == 4 && c.NT == 128) { CODEX_LAUNCH(4, 128) }
+    else                              { CODEX_LAUNCH(1, 128) }
+#undef CODEX_LAUNCH
 }
 
 // Per-stream cache of the q8_1-quantized single-token activation (+ per-block int sums for the packed IQ3 path).
