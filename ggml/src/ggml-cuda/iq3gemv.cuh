@@ -337,6 +337,11 @@ static __device__ __forceinline__ void prologue(uint32_t * smem, const int toff_
 // prefetch is still in flight; prefetching before the staging loads would serialize them behind the weights).
 // Requires NT % 512 == 0, TAB_WORDS % NT == 0 and K/32 <= NT (host checks: pro_split_ok).
 template <class TA, class TB, bool TWO> struct pro_regs { uint4 q0, q1; uint32_t ds, ga, gb; };
+static __device__ __forceinline__ void pro_fence() {
+#if defined(__HIP_DEVICE_COMPILE__)
+    __builtin_amdgcn_sched_barrier(0);
+#endif
+}
 template <class TA, class TB, bool TWO, int NT>
 static __host__ __device__ constexpr bool pro_split_cfg_ok() {
     return NT >= TA::TAB_WORDS/16 && (!TWO || NT >= TB::TAB_WORDS/16);
@@ -365,9 +370,35 @@ static __device__ __forceinline__ void tab_store(uint32_t * tab, const uint32_t 
 // CY (conditional activation loads): only the K/32 threads that own a q8_1 block load it (the other waves issue no
 // activation loads at all: no hot spot on the last block, no extra address-unit work). Without CY (needed when a
 // prefetch follows: the load count must not depend on the path) the other threads load another valid block.
-template <class TA, class TB, bool TWO, int NT, bool CY = false>
+// ORD (r4-ffndown, default via PF 7 / multi-job ORD): the grid words are loaded first - their address needs no kernel
+// argument, so they are in flight while the kernel arguments arrive - and the activation address is computed
+// unconditionally (all kernel-argument loads are issued together at the kernel start). Without ORD the compiler issues
+// the grid-word load only after the activation loads have returned (it moves pro_store's fp16 -> fp32 conversion of the
+// owner's d into the conditional load block, with a wait there) and loads the activation pointer only inside that block:
+// kernel args -> activation pointer -> activation -> grid word = four serialized round trips at every kernel start.
+template <class TA, class TB, bool TWO, int NT, bool CY = false, bool ORD = false>
 static __device__ __forceinline__ void pro_load(pro_regs<TA, TB, TWO> & r, const block_q8_1 * __restrict__ yg, const int K, const int tid) {
     constexpr int GA = TA::TAB_WORDS/16;
+    if constexpr (ORD) {
+        r.ga = grid_word<TA>(tid % GA);
+        r.gb = 0;
+        if constexpr (TWO) { constexpr int GB = TB::TAB_WORDS/16; r.gb = grid_word<TB>(tid % GB); }
+        pro_fence();
+#if defined(__HIP_DEVICE_COMPILE__)
+        asm volatile("" :: "s"(yg), "s"(K));   // request both kernel arguments together (one scalar round trip)
+#endif
+        const int nrec = K/32;
+        const int sy = CY ? min(tid, nrec - 1) : tid % nrec;
+        const uint8_t * b = (const uint8_t *) (yg + sy);
+        if (!CY || tid < nrec) {
+            r.q0 = *(const uint4 *) (b + 4);
+            r.q1 = *(const uint4 *) (b + 20);
+            r.ds = *(const uint32_t *) b;
+        } else {
+            r.q0 = make_uint4(0, 0, 0, 0); r.q1 = r.q0; r.ds = 0;
+        }
+        return;
+    }
     if (!CY || tid < K/32) {
         const int sy = CY ? tid : tid % (K/32);
         const uint8_t * b = (const uint8_t *) (yg + sy);
@@ -490,12 +521,13 @@ __global__ void gemv(const uint8_t * __restrict__ wa, const uint8_t * __restrict
         load_item(min(u, U - 1), lane);   // unconditional (clamped): a conditional load makes the staging wait for it (vmcnt(0))
         sched_fence();
         pro_store<TA, TB, GLU && !SAME, NW*64>(pr, smem, TOFF_B, YOFF, K, tid);
-    } else if constexpr (PF == 4 || PF == 5) {
+    } else if constexpr (PF == 4 || PF == 5 || PF == 7) {
         // PF 4: split prologue without prefetch, activation loads spread over the blocks (no hot spot);
-        // PF 5: same, but only the owners of the activation blocks load them (conditional loads)
+        // PF 5: same, but only the owners of the activation blocks load them (conditional loads);
+        // PF 7: PF 5 with the grid words loaded first and all kernel-argument loads up front (pro_load ORD)
         static_assert(pro_split_cfg_ok<TA, TB, GLU && !SAME, NW*64>(), "split prologue config");
         pro_regs<TA, TB, GLU && !SAME> pr;
-        pro_load<TA, TB, GLU && !SAME, NW*64, PF == 5>(pr, yg, K, tid);
+        pro_load<TA, TB, GLU && !SAME, NW*64, PF == 5 || PF == 7, PF == 7>(pr, yg, K, tid);
         pro_store<TA, TB, GLU && !SAME, NW*64>(pr, smem, TOFF_B, YOFF, K, tid);
     } else {
         if ((PF || DBG == 2) && u < U) load_item(u, lane);   // PF 1: pipelined; PF 2: only the first item is prefetched (before the prologue)
@@ -512,7 +544,7 @@ __global__ void gemv(const uint8_t * __restrict__ wa, const uint8_t * __restrict
 #pragma unroll
         for (int r = 0; r < R; ++r) { acc[r] = 0.0f; if constexpr (GLU) accb[r] = 0.0f; }
         for (int it = lane; it < ipr; it += L) {
-            if ((PF == 0 || PF == 4 || PF == 5 || ((PF == 2 || PF == 3) && !first)) && DBG != 2) load_item(u, it);
+            if ((PF == 0 || PF == 4 || PF == 5 || PF == 7 || ((PF == 2 || PF == 3) && !first)) && DBG != 2) load_item(u, it);
             first = false;
             typename TA::template ld<P> ca[R];
             typename TB::template ld<P> cb[GLU ? R : 1];
@@ -680,7 +712,7 @@ static __device__ __forceinline__ float mj_unit(const uint8_t * __restrict__ w, 
     return acc;
 }
 
-template <class T0, class T1, int P, int L, int NW, int KS, int PFM = 1, int SM = 0>   // PFM: prefetch the first item under the staging; SM: step-major layout
+template <class T0, class T1, int P, int L, int NW, int KS, int PFM = 1, int SM = 0, bool ORD = false>   // PFM: prefetch the first item under the staging; SM: step-major layout; ORD: pro_load order
 __launch_bounds__(NW*64, 1)
 __global__ void gemv_mj(const block_q8_1 * __restrict__ yg, const int K, const mj_args a) {
     constexpr bool HAS1 = !std::is_same<T1, none_t>::value;
@@ -718,7 +750,7 @@ __global__ void gemv_mj(const block_q8_1 * __restrict__ yg, const int K, const m
     }
 
     pro_regs<T0, T1, TWO> pr;
-    pro_load<T0, T1, TWO, NW*64, PFM == 0>(pr, yg, K, tid);   // conditional activation loads unless a prefetch follows
+    pro_load<T0, T1, TWO, NW*64, PFM == 0, ORD && PFM == 0>(pr, yg, K, tid);   // conditional activation loads unless a prefetch follows
     sched_fence();
     // prefetch of the first item, unconditional (clamped unit; both type paths issue 3 loads) so that the staging
     // below only waits for its own loads (vmcnt(3)) - a conditional prefetch makes it wait for everything
