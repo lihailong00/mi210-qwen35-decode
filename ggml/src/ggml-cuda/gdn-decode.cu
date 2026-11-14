@@ -1310,12 +1310,12 @@ gdn_decode_out_split_diet_warm(
     }
 }
 
-// GGML_GDN_DIET: 0 = the generic kernels, 1 = diet kernels without warm-up passes, 2 = with the warm-up pass of the prep
-// gates, 3 (default) = also with the warm-up pass of the out epilogue (all bit-identical)
+// GGML_GDN_DIET: 0 = the generic kernels, 1 (default) = diet kernels, 2 = + the warm-up pass of the prep gates,
+// 3 = + the warm-up pass of the out epilogue (all bit-identical; 2 and 3 measured within noise of 1, experimental)
 static int gdn_dec_diet_level() {
     static const int level = [] {
         const char * e = getenv("GGML_GDN_DIET");
-        return e == nullptr ? 3 : atoi(e);
+        return e == nullptr ? 1 : atoi(e);
     }();
     return level;
 }
