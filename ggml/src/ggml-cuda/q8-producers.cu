@@ -139,6 +139,76 @@ static __global__ void __launch_bounds__(1024) rms_norm_mul_q8_kernel(const floa
     }
 }
 
+// In-place variant of rms_norm_mul_q8_kernel (dst overlaps x, e.g. the output norm that ggml-alloc places over l_out):
+// a single workgroup loads the whole row into registers before the reduction barrier and only then stores, so no load
+// can observe an already normalized element (the multi-workgroup kernel re-reads x in every workgroup while others
+// store their slices). Same reduction and per-element arithmetic as rms_norm_mul_q8_kernel, so dst and the q8_1 blocks
+// are bit-identical to it. No __restrict__ on x/w/dst: they may alias.
+template <int VPT>
+static __global__ void __launch_bounds__(1024) rms_norm_mul_q8_inplace_kernel(const float * x, const float * w,
+        float * dst, block_q8_1 * __restrict__ y, int * __restrict__ ysum, const int ncols, const float eps) {
+    constexpr int block_size = 1024;
+    __shared__ float s_sum[32];
+    const int tid = threadIdx.x;
+    const int ncols4 = ncols / 4;
+    const float4 * x4   = (const float4 *) x;
+    const float4 * mul4 = (const float4 *) w;
+    float4       * dst4 = (float4 *) dst;
+
+    float4 xs[VPT];
+    float  tmp = 0.0f;
+#pragma unroll
+    for (int k = 0; k < VPT; k++) {
+        const int i = tid + k*block_size;
+        if (i < ncols4) {
+            xs[k] = x4[i];
+        }
+    }
+#pragma unroll
+    for (int k = 0; k < VPT; k++) {
+        const int i = tid + k*block_size;
+        if (i < ncols4) {
+            tmp += xs[k].x*xs[k].x + xs[k].y*xs[k].y + xs[k].z*xs[k].z + xs[k].w*xs[k].w;
+        }
+    }
+    tmp = block_reduce<block_reduce_method::SUM, block_size>(tmp, s_sum);
+    const float scale = rsqrtf(tmp / ncols + eps);
+
+#pragma unroll
+    for (int k = 0; k < VPT; k++) {
+        const int i = tid + k*block_size;
+        // ncols4 % 128 == 0: aligned groups of 8 lanes (one q8_1 block) are either fully active or fully inactive
+        if (i < ncols4) {
+            const float4 xo = xs[k];   // register copy loaded before the barrier (x may alias dst)
+            const float4 mo = mul4[i]; // w may alias dst only exactly: this thread reads element i before storing it
+            float4 r = make_float4(scale*xo.x, scale*xo.y, scale*xo.z, scale*xo.w);
+            r.x *= mo.x;
+            r.y *= mo.y;
+            r.z *= mo.z;
+            r.w *= mo.w;
+            dst4[i] = r;
+
+            float amax = fmaxf(fmaxf(fabsf(r.x), fabsf(r.y)), fmaxf(fabsf(r.z), fabsf(r.w)));
+            amax = q8p_max8(amax);
+            const float d = amax / 127.0f;
+            const float inv_d = 1.0f / d;
+            const int8_t q0 = amax == 0.0f ? 0 : q8p_round_div(r.x, d, inv_d);
+            const int8_t q1 = amax == 0.0f ? 0 : q8p_round_div(r.y, d, inv_d);
+            const int8_t q2 = amax == 0.0f ? 0 : q8p_round_div(r.z, d, inv_d);
+            const int8_t q3 = amax == 0.0f ? 0 : q8p_round_div(r.w, d, inv_d);
+            int sum = (int) q0 + (int) q1 + (int) q2 + (int) q3;
+            sum = q8p_sum8(sum);
+            const uint32_t packed = (uint32_t) (uint8_t) q0 | ((uint32_t) (uint8_t) q1 << 8) |
+                                    ((uint32_t) (uint8_t) q2 << 16) | ((uint32_t) (uint8_t) q3 << 24);
+            ((uint32_t *) y[i/8].qs)[i%8] = packed;
+            if (i % 8 == 0) {
+                y[i/8].ds = make_half2(d, d * sum);
+                ysum[i/8] = sum;
+            }
+        }
+    }
+}
+
 // one row of 128 per 32-thread block (as rms_norm_f32<32, 1, true, true>): rms_norm(x) * w, then silu(z) * that (as the
 // UNARY(SILU)+MUL op), + q8_1 of the result (8 consecutive threads hold one block of 32 values)
 static __global__ void __launch_bounds__(32) rms_norm_gated_q8_kernel(const float * __restrict__ x, const float * __restrict__ w,
@@ -217,6 +287,19 @@ static __global__ void __launch_bounds__(256) gated_q8_strided_kernel(const floa
     }
 }
 
+// byte ranges of a and b intersect (ggml_nbytes covers the full extent of strided views)
+static bool q8p_overlap(const ggml_tensor * a, const ggml_tensor * b) {
+    const char * a0 = (const char *) a->data;
+    const char * b0 = (const char *) b->data;
+    return a0 < b0 + ggml_nbytes(b) && b0 < a0 + ggml_nbytes(a);
+}
+
+// an elementwise producer (thread i reads element i of src, then writes element i of dst) is safe in place only if src
+// and dst coincide exactly; any other overlap would let one thread read an element another thread already wrote
+static bool q8p_partial_overlap(const ggml_tensor * src, const ggml_tensor * dst) {
+    return q8p_overlap(src, dst) && (src->data != dst->data || ggml_nbytes(src) != ggml_nbytes(dst));
+}
+
 static bool q8p_single_row_f32(const ggml_tensor * t) {
     return t->type == GGML_TYPE_F32 && ggml_is_contiguous(t) && t->ne[1] == 1 && t->ne[2] == 1 && t->ne[3] == 1 &&
            t->ne[0] % 512 == 0 && ((uintptr_t) t->data) % 16 == 0;
@@ -255,6 +338,12 @@ bool ggml_cuda_rms_norm_mul_q8(ggml_backend_cuda_context & ctx, const ggml_tenso
             ((uintptr_t) w->data) % 16 != 0 || x->ne[0] > 16384) {
         return false;
     }
+    // w is read per slice (safe only if it coincides with dst exactly); x is read in full by every workgroup, so an
+    // output that overlaps x (in place, as ggml-alloc does for the output norm) needs the single-workgroup kernel
+    if (q8p_partial_overlap(w, mul_node)) {
+        return false;
+    }
+    const bool inplace = q8p_overlap(x, mul_node);
     block_q8_1 * y = nullptr;
     int * ysum = nullptr;
     if (!ggml_cuda_mmvq_cache_produce(ctx, mul_node, &y, &ysum)) {
@@ -262,6 +351,17 @@ bool ggml_cuda_rms_norm_mul_q8(ggml_backend_cuda_context & ctx, const ggml_tenso
     }
     float eps;
     memcpy(&eps, rms_norm->op_params, sizeof(float));
+    if (inplace) {
+        if (x->ne[0] <= 8192) {
+            rms_norm_mul_q8_inplace_kernel<2><<<1, 1024, 0, ctx.stream()>>>((const float *) x->data, (const float *) w->data,
+                    (float *) mul_node->data, y, ysum, (int) x->ne[0], eps);
+        } else {
+            rms_norm_mul_q8_inplace_kernel<4><<<1, 1024, 0, ctx.stream()>>>((const float *) x->data, (const float *) w->data,
+                    (float *) mul_node->data, y, ysum, (int) x->ne[0], eps);
+        }
+        CUDA_CHECK(cudaGetLastError());
+        return true;
+    }
     // VPT only bounds the per-thread loop (elements beyond ncols are skipped), so 2 and 4 give identical results;
     // one workgroup per 64 float4 (ne0 % 512 == 0)
     const int nwg = (int) (x->ne[0] / 256);
@@ -316,6 +416,10 @@ static bool gated_q8_launch(ggml_backend_cuda_context & ctx, const ggml_tensor *
             !ggml_are_same_shape(x, dst) || !ggml_are_same_shape(g, dst)) {
         return false;
     }
+    // elementwise kernel: in place only on exactly coinciding tensors
+    if (q8p_partial_overlap(x, dst) || q8p_partial_overlap(g, dst)) {
+        return false;
+    }
     block_q8_1 * y = nullptr;
     int * ysum = nullptr;
     if (!ggml_cuda_mmvq_cache_produce(ctx, dst, &y, &ysum)) {
@@ -365,6 +469,10 @@ bool ggml_cuda_cont_unary_mul_q8(ggml_backend_cuda_context & ctx, const ggml_ten
     // the elementwise index of the copy output must match the flattened mul index: same element count, and the unary
     // output has the copy's shape; the mul operands are contiguous with the mul's shape (no broadcasting)
     if (ggml_nelements(unary_node) != ggml_nelements(mul_node)) {
+        return false;
+    }
+    // the strided source is read in a different order than dst is written: no overlap at all; g elementwise: exact only
+    if (q8p_overlap(v, mul_node) || q8p_partial_overlap(g, mul_node)) {
         return false;
     }
     block_q8_1 * y = nullptr;
