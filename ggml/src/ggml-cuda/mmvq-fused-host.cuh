@@ -20,3 +20,9 @@ bool ggml_cuda_unary_mul_q8(ggml_backend_cuda_context & ctx, ggml_tensor * unary
 // Single-token GEMV for IQ2_S/IQ2_XS/IQ2_XXS/Q2_K/IQ1_M on SoA re-laid-out weights (activation already quantized to q8_1).
 bool ggml_cuda_mmvq_lowbit(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const block_q8_1 * src1_q8_1, ggml_tensor * dst,
         const ggml_cuda_mm_fusion_args_host * fusion);
+
+// Single-token GEMV for IQ4_XS/Q4_K on row-interleaved SoA re-laid-out weights (mmvq-iq4k.cu; activation already q8_1).
+// Supports the residual (x_bias) epilogue and the fused same-type gate/up SwiGLU. GGML_MMVQ_IQ4K=0 disables.
+bool ggml_cuda_mmvq_iq4k(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const block_q8_1 * src1_q8_1, ggml_tensor * dst,
+        const ggml_cuda_mm_fusion_args_host * fusion);
+bool ggml_cuda_mmvq_iq4k_wants(const ggml_tensor * src0);
