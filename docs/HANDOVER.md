@@ -15,7 +15,7 @@
 | decode tg128，上下文 0 | 45.63 token/s | 80.33 token/s | +76.0% |
 | decode tg128，上下文 8192 | 44.23 token/s | 74.57 token/s | +68.6% |
 | decode tg128，上下文 32768 | 40.65 token/s | 64.43 token/s | +58.5% |
-| prefill pp8192 | 1220 token/s | 1578 token/s | +29%（第十三节的 GEMM 选核修正；只做 decode 优化时为 1245） |
+| prefill pp8192 | 1220 token/s | 1608 token/s | +32%（第十三节的 GEMM 选核与反量化修正；只做 decode 优化时为 1245） |
 | llama-server 单请求（-np 1） | 45.6 token/s | 79.1 token/s | +73% |
 | 每 token kernel 启动数 | 1933 | 601 | −69% |
 | 显存峰值（llama-bench） | 24.1 GB | 28.1–31.9 GB | +4–8 GB |
@@ -488,7 +488,7 @@ docker exec mi210-opt bash -lc "PAR=12 /lab/build-wt.sh /lab/wt-mybranch /lab/wt
 |---|---|
 | 物理上限：50.5 GFLOP 以 171 TFLOPS 计算 | 约 3390 |
 | GEMM 全部用最优库 kernel（hipBLASLt 平均约 150 TFLOPS），其余开销为零 | 约 3000 |
-| 修正后的当前版本（pp8192） | 1578 |
+| 两项修正后的当前版本（pp8192） | 1608 |
 
 修正前，rocprofv3 测得每 token 0.804 ms：GEMM 0.577 ms（权重先反量化为 f16，再走 rocBLAS，平均只有 84 TFLOPS），非 GEMM 0.227 ms（逐 token 递推的 DeltaNet kernel 0.065，flash attention 0.047、只有 34 TFLOPS，反量化 0.031，其余小算子约 0.08）。
 
@@ -510,9 +510,26 @@ docker exec mi210-opt bash -lc "PAR=12 /lab/build-wt.sh /lab/wt-mybranch /lab/wt
 
 - **正确性**：prefill 路径（`-c 512 -b 2048 -ub 2048`，8 块）与原 rocBLAS kernel 相比，平均 KLD 0.000002，top-1 100%。这与只改 ubatch 大小、仍用原 kernel 时的差异相同（0.000002，top-1 99.95%）。
 
-### 5. 剩余 prefill 方向
+### 5. prefill 速度随批次大小的变化，以及反量化修正
 
-- 非 GEMM 部分：DeltaNet 改为分块（chunked）算法，flash attention 提高 MFMA 利用率，反量化与小算子融合。估计可再到约 2400 token/s。
+llama-bench 中 pp512 是一个 512-token 批次，pp2048 是一个 2048-token 批次，pp8192 是两个 4096-token 批次（ub 4096）。按 token 平均的 GPU 时间（hipBLASLt 修正后、反量化修正前，rocprofv3）：
+
+| 每 token 开销 | pp512 | pp2048 | pp8192 | 规律 |
+|---|---|---|---|---|
+| 权重反量化为 f16 | 232 µs | 59 µs | 31 µs | 每批次固定约 120 ms |
+| GEMM | 581 µs | 408 µs | 392 µs | 批次小时效率低（约 84 → 124 TFLOPS） |
+| DeltaNet | 63 µs | 64 µs | 64 µs | 每 token 恒定 |
+| flash attention | 11 µs | 14 µs | 47 µs | 随上下文增长 |
+| 其他 | 92 µs | 83 µs | 84 µs | 每 token 恒定 |
+
+- **MMQ（直接用量化权重做矩阵乘）不划算**：强制所有批次走 MMQ 后 prefill 降到约 845 token/s。MMQ 在 gfx90a 上各类型只有 40–67 TOPS，每种类型、包括 512-token 批次都比反量化 + hipBLASLt 慢（只有 IQ4_XS 在 512 时快约 2%）。因此保留 llama.cpp 原来的选择（CDNA2 上 ne11 ≤ 128 才用 MMQ）。
+- **反量化 kernel 的问题**：原来每个 256 值的超块用一个 32 线程的 block（Q2_K 为 64），每线程分散写 2 字节，wave64 一半的 lane 空闲，只有约 0.5 TB/s。
+- **修正（`convert.cu`）**：在 HIP 上，IQ2_XXS/IQ2_XS/IQ2_S/IQ3_XXS/IQ3_S/IQ4_XS/Q4_K/Q2_K 改用 256 线程 block，每组线程用原来的逐线程公式把一个超块展开到 LDS，再用 16 字节写回。输出逐位相同。`GGML_CUDA_DEQUANT_LDS=0` 恢复原来的启动方式。
+- **结果**（A→B→B→A）：每批次反量化 119 → 66 ms（约 0.9 TB/s）。pp512 1006 → 1119（+11%），pp2048 1544 → 1597（+3.4%），pp8192 1583 → 1608（+1.6%），decode 不变。每个 chunk 的困惑度完全相同，test-backend-ops MUL_MAT 2490/2490 通过。
+
+### 6. 剩余 prefill 方向
+
+- 非 GEMM 部分：DeltaNet 改为分块（chunked）算法，flash attention 提高 MFMA 利用率，小算子融合。估计可再到约 2400 token/s。反量化离带宽下限（约 45 ms/批次）还差约 20 ms，主要影响短 prompt。
 - GEMM 部分：直接对量化权重做 MFMA（避免反量化写回），或逐形状为 hipBLASLt 选最优解（再快约 5%）。
 
 微基准源码在 `mi210-tools/peak-bench/`：`peak_bench.hip`（带宽、MFMA、方阵 GEMM）、`bound_bench.hip`（逐张量读取 graph、实际形状 GEMM 全候选扫描）、`gemm_sweep.hip`（不同 token 数下的选核对比）。编译：`hipcc -O3 --offload-arch=gfx90a -std=c++17 <file> -lrocblas`。
