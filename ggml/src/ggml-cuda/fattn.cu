@@ -5,6 +5,355 @@
 #include "fattn-vec.cuh"
 #include "fattn.cuh"
 
+// ---------------------------------------------------------------------------------------------------------------------
+// Single-query decode with grouped-query sharing: one block per (kv chunk, kv head) computes the scores, softmax and
+// V accumulation of all G query heads of that kv head, so every K/V row is read once (the tile kernel needs
+// G % ncols2 == 0 with power-of-two ncols2 and reads K/V G/ncols2 times, e.g. 3x for qwen3.5's GQA 6).
+// Partial results of split chunks use the flash_attn_combine_results layout.
+// f16 K/V, f32 Q, f16 mask, no ALiBi / softcap / sinks / kv_rows.
+#define FATTN_DEC_NTHREADS 256
+
+
+template <int D, int G>
+__launch_bounds__(FATTN_DEC_NTHREADS, 2)
+static __global__ void flash_attn_dec_gqa_f16(
+        const char * __restrict__ Q_ptr, const char * __restrict__ K_ptr, const char * __restrict__ V_ptr,
+        const char * __restrict__ mask_ptr, float * __restrict__ dst, float2 * __restrict__ dst_meta,
+        const float scale, const int n_kv, const int chunk,
+        const int64_t nb02, const int64_t nb11, const int64_t nb12, const int64_t nb21, const int64_t nb22) {
+    static_assert(D == 128 || D == 256, "unsupported head size");
+    constexpr int NW  = FATTN_DEC_NTHREADS/64;
+    constexpr int RPW = 4;          // rows per wave and step in the KQ phase (16 lanes per row)
+    constexpr int DQ  = D / 16;     // dims per lane in the KQ phase (in DQ/8 uint4 pieces, coalesced per piece)
+    constexpr int DV  = D / 64;     // dims per lane in the VKQ phase
+    constexpr int NS  = 8;          // KQ steps per batch: NS*NW*RPW rows, all K loads of a batch issued together
+    constexpr int NV  = 16;         // VKQ rows per wave and batch
+
+    const int g        = blockIdx.y;
+    const int split    = blockIdx.x;
+    const int n_splits = gridDim.x;
+    const int r0       = split*chunk;
+    const int nr       = min(chunk, n_kv - r0);
+    const int tid      = threadIdx.x;
+    const int lane     = tid % 64;
+    const int wave     = tid / 64;
+    const int l16      = lane % 16;
+    const int rs       = lane / 16;
+
+    extern __shared__ float fattn_dec_smem[]; // [G][chunk] scores -> probabilities, reused for the wave reduction
+    float * s_p = fattn_dec_smem;
+    __shared__ float s_m[G];
+    __shared__ float s_l[G];
+
+    const char * Kg = K_ptr + (int64_t) g*nb12;
+    const char * Vg = V_ptr + (int64_t) g*nb22;
+    const half * mask = (const half *) mask_ptr;
+
+    // lane l16 owns the 8-element pieces l16, 16 + l16, ... of a row: every uint4 load instruction of a 16-lane
+    // group covers 256 contiguous bytes
+    float4 qraw[G][DQ/4];
+#pragma unroll
+    for (int h = 0; h < G; ++h) {
+        const float4 * qh = (const float4 *) ((const char *) Q_ptr + (int64_t) (g*G + h)*nb02);
+#pragma unroll
+        for (int i = 0; i < DQ/8; ++i) {
+            qraw[h][2*i + 0] = qh[2*(i*16 + l16) + 0];
+            qraw[h][2*i + 1] = qh[2*(i*16 + l16) + 1];
+        }
+    }
+
+    // ---- KQ ----
+    for (int rb = 0; rb < nr; rb += NS*NW*RPW) {
+        uint4 kraw[NS][DQ/8];
+#pragma unroll
+        for (int st = 0; st < NS; ++st) {
+            const int rl = rb + (st*NW + wave)*RPW + rs;
+            const uint4 * kr = (const uint4 *) (Kg + (int64_t) (r0 + min(rl, nr - 1))*nb11);
+#pragma unroll
+            for (int i = 0; i < DQ/8; ++i) {
+                kraw[st][i] = kr[i*16 + l16];
+            }
+        }
+#pragma unroll
+        for (int st = 0; st < NS; ++st) {
+            const int rl = rb + (st*NW + wave)*RPW + rs;
+            if (rb + st*NW*RPW >= nr) {
+                break; // uniform: no row of this step is in the chunk
+            }
+            float s[G];
+#pragma unroll
+            for (int h = 0; h < G; ++h) {
+                s[h] = 0.0f;
+            }
+#pragma unroll
+            for (int i = 0; i < DQ/8; ++i) {
+                const half2 * k2 = (const half2 *) &kraw[st][i];
+#pragma unroll
+                for (int h = 0; h < G; ++h) {
+                    const float4 qa = qraw[h][2*i + 0];
+                    const float4 qb = qraw[h][2*i + 1];
+                    float2 kf;
+                    kf = __half22float2(k2[0]); s[h] = fmaf(qa.x, kf.x, s[h]); s[h] = fmaf(qa.y, kf.y, s[h]);
+                    kf = __half22float2(k2[1]); s[h] = fmaf(qa.z, kf.x, s[h]); s[h] = fmaf(qa.w, kf.y, s[h]);
+                    kf = __half22float2(k2[2]); s[h] = fmaf(qb.x, kf.x, s[h]); s[h] = fmaf(qb.y, kf.y, s[h]);
+                    kf = __half22float2(k2[3]); s[h] = fmaf(qb.z, kf.x, s[h]); s[h] = fmaf(qb.w, kf.y, s[h]);
+                }
+            }
+#pragma unroll
+            for (int h = 0; h < G; ++h) {
+                s[h] = warp_reduce_sum<16>(s[h]);
+            }
+            if (rl < nr && l16 < G) {
+                float v = s[0];
+#pragma unroll
+                for (int h = 1; h < G; ++h) {
+                    v = l16 == h ? s[h] : v;
+                }
+                s_p[l16*chunk + rl] = v*scale + __half2float(mask[r0 + rl]);
+            }
+        }
+    }
+
+    // first V batch in flight during the softmax
+    float vf[NV][DV];
+    const auto load_v = [&](const int rb) {
+#pragma unroll
+        for (int u = 0; u < NV; ++u) {
+            const int rl = min(rb + u*NW + wave, nr - 1);
+            if constexpr (DV == 4) {
+                const uint2 raw = *((const uint2 *) (Vg + (int64_t) (r0 + rl)*nb21) + lane);
+                const float2 a = __half22float2(*(const half2 *) &raw.x);
+                const float2 b = __half22float2(*(const half2 *) &raw.y);
+                vf[u][0] = a.x; vf[u][1] = a.y; vf[u][2] = b.x; vf[u][3] = b.y;
+            } else {
+                const uint32_t raw = *((const uint32_t *) (Vg + (int64_t) (r0 + rl)*nb21) + lane);
+                const float2 a = __half22float2(*(const half2 *) &raw);
+                vf[u][0] = a.x; vf[u][1] = a.y;
+            }
+        }
+    };
+    load_v(0);
+    __syncthreads();
+
+    // ---- softmax over the chunk, one wave per head ----
+    for (int h = wave; h < G; h += NW) {
+        float m = -INFINITY;
+        for (int i = lane; i < nr; i += 64) {
+            m = fmaxf(m, s_p[h*chunk + i]);
+        }
+        m = warp_reduce_max<64>(m);
+        float l = 0.0f;
+        for (int i = lane; i < nr; i += 64) {
+            const float p = m == -INFINITY ? 0.0f : expf(s_p[h*chunk + i] - m);
+            s_p[h*chunk + i] = p;
+            l += p;
+        }
+        l = warp_reduce_sum<64>(l);
+        if (lane == 0) {
+            s_m[h] = m;
+            s_l[h] = l;
+        }
+    }
+    __syncthreads();
+
+    // ---- VKQ: 64 lanes per row (DV dims each), wave w takes rows w, w+NW, ... ----
+    float o[G][DV];
+#pragma unroll
+    for (int h = 0; h < G; ++h) {
+#pragma unroll
+        for (int i = 0; i < DV; ++i) {
+            o[h][i] = 0.0f;
+        }
+    }
+    for (int rb = 0; rb < nr; rb += NV*NW) {
+        if (rb > 0) {
+            load_v(rb);
+        }
+#pragma unroll
+        for (int u = 0; u < NV; ++u) {
+            const int rl = rb + u*NW + wave;
+            if (rl < nr) {
+#pragma unroll
+                for (int h = 0; h < G; ++h) {
+                    const float p = s_p[h*chunk + rl];
+#pragma unroll
+                    for (int i = 0; i < DV; ++i) {
+                        o[h][i] = fmaf(p, vf[u][i], o[h][i]);
+                    }
+                }
+            }
+        }
+    }
+    __syncthreads(); // all reads of s_p done before it is reused
+
+    // deterministic reduction over the waves: waves 1..NW-1 store, wave 0 adds them in order
+    float * s_o = fattn_dec_smem; // [(NW-1)][G][D]
+    if (wave > 0) {
+#pragma unroll
+        for (int h = 0; h < G; ++h) {
+#pragma unroll
+            for (int i = 0; i < DV; ++i) {
+                s_o[((wave - 1)*G + h)*D + lane*DV + i] = o[h][i];
+            }
+        }
+    }
+    __syncthreads();
+    if (wave == 0) {
+        for (int w = 1; w < NW; ++w) {
+#pragma unroll
+            for (int h = 0; h < G; ++h) {
+#pragma unroll
+                for (int i = 0; i < DV; ++i) {
+                    o[h][i] += s_o[((w - 1)*G + h)*D + lane*DV + i];
+                }
+            }
+        }
+#pragma unroll
+        for (int h = 0; h < G; ++h) {
+            const int head = g*G + h;
+            if (n_splits == 1) {
+                const float inv = 1.0f / s_l[h];
+#pragma unroll
+                for (int i = 0; i < DV; ++i) {
+                    dst[(int64_t) head*D + lane*DV + i] = o[h][i]*inv;
+                }
+            } else {
+#pragma unroll
+                for (int i = 0; i < DV; ++i) {
+                    dst[((int64_t) head*n_splits + split)*D + lane*DV + i] = o[h][i];
+                }
+                if (lane == 0) {
+                    dst_meta[(int64_t) head*n_splits + split] = make_float2(s_m[h], s_l[h]);
+                }
+            }
+        }
+    }
+}
+
+// minimum KV length for the decode kernel (shorter contexts keep the tile kernel), GGML_CUDA_FA_DEC_MIN_KV overrides
+static int ggml_cuda_fattn_dec_min_kv() {
+    static const int v = [] {
+        const char * e = getenv("GGML_CUDA_FA_DEC_MIN_KV");
+        return e ? atoi(e) : -1; // opt-in: no clear win over the tile kernel on MI210 (see attn-misc report)
+    }();
+    return v;
+}
+
+static bool ggml_cuda_fattn_dec_supported(const int cc, const ggml_tensor * dst) {
+    const ggml_tensor * Q     = dst->src[0];
+    const ggml_tensor * K     = dst->src[1];
+    const ggml_tensor * V     = dst->src[2];
+    const ggml_tensor * mask  = dst->src[3];
+    const ggml_tensor * sinks = dst->src[4];
+    const ggml_tensor * kv_rows = dst->src[5];
+
+    if (!GGML_CUDA_CC_IS_AMD(cc) || ggml_cuda_fattn_dec_min_kv() < 0) {
+        return false;
+    }
+    float max_bias = 0.0f, logit_softcap = 0.0f;
+    memcpy(&max_bias,      (const float *) dst->op_params + 1, sizeof(float));
+    memcpy(&logit_softcap, (const float *) dst->op_params + 2, sizeof(float));
+    if (max_bias != 0.0f || logit_softcap != 0.0f || sinks || kv_rows || !mask || mask->type != GGML_TYPE_F16) {
+        return false;
+    }
+    if (Q->type != GGML_TYPE_F32 || K->type != GGML_TYPE_F16 || V->type != GGML_TYPE_F16 ||
+        Q->ne[1] != 1 || Q->ne[3] != 1 || K->ne[3] != 1 || V->ne[3] != 1 || mask->ne[2] != 1 || mask->ne[3] != 1) {
+        return false;
+    }
+    const int64_t D = Q->ne[0];
+    if ((D != 128 && D != 256) || K->ne[0] != D || V->ne[0] != D || K->ne[1] != V->ne[1] || K->ne[2] != V->ne[2]) {
+        return false;
+    }
+    if (Q->ne[2] % K->ne[2] != 0) {
+        return false;
+    }
+    const int64_t G = Q->ne[2] / K->ne[2];
+    if (G != 2 && G != 4 && G != 6 && G != 8) {
+        return false;
+    }
+    if (K->ne[1] < ggml_cuda_fattn_dec_min_kv()) {
+        return false;
+    }
+    // 16-byte aligned K rows / Q rows, 8-byte aligned V rows, contiguous elements
+    if (Q->nb[0] != sizeof(float) || K->nb[0] != sizeof(half) || V->nb[0] != sizeof(half) ||
+        (uintptr_t) Q->data % 16 != 0 || Q->nb[2] % 16 != 0 || (uintptr_t) K->data % 16 != 0 || K->nb[1] % 16 != 0 ||
+        K->nb[2] % 16 != 0 || (uintptr_t) V->data % 8 != 0 || V->nb[1] % 8 != 0 || V->nb[2] % 8 != 0) {
+        return false;
+    }
+    // the output is written as [D, n_head] rows
+    if (!ggml_is_contiguous(dst)) {
+        return false;
+    }
+    return true;
+}
+
+template <int D, int G>
+static void ggml_cuda_flash_attn_ext_dec_launch(ggml_backend_cuda_context & ctx, ggml_tensor * dst, const int n_splits, const int chunk,
+        float * parts, float2 * meta) {
+    const ggml_tensor * Q    = dst->src[0];
+    const ggml_tensor * K    = dst->src[1];
+    const ggml_tensor * V    = dst->src[2];
+    const ggml_tensor * mask = dst->src[3];
+    float scale = 1.0f;
+    memcpy(&scale, (const float *) dst->op_params + 0, sizeof(float));
+
+    const size_t smem = std::max<size_t>((size_t) G*chunk, (size_t) (FATTN_DEC_NTHREADS/64 - 1)*G*D) * sizeof(float);
+    const dim3 grid(n_splits, K->ne[2], 1);
+    const dim3 block(FATTN_DEC_NTHREADS, 1, 1);
+    cudaStream_t stream = ctx.stream();
+    flash_attn_dec_gqa_f16<D, G><<<grid, block, smem, stream>>>(
+        (const char *) Q->data, (const char *) K->data, (const char *) V->data, (const char *) mask->data,
+        n_splits == 1 ? (float *) dst->data : parts, meta, scale, (int) K->ne[1], chunk,
+        Q->nb[2], K->nb[1], K->nb[2], V->nb[1], V->nb[2]);
+    CUDA_CHECK(cudaGetLastError());
+
+    if (n_splits > 1) {
+        const dim3 grid_c(1, Q->ne[2], 1);
+        const dim3 block_c(D, 1, 1);
+        const ggml_cuda_kernel_launch_params launch_params =
+            ggml_cuda_kernel_launch_params(grid_c, block_c, n_splits*sizeof(float2), stream);
+        ggml_cuda_kernel_launch(flash_attn_combine_results<D>, launch_params, (const float *) parts, (const float2 *) meta,
+            (float *) dst->data, n_splits);
+        CUDA_CHECK(cudaGetLastError());
+    }
+}
+
+static void ggml_cuda_flash_attn_ext_dec(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    const ggml_tensor * Q = dst->src[0];
+    const ggml_tensor * K = dst->src[1];
+    const int64_t D     = Q->ne[0];
+    const int64_t G     = Q->ne[2] / K->ne[2];
+    const int64_t n_kv  = K->ne[1];
+    const int64_t n_kvh = K->ne[2];
+    const int     nsm   = ggml_cuda_info().devices[ggml_cuda_get_device()].nsm;
+
+    // ~bpc blocks per CU (GGML_CUDA_FA_DEC_BPC, default 2), at least 64 rows per block
+    static const int bpc = getenv("GGML_CUDA_FA_DEC_BPC") ? atoi(getenv("GGML_CUDA_FA_DEC_BPC")) : 2;
+    int64_t n_splits = std::max<int64_t>(1, (bpc*nsm + n_kvh - 1) / n_kvh);
+    n_splits = std::min<int64_t>(n_splits, (n_kv + 63) / 64);
+    n_splits = std::max<int64_t>(n_splits, (n_kv + 2047) / 2048); // LDS: at most 2048 rows per block
+    int64_t chunk = (n_kv + n_splits - 1) / n_splits;
+    chunk = (chunk + 15) / 16 * 16;
+    n_splits = (n_kv + chunk - 1) / chunk;
+
+    ggml_cuda_pool_alloc<float>  parts(ctx.pool());
+    ggml_cuda_pool_alloc<float2> meta(ctx.pool());
+    if (n_splits > 1) {
+        parts.alloc(Q->ne[2]*n_splits*D);
+        meta.alloc(Q->ne[2]*n_splits);
+    }
+
+#define FATTN_DEC_CASE(D_, G_) \
+    if (D == (D_) && G == (G_)) { \
+        ggml_cuda_flash_attn_ext_dec_launch<D_, G_>(ctx, dst, (int) n_splits, (int) chunk, parts.ptr, meta.ptr); \
+        return; \
+    }
+    FATTN_DEC_CASE(256, 6) FATTN_DEC_CASE(256, 8) FATTN_DEC_CASE(256, 4) FATTN_DEC_CASE(256, 2)
+    FATTN_DEC_CASE(128, 6) FATTN_DEC_CASE(128, 8) FATTN_DEC_CASE(128, 4) FATTN_DEC_CASE(128, 2)
+#undef FATTN_DEC_CASE
+    GGML_ABORT("fatal error");
+}
+
 #if !defined(GGML_USE_MUSA)
 
 // one list per group of ncols1 queries: a column is selected if any query of the group can see it
@@ -540,6 +889,7 @@ enum best_fattn_kernel {
     BEST_FATTN_KERNEL_TILE    = 200,
     BEST_FATTN_KERNEL_VEC     = 100,
     BEST_FATTN_KERNEL_MMA_F16 = 400,
+    BEST_FATTN_KERNEL_DEC     = 150, // single-query decode with GQA sharing (AMD, long contexts)
 };
 
 // K/V types for which there is a vector kernel template instance, other kernels convert these to f16:
@@ -653,6 +1003,11 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
 
     if (mask && mask->ne[2] != 1) {
         return BEST_FATTN_KERNEL_NONE;
+    }
+
+    // single-query decode with GQA sharing (AMD): K/V are read once per kv head
+    if (ggml_cuda_fattn_dec_supported(cc, dst)) {
+        return BEST_FATTN_KERNEL_DEC;
     }
 
     // only the MMA kernel reads K/V through kv_rows
@@ -790,6 +1145,8 @@ size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * d
             need_f16_K = true;
             need_f16_V = true;
             break;
+        case BEST_FATTN_KERNEL_DEC:
+            break;
         case BEST_FATTN_KERNEL_VEC: {
             const bool f16_fallback = ggml_cuda_get_fattn_vec_case(Q->ne[0], K->type, V->type) == nullptr;
             need_f16_K = K->type == GGML_TYPE_F32 || f16_fallback;
@@ -818,6 +1175,9 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
             break;
         case BEST_FATTN_KERNEL_MMA_F16:
             ggml_cuda_flash_attn_ext_mma_f16(ctx, dst);
+            break;
+        case BEST_FATTN_KERNEL_DEC:
+            ggml_cuda_flash_attn_ext_dec(ctx, dst);
             break;
     }
 }

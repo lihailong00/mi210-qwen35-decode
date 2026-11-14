@@ -11300,6 +11300,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_attn_prep(256, 16, 2, nt, 256, GGML_ROPE_TYPE_IMROPE, order));
         }
     }
+    // single-query decode flash attention with GQA sharing (HIP decode kernel for long KV, tile kernel below)
+    for (int64_t kv : {256, 1024, 1280, 4096, 8448}) {
+        test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, kv, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 2, 1, 3}));
+        test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {8, 1}, kv, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 2, 1, 3}));
+        test_cases.emplace_back(new test_flash_attn_ext(128, 128, 8, {4, 1}, kv, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 2, 1, 3}));
+        test_cases.emplace_back(new test_flash_attn_ext(128, 128, 4, {2, 1}, kv, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
+    }
     test_cases.emplace_back(new test_rms_norm_mul_rope({128, 4, 7, 2}, 1e-6f, false, true));
 
     for (auto multi_add : {false, true}) {

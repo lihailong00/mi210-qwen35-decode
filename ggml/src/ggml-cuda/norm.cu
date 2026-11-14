@@ -150,6 +150,8 @@ static __global__ void rms_norm_f32(const float * x,
                 float4 *       dst4   = (float4 *) dstc;
 
                 float4 xs[vpt];
+                [[maybe_unused]] float4 ms[vpt];
+                [[maybe_unused]] float4 as[vpt];
                 float  tmp = 0.0f;
 
 #pragma unroll
@@ -158,6 +160,20 @@ static __global__ void rms_norm_f32(const float * x,
                     if (i < ncols4) {
                         xs[k] = x4[i];
                         tmp += xs[k].x*xs[k].x + xs[k].y*xs[k].y + xs[k].z*xs[k].z + xs[k].w*xs[k].w;
+                    }
+                }
+                // issue the weight (and addend) loads before the reduction: they are usually not in the cache
+                // (the weights of the previous GEMV streamed through it), and the arithmetic is unchanged
+#pragma unroll
+                for (int k = 0; k < vpt; k++) {
+                    const int i = tid + k*block_size;
+                    if (i < ncols4) {
+                        if constexpr (do_multiply) {
+                            ms[k] = mul4[i];
+                        }
+                        if constexpr (do_add) {
+                            as[k] = add4[i];
+                        }
                     }
                 }
                 tmp = block_reduce<block_reduce_method::SUM, block_size>(tmp, s_sum);
@@ -169,14 +185,14 @@ static __global__ void rms_norm_f32(const float * x,
                     if (i < ncols4) {
                         float4 r = make_float4(scale*xs[k].x, scale*xs[k].y, scale*xs[k].z, scale*xs[k].w);
                         if constexpr (do_multiply) {
-                            const float4 m = mul4[i];
+                            const float4 m = ms[k];
                             r.x *= m.x;
                             r.y *= m.y;
                             r.z *= m.z;
                             r.w *= m.w;
                         }
                         if constexpr (do_add) {
-                            const float4 a = add4[i];
+                            const float4 a = as[k];
                             r.x += a.x;
                             r.y += a.y;
                             r.z += a.z;
@@ -223,7 +239,10 @@ static __global__ void rms_norm_f32(const float * x,
 
             if constexpr (block_size > WARP_SIZE) {
                 // sync is needed as we reuse s_sum across block_reduce invocations, see #26385
-                __syncthreads();
+                // (not after the last row of the block: single-row decode norms skip it)
+                if (channel + (int) gridDim.y < nchannels || sample + (int) gridDim.z < nsamples) {
+                    __syncthreads();
+                }
             }
         }
     }
