@@ -1,6 +1,9 @@
 #include "gdn-decode.cuh"
 #include "convert.cuh"
+#include "quantize.cuh"
 #include "unary.cuh"
+
+#include <vector>
 
 // Fused single-token gated delta net decode for one sequence (qwen3.5 / qwen3-next linear attention).
 //
@@ -62,6 +65,33 @@ static __device__ __forceinline__ float gdn_dec_sigmoid(float x) {
 
 static __device__ __forceinline__ float gdn_dec_softplus(float x) {
     return (x > 20.0f) ? x : log1pf(expf(x)); // == op_softplus (unary.cu)
+}
+
+// output of head h, elements 4*tid .. 4*tid + 3 (tid < 32); with q8: also the q8_1 quantization for the consuming
+// single-token GEMV, bit-identical to quantize_q8_1 (8 threads hold one block of 32 values) + the per-block int sums
+template <bool q8>
+static __device__ __forceinline__ void gdn_dec_store_out(
+        float * out, const float4 o, const int h, const int tid, block_q8_1 * y, int * ysum) {
+    ((float4 *) (out + h*GDN_DEC_S))[tid] = o;
+    if constexpr (q8) {
+        float amax = fmaxf(fmaxf(fabsf(o.x), fabsf(o.y)), fmaxf(fabsf(o.z), fabsf(o.w)));
+        amax = warp_reduce_max<QK8_1/4>(amax);
+        const float  d  = amax / 127.0f;
+        const int8_t q0 = amax == 0.0f ? 0 : roundf(o.x / d);
+        const int8_t q1 = amax == 0.0f ? 0 : roundf(o.y / d);
+        const int8_t q2 = amax == 0.0f ? 0 : roundf(o.z / d);
+        const int8_t q3 = amax == 0.0f ? 0 : roundf(o.w / d);
+        int sum = (int) q0 + (int) q1 + (int) q2 + (int) q3;
+        sum = warp_reduce_sum<QK8_1/4>(sum);
+        const int ib = (h*GDN_DEC_S)/QK8_1 + tid/(QK8_1/4);
+        const uint32_t packed = (uint32_t) (uint8_t) q0 | ((uint32_t) (uint8_t) q1 << 8) |
+                                ((uint32_t) (uint8_t) q2 << 16) | ((uint32_t) (uint8_t) q3 << 24);
+        ((uint32_t *) y[ib].qs)[tid % (QK8_1/4)] = packed;
+        if (tid % (QK8_1/4) == 0) {
+            y[ib].ds  = make_half2(d, d * sum);
+            ysum[ib] = sum;
+        }
+    }
 }
 
 template <typename T>
@@ -233,6 +263,7 @@ gdn_decode_prep_f32(
 
 // one block per v head: conv of the head's v channels, delta rule (== gated_delta_net_cuda<128, false, false, 4>),
 // gated rms norm
+template <bool q8>
 static __global__ void __launch_bounds__(GDN_DEC_OUT_BLOCK)
 gdn_decode_out_f32(
         const float   * __restrict__ prep,
@@ -250,7 +281,9 @@ gdn_decode_out_f32(
         const int64_t                ss_row_stride,
         const int                    dst_row,
         const float                  scale,
-        const float                  eps) {
+        const float                  eps,
+        block_q8_1    * __restrict__ y,
+        int           * __restrict__ ysum) {
     constexpr int S             = GDN_DEC_S;
     constexpr int warp_size     = ggml_cuda_get_physical_warp_size() < S ? ggml_cuda_get_physical_warp_size() : S;
     constexpr int cols_per_warp = 4;
@@ -418,13 +451,14 @@ gdn_decode_out_f32(
         o.y = ggml_cuda_op_silu_single(zz.y) * r.y;
         o.z = ggml_cuda_op_silu_single(zz.z) * r.z;
         o.w = ggml_cuda_op_silu_single(zz.w) * r.w;
-        ((float4 *) (out + h*S))[tid] = o;
+        gdn_dec_store_out<q8>(out, o, h, tid, y, ysum);
     }
 }
 
 // several blocks per v head (each owns cols_per_block state columns, like gated_delta_net_cuda): conv of the
 // block's v channels, delta rule; the last block of a head to finish applies the gated rms norm to the head's
 // output (per-head arrival counters: tail of the prep result, zeroed by the prep kernel)
+template <bool q8>
 static __global__ void __launch_bounds__(GDN_DEC_SPLIT_BLOCK)
 gdn_decode_out_split_f32(
         const float   * __restrict__ prep,
@@ -442,7 +476,9 @@ gdn_decode_out_split_f32(
         const int64_t                ss_row_stride,
         const int                    dst_row,
         const float                  scale,
-        const float                  eps) {
+        const float                  eps,
+        block_q8_1    * __restrict__ y,
+        int           * __restrict__ ysum) {
     constexpr int S              = GDN_DEC_S;
     constexpr int warp_size      = ggml_cuda_get_physical_warp_size() < S ? ggml_cuda_get_physical_warp_size() : S;
     constexpr int cols_per_warp  = 4;
@@ -602,7 +638,7 @@ gdn_decode_out_split_f32(
         o.y = ggml_cuda_op_silu_single(zz.y) * r.y;
         o.z = ggml_cuda_op_silu_single(zz.z) * r.z;
         o.w = ggml_cuda_op_silu_single(zz.w) * r.w;
-        ((float4 *) (out + h*S))[tid] = o;
+        gdn_dec_store_out<q8>(out, o, h, tid, y, ysum);
     }
 }
 
@@ -685,6 +721,10 @@ void ggml_cuda_op_gdn_decode_prep(ggml_backend_cuda_context & ctx, ggml_tensor *
 }
 
 void ggml_cuda_op_gdn_decode_out(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    ggml_cuda_op_gdn_decode_out_q8(ctx, dst, nullptr, nullptr);
+}
+
+void ggml_cuda_op_gdn_decode_out_q8(ggml_backend_cuda_context & ctx, ggml_tensor * dst, block_q8_1 * y, int * ysum) {
     const ggml_tensor * prep   = dst->src[0];
     const ggml_tensor * qkv    = dst->src[1];
     const ggml_tensor * conv_w = dst->src[2];
@@ -716,18 +756,76 @@ void ggml_cuda_op_gdn_decode_out(ggml_backend_cuda_context & ctx, ggml_tensor * 
     const int warp_size = std::min(ggml_cuda_info().devices[ctx.device].warp_size, S);
     const int split     = S / ((GDN_DEC_SPLIT_BLOCK / warp_size) * 4);
 
-    if (use_split && split >= 1) {
-        gdn_decode_out_split_f32<<<H_v*split, GDN_DEC_SPLIT_BLOCK, 0, stream>>>(
-            (const float *) prep->data, (const float *) qkv->data, (const float *) conv_w->data, (float *) cs->data,
-            (const float *) z->data, (const float *) norm_w->data, (float *) ss->data, (const int32_t *) s_copy->data,
-            (float *) dst->data, H_k, H_v, (int64_t) (cs->nb[1] / sizeof(float)), (int64_t) (ss->nb[1] / sizeof(float)),
-            dst_row, scale, eps);
+    GGML_ASSERT((y == nullptr) == (ysum == nullptr));
+
+    // GGML_GDN_DECODE_Q8_SELFTEST=1 (debug, needs GGML_CUDA_DISABLE_GRAPHS=1): run the q8 variant into scratch buffers
+    // and compare its q8_1 output with quantize_q8_1 of the fp32 result
+    static const bool q8_selftest = [] {
+        const char * e = getenv("GGML_GDN_DECODE_Q8_SELFTEST");
+        return e != nullptr && atoi(e) != 0;
+    }();
+    const int64_t n_out = (int64_t) H_v*S;
+    const int64_t nb8   = n_out/QK8_1;
+    ggml_cuda_pool_alloc<block_q8_1> y_test(ctx.pool());
+    ggml_cuda_pool_alloc<int>        s_test(ctx.pool());
+    const bool selftest = q8_selftest && y == nullptr;
+    if (selftest) {
+        y    = y_test.alloc(nb8);
+        ysum = s_test.alloc(nb8);
+    }
+
+    const bool q8 = y != nullptr;
+
+    auto launch = [&](auto q8_c) {
+        constexpr bool Q8 = decltype(q8_c)::value;
+        if (use_split && split >= 1) {
+            gdn_decode_out_split_f32<Q8><<<H_v*split, GDN_DEC_SPLIT_BLOCK, 0, stream>>>(
+                (const float *) prep->data, (const float *) qkv->data, (const float *) conv_w->data, (float *) cs->data,
+                (const float *) z->data, (const float *) norm_w->data, (float *) ss->data, (const int32_t *) s_copy->data,
+                (float *) dst->data, H_k, H_v, (int64_t) (cs->nb[1] / sizeof(float)), (int64_t) (ss->nb[1] / sizeof(float)),
+                dst_row, scale, eps, y, ysum);
+        } else {
+            gdn_decode_out_f32<Q8><<<H_v, GDN_DEC_OUT_BLOCK, 0, stream>>>(
+                (const float *) prep->data, (const float *) qkv->data, (const float *) conv_w->data, (float *) cs->data,
+                (const float *) z->data, (const float *) norm_w->data, (float *) ss->data, (const int32_t *) s_copy->data,
+                (float *) dst->data, H_k, H_v, (int64_t) (cs->nb[1] / sizeof(float)), (int64_t) (ss->nb[1] / sizeof(float)),
+                dst_row, scale, eps, y, ysum);
+        }
+    };
+    if (q8) {
+        launch(std::true_type{});
     } else {
-        gdn_decode_out_f32<<<H_v, GDN_DEC_OUT_BLOCK, 0, stream>>>(
-            (const float *) prep->data, (const float *) qkv->data, (const float *) conv_w->data, (float *) cs->data,
-            (const float *) z->data, (const float *) norm_w->data, (float *) ss->data, (const int32_t *) s_copy->data,
-            (float *) dst->data, H_k, H_v, (int64_t) (cs->nb[1] / sizeof(float)), (int64_t) (ss->nb[1] / sizeof(float)),
-            dst_row, scale, eps);
+        launch(std::false_type{});
     }
     CUDA_CHECK(cudaGetLastError());
+
+    if (selftest) {
+        ggml_cuda_pool_alloc<block_q8_1> y_ref(ctx.pool(), nb8);
+        quantize_row_q8_1_cuda((const float *) dst->data, nullptr, y_ref.get(), GGML_TYPE_Q8_0,
+            n_out, n_out, n_out, n_out, n_out, 1, 1, 1, stream);
+        std::vector<block_q8_1> hf(nb8), hr(nb8);
+        std::vector<int> hs(nb8);
+        CUDA_CHECK(cudaMemcpyAsync(hf.data(), y, nb8*sizeof(block_q8_1), cudaMemcpyDeviceToHost, stream));
+        CUDA_CHECK(cudaMemcpyAsync(hr.data(), y_ref.get(), nb8*sizeof(block_q8_1), cudaMemcpyDeviceToHost, stream));
+        CUDA_CHECK(cudaMemcpyAsync(hs.data(), ysum, nb8*sizeof(int), cudaMemcpyDeviceToHost, stream));
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+        int64_t bad = 0;
+        for (int64_t i = 0; i < nb8; ++i) {
+            int sum = 0;
+            for (int j = 0; j < QK8_1; ++j) {
+                sum += hr[i].qs[j];
+            }
+            if (memcmp(&hf[i], &hr[i], sizeof(block_q8_1)) != 0 || hs[i] != sum) {
+                bad++;
+            }
+        }
+        static int64_t n_calls = 0;
+        static int64_t n_bad   = 0;
+        n_calls++;
+        n_bad += bad;
+        if (n_calls == 1 || n_calls % 480 == 0 || bad) {
+            GGML_LOG_WARN("%s: q8 selftest: %lld calls, %lld mismatching blocks (last call: %lld of %lld)\n", __func__,
+                (long long) n_calls, (long long) n_bad, (long long) bad, (long long) nb8);
+        }
+    }
 }
