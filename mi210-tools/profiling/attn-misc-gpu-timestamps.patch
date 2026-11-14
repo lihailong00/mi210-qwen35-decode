@@ -1,0 +1,98 @@
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu	2026-11-14 14:06:18.638590300 +0800
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu	2026-11-14 14:06:18.754169200 +0800
+@@ -5533,8 +5533,62 @@
+     return 0;
+ }
+ 
++// ---- diagnostic: in-graph GPU timestamps (GGML_CUDA_TS=1 [GGML_CUDA_TS_DUMP=n] [GGML_CUDA_TS_OUT=prefix]) ----
++// A 1-thread kernel writing s_memrealtime (25 MHz on MI210) is captured after every dispatched node; after n graph
++// evaluations the timestamps and the node labels are dumped (analysis: ts.py). Real per-node cost = delta - ts kernel cost.
++static __global__ void k_ts(unsigned long long * buf, unsigned int * counter, unsigned int cap) {
++    const unsigned long long t = wall_clock64();
++    const unsigned int i = atomicAdd(counter, 1u);
++    buf[i % cap] = t;
++}
++struct ggml_cuda_ts_state {
++    bool enabled = false; bool dumped = false; int evals = 0; int dump_at = 100;
++    unsigned long long * buf = nullptr; unsigned int * counter = nullptr; unsigned int cap = 1u << 20;
++    std::vector<std::string> labels;
++};
++static ggml_cuda_ts_state & ggml_cuda_ts() {
++    static ggml_cuda_ts_state st = [] {
++        ggml_cuda_ts_state s;
++        s.enabled = getenv("GGML_CUDA_TS") != nullptr;
++        if (const char * e = getenv("GGML_CUDA_TS_DUMP")) { s.dump_at = atoi(e); }
++        return s;
++    }();
++    return st;
++}
++static void ggml_cuda_ts_mark(ggml_backend_cuda_context * ctx, const std::string & label) {
++    ggml_cuda_ts_state & st = ggml_cuda_ts();
++    if (!st.enabled || st.dumped) return;
++    if (!st.buf) {
++        CUDA_CHECK(cudaMalloc(&st.buf, sizeof(unsigned long long) * st.cap));
++        CUDA_CHECK(cudaMalloc(&st.counter, sizeof(unsigned int)));
++        CUDA_CHECK(cudaMemset(st.counter, 0, sizeof(unsigned int)));
++    }
++    k_ts<<<1, 1, 0, ctx->stream()>>>(st.buf, st.counter, st.cap);
++    st.labels.push_back(label);
++}
++static void ggml_cuda_ts_maybe_dump() {
++    ggml_cuda_ts_state & st = ggml_cuda_ts();
++    if (!st.enabled || st.dumped || !st.buf) return;
++    if (++st.evals < st.dump_at) return;
++    CUDA_CHECK(cudaDeviceSynchronize());
++    unsigned int n = 0;
++    CUDA_CHECK(cudaMemcpy(&n, st.counter, sizeof(n), cudaMemcpyDeviceToHost));
++    const unsigned int m = std::min(n, st.cap);
++    std::vector<unsigned long long> h(m);
++    CUDA_CHECK(cudaMemcpy(h.data(), st.buf, sizeof(unsigned long long) * m, cudaMemcpyDeviceToHost));
++    const char * out = getenv("GGML_CUDA_TS_OUT") ? getenv("GGML_CUDA_TS_OUT") : "/tmp/ggml_ts";
++    std::string f1 = std::string(out) + ".ts", f2 = std::string(out) + ".labels";
++    FILE * f = fopen(f1.c_str(), "w");
++    if (f) { for (unsigned int i = 0; i < m; ++i) fprintf(f, "%llu\n", h[i]); fclose(f); }
++    f = fopen(f2.c_str(), "w");
++    if (f) { for (auto & l : st.labels) fprintf(f, "%s\n", l.c_str()); fclose(f); }
++    fprintf(stderr, "ggml_cuda_ts: dumped %u timestamps, %zu labels per graph to %s.*\n", m, st.labels.size(), out);
++    st.dumped = true;
++}
++
+ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, const bool use_cuda_graph, const bool cuda_graph_update_required, const void * graph_key) {
+     bool graph_evaluated_or_captured = false;
++    ggml_cuda_ts_maybe_dump();
+ 
+     // flag used to determine whether it is an integrated_gpu
+     const bool integrated            = ggml_cuda_info().devices[cuda_ctx->device].integrated;
+@@ -5638,6 +5692,11 @@
+                 stream_ctx.concurrent_events.clear();
+             }
+ 
++            if (ggml_cuda_ts().enabled) {
++                ggml_cuda_ts().labels.clear();
++                ggml_cuda_ts_mark(cuda_ctx, "START0");
++                ggml_cuda_ts_mark(cuda_ctx, "START1");
++            }
+             for (int i = 0; i < cgraph->n_nodes; i++) {
+                 ggml_tensor * node = cgraph->nodes[i];
+ #ifdef USE_CUDA_GRAPH
+@@ -5691,6 +5750,10 @@
+ 
+                 int nodes_to_skip = ggml_cuda_try_fuse(cuda_ctx, cgraph, i);
+ 
++                if (nodes_to_skip != 0 && ggml_cuda_ts().enabled) {
++                    const ggml_tensor * last = cgraph->nodes[i + nodes_to_skip];
++                    ggml_cuda_ts_mark(cuda_ctx, std::string("F ") + ggml_op_desc(node) + "+" + std::to_string(nodes_to_skip) + "->" + ggml_op_desc(last) + " " + node->name);
++                }
+                 if (nodes_to_skip != 0) {
+ #ifdef GGML_CUDA_DEBUG
+                     const int last_fused = i + nodes_to_skip;
+@@ -5723,6 +5786,9 @@
+                     GGML_LOG_ERROR("%s: op not supported %s (%s)\n", __func__, node->name, ggml_op_name(node->op));
+                 }
+                 GGML_ASSERT(ok);
++                if (ggml_cuda_ts().enabled) {
++                    ggml_cuda_ts_mark(cuda_ctx, std::string("U ") + ggml_op_desc(node) + " " + node->name + " " + (node->src[0] ? ggml_type_name(node->src[0]->type) : "") + " " + std::to_string(node->ne[0]) + "x" + std::to_string(node->ne[1]));
++                }
+ 
+                 if (!is_concurrent_event_active) {
+                     try_launch_concurrent_event(node);

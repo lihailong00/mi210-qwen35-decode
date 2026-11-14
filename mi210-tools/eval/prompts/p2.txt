@@ -1,0 +1,1 @@
+def merge_sorted_lists(a, b):\n    """Merge two sorted lists into one sorted list."""\n

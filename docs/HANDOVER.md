@@ -1,0 +1,492 @@
+# MI210 上 Qwen3.8-27B IQ3\_S 单流解码优化：工作交接文档
+
+2026-11-14
+
+## 一、背景、目标与最终结果
+
+单流 decode（不开 MTP）从 45.6 提升到 80.3 token/s，提升 76%；目标 90 token/s 未达到，还差每 token 约 1.35 ms。
+
+任务是在单张 AMD Instinct MI210 上，用 llama.cpp b12110 跑 Qwen3.8-27B-GSQ-RCO-IQ3\_S-mtp.gguf（架构 qwen35），提高单流解码速度。约束：同一个 GGUF，不重新量化、不降精度；允许无损的权重重排、新 kernel、融合和启动开销优化。时间窗为 12 小时（2026-11-14，08:30 起）。
+
+起点是"保留版"：b12110 加 ROCm 7.2 兼容补丁，再加一个把 IQ3\_S/IQ3\_XXS 权重展开成 4-bit 副本的补丁（每 256 个权重 134 字节）。保留版 decode 为 45.6 token/s。
+
+| 指标 | 保留版基线 | 最终版本 | 变化 |
+| --- | --- | --- | --- |
+| decode tg128，上下文 0 | 45.63 token/s | 80.33 token/s | +76.0% |
+| decode tg128，上下文 8192 | 44.23 token/s | 74.57 token/s | +68.6% |
+| decode tg128，上下文 32768 | 40.65 token/s | 64.43 token/s | +58.5% |
+| prefill pp8192 | 1220 token/s | 1245 token/s | +2%（未退化） |
+| llama-server 单请求（-np 1） | 45.6 token/s | 79.1 token/s | +73% |
+| 每 token kernel 启动数 | 1933 | 601 | −69% |
+| 显存峰值（llama-bench） | 24.1 GB | 28.1–31.9 GB | +4–8 GB |
+
+质量：与基线 logits 的平均 KL 散度为 0.00125，处在纯计算重排的噪声底线（0.00114）上。显存增加来自同尺寸的重排权重副本，原权重保留给 prefill 使用。
+
+## 二、环境与工作区
+
+所有工作都在一台单 MI210 服务器的 `/data/tools/mi210-opt` 下完成，编译和运行在一个长期运行的容器里。
+
+**硬件与系统**
+
+- 服务器：普通用户（无 sudo），Ubuntu 24.04，Ryzen 7 9700X（16 线程），60 GB 内存。
+- GPU：一张 MI210（gfx90a，CDNA2，104 CU，wave64，64 GB HBM2e），PCI 03:00.0，对应 card1 / renderD128。另有一块 AMD 核显（renderD129），容器里只映射 MI210。
+- 宿主机没有安装 ROCm，编译和运行都在 Docker 容器里，ROCm 7.2.1。
+- 模型：`/data/model/Qwen3.8-27B-GSQ-RCO-GGUF/Qwen3.8-27B-GSQ-RCO-IQ3_S-mtp.gguf`，12,120,016,960 字节，SHA-256 以 58fd8267 开头。
+
+**工作容器 `mi210-opt`**
+
+- 镜像 `local/llama-fastmtp-rocm-profile:20261003`（ROCm 7.2.1 + rocprofv3 + cmake/ninja/python3）。
+- 以 uid 1000 运行，附加 video(44)/render(992) 组，`--network host`，`seccomp=unconfined`。
+- 挂载：`/data/tools/mi210-opt` → `/lab`（读写），`/data/model`（只读）。容器内所有路径都用 `/lab/...`。
+- 主进程是 `sleep infinity`，用 `docker exec mi210-opt bash -lc '...'` 执行命令；停掉后用 `docker start mi210-opt` 恢复。
+
+**目录结构（宿主机路径）**
+
+| 路径 | 用途 |
+| --- | --- |
+| `src/` | git 仓库主工作树，master = 保留版源码；所有分支和标签都在这个仓库里 |
+| `wt-<分支>/` | 各分支的 git worktree，各自带 `build/` 编译目录 |
+| `wt-final/` | 最终版本（分支 final，标签 mi210-final），二进制在 `wt-final/build/bin` |
+| `build/` | 保留版的完整编译（对照用） |
+| `baseline-retained/` | 官方 b12110 工具 + 保留版 libggml-hip.so（A/B 对照的 A） |
+| `gemv/` | GEMV 微基准框架、真实权重切片（`gemv/w/*.bin`）和各模块的独立开发仓库 |
+| `eval/` | 评估脚本、困惑度文本、提示词、基线 logits（`ref-logits.bin`） |
+| `results/` | 所有测量结果、trace 和日志 |
+| `deliver/` | 交付物：完整补丁和启动脚本 |
+| `logs/` | 编译日志、每次 GPU 作业的温度与显存采样 |
+
+**关键脚本**
+
+- `gpu-run.sh <标签> "<容器内命令>"`（宿主机执行）：用 flock 串行化 GPU 作业；开始前等 GPU 降到 60°C 以下；每秒记录温度和显存；任一传感器达到 85°C 就杀掉作业。会自动透传 `GGML_*`、`LLAMA_*`、`CODEX_*`、`HIP_*` 环境变量。**所有 GPU 作业都必须经过它**。
+- `build-wt.sh <源码目录> <编译目录> [目标...]`（容器内）：首次配置 cmake，然后编译；并行度由环境变量 PAR 控制。
+- `bench.sh`、`final-run.sh`、`eval/kld.sh`、`eval/eval.sh`、`eval/server_test.py`：测速与评估，用法见第十一节。
+- `merge-int.sh`：把若干分支合并到 integration（忽略行尾差异并统一为 LF，自动应用 `int-patches/` 里的补丁）。
+
+
+## 三、基线测量与性能模型
+
+保留版每个 token 约 21.9 ms：权重 GEMV 约 16.5 ms，其余 1460 个小 kernel 约 4.5 ms。两个一起压缩，是之后所有工作的出发点。
+
+**模型结构（影响优化的部分）**
+
+- 64 层，其中 48 层是 Gated DeltaNet（线性注意力），16 层是全注意力（第 il%4==3 层）。另有 1 层 MTP，关闭 MTP 时不读。
+- 隐藏维 5120，FFN 17408。注意力 24 个 q 头、4 个 kv 头，头维 256，attn\_q 宽 12288（含输出门）。IMROPE，旋转 64 维，分段 11/11/10，base 1e7。
+- DeltaNet：16 个 k 组、48 个 v 头，状态维 128，d\_inner 6144，卷积核 4（conv 通道 10240）。每层递归状态 3 MB。词表 248320。
+- 混合精度：每 token 读 IQ3\_S 3.64 GB、IQ4\_XS 3.02 GB、IQ3\_XXS 2.08 GB、Q4\_K 1.58 GB（其中 LM head 0.715 GB），另有少量 IQ2\_S/Q2\_K/IQ2\_XS/IQ2\_XXS/IQ1\_M/BF16。同一层的 gate 与 up 常常类型不同（64 层里只有 24 层相同）。
+- 每 token 至少读取 11.35 GB 权重（GGUF 原始尺寸，不含 MTP 和只读一行的 token\_embd）。保留版的 4-bit 展开副本使实际读取变成 12.9 GB。
+
+**硬件性能模型（实测）**
+
+| 量 | 实测值 |
+| --- | --- |
+| 纯读带宽上限 | 13–50 MB 张量 1.33–1.42 TB/s；1 GiB 连续读 1.455 TB/s |
+| 单个 GEMV 的读取底线 | t ≈ 1.6 µs + 字节数 / 1.46 TB/s |
+| HIP graph 回放中一个空 kernel | 约 1.35 µs；实际小 kernel 约 2–3 µs |
+| 单 block 的 rms\_norm（5120 元素） | 4.4–5.7 µs（延迟链） |
+| HIP graph | llama.cpp 每 token 8 个 graph 块回放；关闭会慢 1.6 ms |
+| 时钟 | 核心 1700 MHz、显存 1600 MHz，220–245 W，无降频 |
+
+由此得到硬约束：纯读 11.35 GB 至少 7.8 ms；90 token/s 对应 11.1 ms，等于整个 token 平均要跑到 1.02 TB/s，约为带宽上限的 75%，包括所有小 kernel 和间隙。
+
+**基线每 token 时间分解**（rocprofv3，校准后的真实估计）
+
+| 类别 | 启动数 | 耗时 |
+| --- | --- | --- |
+| 权重 GEMV | 473 | 16.5 ms（平均 0.80 TB/s，带宽上限的 55%） |
+| 激活量化（quantize\_q8\_1 + IQ3 求和） | 513 | 1.39 ms |
+| 各类 norm | 305 | 1.08 ms |
+| 全注意力链 | 约 80 | 0.89 ms |
+| DeltaNet 小算子链 | 约 720 | 0.69 ms + 小 kernel 开销 |
+| 逐元素、拷贝等 | 约 370 | 1.04 ms |
+| 空闲（token 之间） | — | 0.20 ms |
+
+基线的重灾区：
+
+- IQ2\_S/IQ2\_XS/IQ2\_XXS/IQ1\_M 只占 0.73 GB，却要 2.3 ms（约 0.3 TB/s）。码表查表走全局内存，受延迟限制。
+- 48×5120 的 BF16 ssm\_alpha/ssm\_beta 矩阵每 token 96 次、每次 11 µs，共 1.07 ms，只用了 48 个 workgroup。
+- 每个 GEMV 前都有单独的激活量化 kernel，但只有 257 个不同的输入向量。
+- 通用 mul\_mat\_vec\_q 在 gfx90a 上每个 128 线程块只算一行，K=5120 时最后一轮只有 25% 线程在工作。
+
+## 四、工作方法
+
+工作按"先测量、再并行开发、频繁集成、用 KL 散度验收"的循环进行，共四轮开发加一轮审查修复。
+
+**分工与分支**（每条工作线一个 git 分支和独立 worktree/编译目录，GPU 通过锁共享）
+
+| 轮次 | 分支 | 内容 |
+| --- | --- | --- |
+| 第 1 轮 | gemv | GEMV 框架：q8 激活缓存、q8 生产者、低比特模块接入、BF16 细矩阵、各类尾部融合 |
+| 第 1 轮 | gemv-lowbit（独立仓库 `gemv/lowbit`） | IQ2\_S/IQ2\_XS/IQ2\_XXS/Q2\_K/IQ1\_M 新 kernel |
+| 第 1 轮 | deltanet | 融合的 Gated DeltaNet 单 token 解码算子 |
+| 第 1 轮 | attn | 注意力层前处理融合、异步上传、FA 门融合、norm |
+| 第 2 轮 | gemv-iq3、gemv-iq4k | IQ3 紧凑布局 kernel；IQ4\_XS/Q4\_K kernel |
+| 第 3 轮 | iq3-r3、iq4k-r3 | 同输入 GEMV 合并为一次启动、移动读取窗口布局、小形状 |
+| 第 4 轮 | r4-mixgroup、r4-ffndown、r4-attn | 混合类型配对、ffn\_down 前序指令顺序、短上下文 FA 解码、小代码 norm |
+| 审查后 | fixes | 修复代码审查确认的 12 个缺陷 |
+| 收尾 | diet-gdn、diet-gemv | 缩减关键路径指令数（冷指令缓存） |
+
+**集成流程**
+
+1. 各分支验证通过后提交；integration 分支从 master 重新合并各分支（`merge-int.sh`）。
+2. 冲突手工解决后编译，跑 bench 和 KLD；重要节点打标签（int-v8-base、int-v9、int-v11）。
+3. 后期的分支都从最新标签分出，只在其上叠加新提交，减少重复冲突。
+4. 最终版 = int-v11 + fixes + diet-gemv + diet-gdn，分支 final，标签 mi210-final。
+
+**各集成版本的速度**
+
+| 版本 | 时间 | decode token/s | 新增内容 |
+| --- | --- | --- | --- |
+| 基线 | 08:45 | 45.6 | 保留版 |
+| v1 | 10:35 | 60.1 | 融合 DeltaNet、注意力前处理、GEMV 框架 |
+| v2 | 11:20 | 61.5 | q8 生产者、异步上传 |
+| v3 | 11:50 | 62.5 | 低比特模块 v3、多块 norm |
+| v4 | 12:30 | 66.2 | IQ3 紧凑布局 + LDS 码表 |
+| v5 | 13:05 | 72.3 | IQ4_XS/Q4_K 模块 |
+| v7 | 14:25 | 73.4 | 门控 norm 融合 |
+| v8 | 14:55 | 74.0 | DeltaNet 输出直接写 q8 |
+| v9 | 15:20 | 76.0 | 同输入合并、移动读取窗口 |
+| v10 | 16:30 | 77.4 | 混合配对、短上下文 FA |
+| v11 | 16:55 | 78.0 | 小代码 norm、前序重排 |
+| 最终 | 17:45 | 80.3 | 缺陷修复 + 代码瘦身 |
+
+最大的两次跳跃来自第一次集成（融合 DeltaNet 等，+14.5）和 IQ4\_XS/Q4\_K 模块（+6.1）；后期每轮只增加 1–3 token/s。
+
+**验收标准**
+
+- 速度：同一二进制用环境变量开关做交替 A/B（至少 3 轮），或新旧二进制交替跑；单次测量噪声约 ±0.5–1%。
+- 质量：平均 KLD ≤ 0.0015，top-1 一致率 ≥ 98.3%，困惑度比值偏差在 0.5% 以内。噪声底线的来历见第六节。
+- 不要求位精确：GEMV 累加顺序变化在这个带递归状态的模型里会被放大。但融合类改动（算子串联融合、代码缩减）都要求与上一版位精确，并用 KLD 表和贪心输出 md5 确认。
+- 量化激活（q8\_1）必须与 ggml 的 quantize\_q8\_1 位精确一致：d = amax/127，q = roundf(x/d)，ds = (d, d·sum)。
+
+## 五、已完成的优化
+
+收益最大的三项是：融合 DeltaNet 算子（约 2.8 ms）、按类型重写的 GEMV（约 4 ms）、消除量化和小 kernel 启动（约 2 ms）。下面按组件列出原理、文件、收益和关闭开关；所有开关默认都是开。
+
+### 1. 激活量化：q8 缓存与生产者
+
+- 原理：生成 GEMV 输入的 kernel（RMS\_NORM+MUL、SWIGLU、SILU/SIGMOID+MUL、DeltaNet 输出、FA 合并）顺便写出 q8\_1 块和每 32 元素整数和，与 quantize\_q8\_1 位精确。按流维护一个缓存，输入相同的连续 GEMV 只量化一次。
+- 缓存条目按值保存（基张量、数据指针、ne10），每次 graph 计算开始时清空，上下文销毁时释放。
+- 文件：`mmvq.cu`（缓存）、`q8-producers.cu`（生产者 kernel）、`ggml-cuda.cu`（调用点）。
+- 收益：量化启动从每 token 513 次降到约 24 次。
+- 开关：`GGML_MMVQ_Q8_CACHE=0`，`GGML_Q8_PRODUCERS=0`（分项 `_NORM`/`_GNORM`/`_CONT`）。
+
+### 2. 重排权重缓存（各 GEMV 模块共用）
+
+- `ggml_cuda_get_repacked()`：按权重 buffer 缓存重排后的副本，键里包含布局类型；只在非 graph 捕获的首次计算时创建，随 buffer 释放。
+- 副本与原权重同尺寸（或多 1.8%），原权重保留给 prefill 的 MMQ 路径。显存因此增加 4–8 GB。
+
+### 3. IQ3\_S / IQ3\_XXS 模块（`iq3gemv.cuh`、`mmvq-iq3.cu`）
+
+- 布局：无损重排为 IQ3\_S 112 字节/256 权重（GGUF 为 110）、IQ3\_XXS 98 字节/256，取代保留版 134 字节的 4-bit 展开副本，每 token 少读 1.56 GB。
+- 码表放进 LDS，并预先把符号展开（IQ3\_S 32 KB、IQ3\_XXS 16 KB）：每 4 个权重只需一次 ds\_read\_b32 加一次 dot4，没有符号运算。
+- 行按 4 行一组交错，每条读指令读连续 1 KB；再用"步主序"布局，把同一步所有单元的数据放在一起，GPU 只读一个移动窗口。
+- 读取与解码分开，在途数据不参与 ALU 运算。常驻式：104 个 workgroup × 16 wave，每行 16 lane，每 wave 4 行。要求 K%256==0、N%4==0。
+- 尾部：残差加法；融合 SwiGLU gate+up（S+S、XXS+XXS、S/XXS 混合，混合只用于普通 SwiGLU）。
+- 多任务 kernel `gemv_mj`：同为 IQ3 的 qkv+z、k+v 一次启动。
+- 前序：先发码表读取再读激活；码表展开从每字 7 条指令减到 2 条。
+- 收益：17408×5120 IQ3\_S 34.5 µs（1129 GB/s，原 39.6 µs），IQ3\_XXS 32.6 µs（原 46.1 µs）；融合 gate+up 约 1.2 TB/s；模型内 IQ3 总耗时 7.0 → 约 5.5 ms。
+- 开关：`GGML_MMVQ_IQ3=0`（回到 4-bit 展开路径），`_MULTI=0`，`_PF=5`（旧前序），`_SM=0`（旧布局），`_SMALLN=1`（1024 行走旧 kernel，默认关）。
+
+### 4. IQ4\_XS / Q4\_K 模块（`iq4k-gemv.cuh`、`mmvq-iq4k.cu`）
+
+- 布局：同尺寸 SoA，码流（每 256 权重 128 字节）加头信息流（IQ4\_XS 8 字节、Q4\_K 16 字节）。行按 16 字节交错；K=17408 用"轮次分块"布局保持移动窗口。
+- kernel：每 CU 一个常驻 workgroup，激活以 16 字节对齐记录暂存在 LDS；跨行乒乓寄存器流水；IQ4\_NL 查表用 v\_perm。按形状选配置，支持残差尾部和同类型 SwiGLU。
+- ISA 教训：循环里任何条件计算、条件读、写全局内存或中途 break，都会让编译器插入 vmcnt(0)，把流水串行化。
+- 小形状（N≤2048）：k+v 一次启动，沿用 stock 结构保持位精确。
+- 收益：约 −0.8 ms；LM head（Q4\_K 715 MB）775 → 512 µs（1.41 TB/s）。
+- 开关：`GGML_MMVQ_IQ4K=0`，`GGML_MMVQ_IQ4K_GROUP=0`（`_SMALL=0`；`_BIG=1` 可开启大分组，实测更慢），`GGML_MMVQ_IQ4K_X`/`_Q`="L:NW" 覆盖配置。
+
+### 5. 低比特模块（`lowbit-gemv.cuh`、`mmvq-lowbit.cu`）
+
+- 覆盖 IQ2\_S、IQ2\_XS、IQ2\_XXS、Q2\_K、IQ1\_M。同尺寸 SoA：流 A 每 32 权重 8 字节（码表索引 + 转置后的符号位），流 B 为高位/scale，流 C 为每 256 的缩放。
+- 码表放在 LDS 地址 0；符号用 v\_perm 选择字构造，每 4 权重 2 条指令；IQ2\_XXS/XS 的符号奇偶位在寄存器里重建。
+- 收益：独立测试 IQ2\_S 690–896 GB/s、IQ2\_XS 742–796、IQ2\_XXS 701–818、Q2\_K 926–1018、IQ1\_M 680（为 stock 的 2.1–2.7 倍）；模型内 2.8 → 1.2 ms。
+- 开关：`GGML_MMVQ_LOWBIT=0`。
+
+### 6. 融合 Gated DeltaNet 解码（`gdn-decode.cu`、`ggml.h`/`ggml.c`、`ggml-cpu/ops.cpp`、`src/models/qwen35.cpp`）
+
+- 新增两个 ggml op：`GGML_OP_GDN_DECODE_PREP`、`GGML_OP_GDN_DECODE_OUT`，追加在 GGML\_OP\_GLU 之后（GGML\_OP\_COUNT=104）。RPC 协议补丁号 +1，meta 后端和 RPC 都报告不支持。CPU 有参考实现。
+- prep：q/k 卷积 + silu（卷积状态原地移位）、q/k L2 归一化、alpha/beta 的 BF16 投影（每头 2 个长 5120 的点积）、门值计算。
+- out：v 卷积；通过 s\_copy 索引在缓存行里原地读写递归状态并做 delta 规则更新；门控输出 norm（rms\_norm·w·silu(z)）；可选 q8\_1 尾部供 ssm\_out 使用。每头 8 个 block，最后到达的 block 做 norm。
+- 替换了每层 15 个小 kernel 和 2 个 BF16 GEMV，去掉了每层 3 MB 的状态拷贝。与未融合链位精确（归约树、lane 映射、fma 模式全部照抄），`tests/test-gdn-decode.cpp` 对 4 步解码逐位校验。
+- 启用条件：单 token、单序列、n\_rs\_seq==0（无投机回滚快照）、f32 状态、所有相关张量在同一个 CUDA/ROCm 设备、构造前提全部满足；否则回退原图。
+- 精简版：针对 qwen35 形状（H\_k=16、H\_v=48、S=128、卷积 4）的特化 kernel，prep 758→638 条指令，out 755→491 条。
+- 收益：单独 45.7 → 51.5 token/s（约 −2.8 ms）；精简再 +1.2%。
+- 开关：`LLAMA_GDN_FUSED_DECODE=0`，`GGML_GDN_DECODE_SPLIT=0`，`GGML_GDN_DECODE_Q8=0`，`GGML_GDN_DIET=0`（精简版）。
+
+### 7. 注意力层（`rope.cu`、`fattn-common.cuh`、`fattn.cu`、`fattn-dec.cu`、`qwen35.cpp`）
+
+- attn\_prep：q/k 的 rms\_norm+mul、IMROPE、gate 拷贝、K/V 写入缓存合为一个 kernel，每个注意力层 5 次启动变 1 次。需要 qwen35.cpp 让 q/k/v 投影相邻。θ 幂表由捕获外的初始化 kernel 填充。
+- FA 门融合：sigmoid(gate)·attn 及其 q8\_1 在 FA 合并 kernel 里完成。
+- 短上下文 FA 解码（KV≤1024）：单次启动的 split-KV，8 个分块 × kv 头，6 个 GQA 头共享 K/V 读取，kernel 内屏障替代合并 kernel，同时做门和 q8。模型内每层 28.4 → 约 16–17.5 µs。要求整个 grid 同时驻留（8×kv 头数 ≤ CU 数）。
+- 融合的 norm+rope 支持 MROPE/IMROPE（作为回退路径）。
+- 开关：`GGML_CUDA_DISABLE_ATTN_PREP_FUSION=1`，`GGML_CUDA_DISABLE_FA_GATE_FUSION=1`，`GGML_CUDA_FA_DEC=0`，`GGML_CUDA_FA_DEC_MAX_KV`（默认 1024），`GGML_CUDA_FUSED_ROPE_NO_MROPE=1`。
+
+### 8. rms\_norm 与 q8 生产（`q8-producers.cu`、`norm.cu`）
+
+- 一行分给 ne0/256 个 workgroup，每个重做完全相同的整行归约（保证位精确），只写自己的切片和 q8。
+- 代码缩减：直接用 roundf，归约改用 DPP/ds\_swizzle，398 → 308 条指令；模型内每次 5.1 → 4.3 µs。
+- 输出与输入原地重叠时，改用单 workgroup 的原地版本（见第六节缺陷 F1）。
+- 开关：`GGML_Q8_NORM_SMALL=0`，`GGML_Q8_PRODUCERS_NORM=0`。
+
+### 9. 混合模块配对（`mixgemv.cuh`）
+
+- 一个 IQ3 GEMV 和一个 IQ4\_XS/Q4\_K GEMV 共用输入时一次启动：16 对 qkv+z、16 对未融合 gate/up。一个前序暂存码表和两种激活布局，wave 跑完 IQ3 单元直接进入 IQ4 单元。
+- 收益：上下文 0 为 +0.14%（噪声内），8K 为 +0.7%；位精确。
+- 开关：`GGML_MMVQ_MIX=0`，`GGML_MMVQ_MIX_GLU=1`（SwiGLU 尾部，实测慢 1%，默认关）。
+
+### 10. 主机侧与上传（`ggml-backend.cpp`、`ggml-cuda.cu`）
+
+- split 输入异步上传（每个 split 一次同步），小的 H2D 上传合并为一次拷贝加一个分发 kernel。token 之间 GPU 空闲 201 → 约 112 µs。
+- 开关：`GGML_SCHED_SYNC_UPLOADS`，`GGML_CUDA_NO_UPLOAD_BATCH`，`GGML_CUDA_UPLOAD_BATCH_ALTERNATE`。
+
+### 11. GEMV 前序代码缩减（diet-gemv）
+
+- 去掉运行时除法、无用的寄存器清零、多余的地址计算。前序长度：iq3g 132 → 81 条指令，iq4k 189 → 132，配对 kernel 148 → 98。
+- 收益：+1.1%（上下文 0），+0.9%（8K）；位精确。
+
+## 六、正确性验证
+
+最终版本的输出分布与基线的差异，和"只改变计算顺序"造成的差异一样大；代码审查确认的 12 个缺陷已全部修复并独立复核。
+
+**KL 散度测试方法**
+
+- 文本：`eval/ppl.txt`（若干英文技术文档拼接，约 80 KB）。用 llama-perplexity，`-c 512 --chunks 8 -ub 1`：每个 token 都走单 token 解码路径，正好覆盖被优化的代码。
+- 参考 logits 由保留版用 `--kl-divergence-base` 保存在 `eval/ref-logits.bin`；候选版本用 `--kl-divergence` 对比。
+- 噪声底线：保留版本身开 `GGML_CUDA_DISABLE_FUSION=1`（只是换了一种计算顺序），得到平均 KLD 0.00114、top-1 一致 98.82%、困惑度比 1.0013。
+- 这个模型有递归状态，微小的浮点差异会随 token 累积放大，所以困惑度会漂移 0.1–0.4%，贪心输出在接近平局的 token 上会分叉。判断以 KLD 为准。
+
+| 版本 | 平均 KLD | top-1 一致 | 困惑度比 |
+| --- | --- | --- | --- |
+| 噪声底线（保留版关闭融合） | 0.00114 | 98.82% | 1.0013 |
+| 第一次集成（60.1 token/s） | 0.00113 | 98.82% | 1.0035 |
+| v5（72.3 token/s） | 0.00122 | 98.48% | 1.0021 |
+| 最终版本（80.3 token/s） | 0.00125 | 98.78% | 1.0016 |
+
+最终版本的困惑度为 3.8018（基线 3.7981）。各版本间只有重排类改动会改变 KLD；其余改动的 KLD 表逐块完全相同。
+
+**哪些是位精确的**
+
+- 与基线位精确：融合 DeltaNet 算子、q8 生产者、norm、各类尾部融合、异步上传。
+- 只改变 fp32 累加顺序：各 GEMV 模块、短上下文 FA 解码。
+- 更正：attn\_prep 的注释写着位精确，实际约百万分之 1–3 的 K 缓存元素与未融合路径差 1 个 f16 ulp（融合指令内的舍入），已包含在上表 KLD 里。
+
+**贪心输出**
+
+- 3 个提示词（英文散文、Python 代码、中文问答），各生成 128 token，`--temp 0 --ignore-eos`，比较 md5。
+- 最终版本 p1 与基线完全一致；p2、p3 在接近平局的 token 上分叉，内容等价。最终版 md5：p1 `857b01f7…`、p2 `ba86ecd8…`、p3 `9e035710…`。
+
+**服务器模式**
+
+- llama-server，`-c 65536`，分别用 `-np 1` 和 `-np 4`：3 个顺序请求、4 个并发请求、两轮对话的 prompt 缓存复用。全部正常，无崩溃。
+- 与基线输出比较：np=1 有 3/7 个输出完全一致，np=4 有 4/7，其余在 26–93 token 后的平局处分叉。
+
+**代码审查与修复**
+
+三位审查者分别审 GEMV 模块、图级融合与 q8 缓存、DeltaNet 算子，共报 13 个问题。每个问题再由独立反驳者尝试推翻，12 个被确认。修复在分支 fixes，由另一位审查者重新跑所有探针复核：修复前全部复现，修复后全部通过，默认路径仍位精确。
+
+| 编号 | 缺陷 | 触发条件 | 修复 | 验证 |
+| --- | --- | --- | --- | --- |
+| F1 | 多 workgroup 的 rms\_norm+q8 在输出与输入原地重叠时有数据竞争 | **默认路径**：LM head 前的最终 norm 是原地的；GPU 被其他进程占用时触发 | 重叠时改用单 workgroup 原地 kernel，仍产出 q8 | 修复前加干扰 50/50 次出错；修复后 0/1000 |
+| F2 | attn\_prep 在多流并发区域里与 K/V 写入竞争 | `GGML_CUDA_GRAPH_OPT=1` | 并发区域内不做该融合（FA 门融合同理） | 3 次运行输出一致 |
+| F3 | attn\_prep 的 θ 幂表首次发布不安全 | `--no-warmup`、交替加载两个模型 | 捕获外由初始化 kernel 填表；捕获中缺表则自己算 | 首次启动错行 17–29 → 0 |
+| F4 | q8 缓存解引用已失效的张量指针，且从不释放 | 关闭 q8 生产者或关闭融合 | 按值存键，先判有效，按流释放 | SIGSEGV → 正常 |
+| F5 | 非 HIP（CUDA/MUSA）无法编译 | CUDA/MUSA 构建 | 补桩函数、HIP 专用代码加守卫 | clang 语法检查通过（本机无 CUDA 工具链） |
+| F6 | 融合 DeltaNet 路径会被 RPC 设备采用 | `GGML_RPC=ON` 并卸载到远端 | 只在 CUDA/ROCm 后端启用；RPC 报告不支持 | 远端不再崩溃 |
+| F7 | ssm\_alpha/ssm\_beta 类型不同时硬中止 | 其他量化配方 | 构造前提全部前置检查 | 中止 → 正常回退 |
+| F8 | 混合 IQ3 gate/up 融合被用于 GEGLU 等非 SwiGLU | 其他模型 + 混合 IQ3 | 只允许非交换的普通 SwiGLU | NaN → 正确 |
+| F9 | MoE 共享专家匹配器接受混合 IQ3 门 | MoE + 混合 IQ3 | 要求三者同类型 | 中止 → 正确 |
+
+未修项：RPC 服务端拒绝未知 op（需要协议变更）；test-backend-ops 里没有为这些修复加测试用例。
+
+## 七、最终性能与剩余时间分解
+
+最终版本每个 token 的 GPU 节点耗时为 12.27 ms（601 次启动），加上 token 之间 0.11 ms 空闲，对应 80.3 token/s。其中 GEMV 占 10.42 ms，是剩余差距的主体。
+
+**最终 A/B 协议**：A = 保留版（官方 b12110 工具 + 保留版 libggml-hip），B = 最终版本，按 A→B→B→A 顺序。每轮跑 llama-bench 的 decode（上下文 0 和 8192，`-r 2`）和 prefill（512/2048/8192），每轮前等 GPU 降温，峰值温度 73°C。decode 四轮分别为 45.77、80.07、80.59、45.49 token/s，汇总见第一节的表。
+
+**每 token 节点耗时**（在每个 graph 节点后插入 GPU 时间戳 kernel 测得，扣除时间戳 kernel 自身 2.1 µs，30 个 token 平均）
+
+| 节点 | 启动/token | 耗时 | 说明 |
+| --- | --- | --- | --- |
+| FFN gate（含融合 gate+up、混合配对） | 64 | 3.57 ms | 融合的每次约 62.8 µs |
+| FFN down + 残差 | 64 | 2.42 ms | 每次约 37.8 µs |
+| 线性注意力 qkv（含合并的 z） | 48 | 1.44 ms |  |
+| ssm\_out + 残差 | 48 | 0.88 ms |  |
+| 未融合的 FFN up | 17 | 0.55 ms |  |
+| LM head（Q4\_K，0.715 GB） | 1 | 0.51 ms | 1.41 TB/s，已接近上限 |
+| 注意力 q/o/k/v 与单独的 z | 66 | 1.05 ms |  |
+| **GEMV 合计** | — | **10.42 ms** | 平均 1.09 TB/s，约为读取底线模型的 79% |
+| rms\_norm（含 q8） | 129 | 0.62 ms | 每次 4.8 µs |
+| DeltaNet prep + out | 96 | 0.72 ms |  |
+| FA + 门 | 16 | 0.29 ms |  |
+| attn\_prep、SwiGLU 等 | 49 | 0.20 ms |  |
+| **非 GEMV 合计** | — | **1.85 ms** |  |
+| token 之间空闲 | — | 0.11 ms | 主机侧采样、上传、graph 启动 |
+
+要到 90 token/s（11.1 ms）还需省 1.35 ms。若 GEMV 达到读取底线模型的 90%（约 9.2 ms），再把非 GEMV 压到 1.5 ms 以下，就能达到。为什么这两步难，见第八、九节。
+
+## 八、试过但无效或放弃的方案
+
+下面这些方向都已实测，收益为零、为负或不值得复杂度；继续研究时可以直接跳过，或换一种思路。
+
+| 方案 | 实测结果 | 原因或备注 |
+| --- | --- | --- |
+| 多流并发（`GGML_CUDA_GRAPH_OPT=1`） | 69.8 vs 72.3 token/s，更慢 | 会关掉部分融合，跨流同步代价大 |
+| 关闭 HIP graph | 慢 1.5–1.7 ms/token | graph 回放显著降低启动开销，必须保留 |
+| `HIP_FORCE_DEV_KERNARG=1` | 无变化 | graph 回放已把 kernel 参数放在显存 |
+| GEMV 内部自行量化 fp32 输入（常驻 kernel） | IQ3/IQ4\_XS/IQ2 均更慢，只有 LM head 受益 | 每个 workgroup 重复量化，前序变长；改为生产者侧写 q8 |
+| 融合 gate+up 的 kernel 顺便写自己输出的 q8 | 原子版 −0.2 token/s；自旋等待版 +0.1% | kernel 末尾的栅栏/原子链约 3.8 µs，超过省下的一次量化启动（约 3.1 µs） |
+| 混合配对 kernel 加 SwiGLU+q8 尾部 | −1%（74.84 vs 75.63） | 同上，完成序列约 5 µs，单独的 swiglu\_q8 只要约 3 µs |
+| 把 rms\_norm 放进 GEMV 前序 | −1.3%，且不再位精确 | 每个 workgroup 重做归约，前序变长 |
+| 大 GEMV 分组（q+k+v、qkv+z、混合 gate+up 的通用任务表 kernel） | 连续启动时每组省 4.8–9.5 µs，graph 回放中反而多 110 µs/token | graph 回放里大 GEMV 几乎没有固定开销可省；合并两个大 GEMV 只省约 0.4 µs |
+| 软件流水、stream-K、批量读、激活放 VGPR、每 CU 2–4 个 workgroup、R=2、每项 4 个子块 | IQ3/IQ4K/低比特模块均持平或更慢 | 稳态循环已接近读取速率（约 1.26–1.5 TB/s），瓶颈在头尾 |
+| K 分割（split-K）处理 1024 行小矩阵 | 无收益 | 合并开销抵消并行度收益 |
+| 调度类：动态/配对 workgroup、提高 wave 优先级、旋转循环、均匀循环、展平行映射 | 全部无收益 | 尾部不均来自硬件偏爱老 wave，软件很难绕开 |
+| 预取下一个 GEMV 的前几步到 L2、提前读残差 | 无变化 | L2 冷启动不是瓶颈 |
+| 在前序里预取第一项权重（各种 PF 变体） | −0.65% 或持平 | 条件预取会引入 vmcnt(0) 串行化 |
+| ssm\_out 前 DeltaNet 状态的 L2 脱脏写回（非时间性存储、buffer\_wbl2） | 无效 | ssm\_out 因此每次多 2.2–3.0 µs（约 120 µs/token），gfx90a 上无解 |
+| DeltaNet 单次启动变体（冗余 prep 或带就绪标志的票号排序） | 无收益 |  |
+| DeltaNet prep 放到侧流与 z 投影重叠 | 49.1 vs 51.9 token/s，更慢 | 跨流同步约 13 µs |
+| DeltaNet 精简版的"预热指令缓存"变体 | 噪声内 | 保留为 `GGML_GDN_DIET=2/3`，默认不用 |
+| MFMA 单次启动的解码注意力（两个版本） | 热测 11.2 vs 12.5 µs 更快，模型内 29.7/33.0 vs 26.0 µs 更慢 | 代码更长，冷指令缓存代价更大 |
+| GQA 专用解码 FA kernel | 模型内比 tile kernel 慢 | 已删除 |
+| 新 FA 解码用于 KV>1024 | 1024 时持平，更长更慢 | 默认上限 1024，更长走 tile 路径 |
+| 更小线程块（256/512）的 norm | 模型内更慢 |  |
+| 零拷贝上传分发、推迟上传 flush | token 周期变化 ≤ 10 µs |  |
+| 我最初的朴素 SoA 常驻原型（IQ3） | 比 LDS 码表版慢 | LDS bank 冲突、在途读取太少 |
+| 11 月 5 日旧实验：q8 求和融合、SiLU+q8 融合、CDNA2 线程布局 | +0.6%、+0.4%、+1.9%（后者非位精确） | 当时未保留；本次该方向已被生产者侧 q8 取代 |
+
+## 九、关键经验与硬件行为发现
+
+最重要的一条经验：在模型里测，而不是在热的微基准里测。很多"微基准更快"的 kernel 放进模型后反而更慢。
+
+1. **冷指令缓存**：模型内每次 kernel 派发都从冷的指令缓存开始，关键路径上每条指令约 8–13 ns。同一算法的 FA 解码：4714 条指令 76.5 µs，1427 条 33 µs，847 条 17.4 µs。norm 从 398 条减到 308 条，5.1 → 4.35 µs。
+2. **剖析工具失真**：rocprofv3 把任何小 kernel 都显示为 ≥ 4.3 µs，并把 graph 回放拖成 CPU 瓶颈（每节点约 47 µs）。小 kernel 的真实成本约 1.3–1.9 µs。GEMV 的 trace 时长可信（±3%），小 kernel 要用 graph 内 GPU 时间戳测。
+3. **graph 回放中的启动成本**：两个 GEMV 之间插一个额外 kernel，无论形状约多 3.5 µs；连续排列的额外 kernel 每个只约 0.7 µs。合并两个大 GEMV 只省约 0.4 µs；分组只对小 GEMV 或前序很重的模块（IQ3 的 LDS 码表）划算。
+4. **把小 kernel 吸进常驻 GEMV 不划算**：常驻 kernel 末尾的完成序列（栅栏、原子计数）约 3.8–5 µs，比它省下的那次启动还贵。
+5. **码表类量化（IQ*）*\*：码表放全局内存时受查表延迟限制，只有带宽上限的 25–30%。码表放 LDS 快 2.3 倍。GGUF 里 66/74/82/98/110 字节的块只有 2 字节对齐，只读不算也只有 650–800 GB/s，必须重排成宽而合并的读取。
+6. **DRAM 局部性**：每个 wave 各自顺序读一大片分散地址时只有 1.16 TB/s；所有 wave 共同推进一个移动窗口可达 1.42 TB/s。这就是"步主序"和"轮次分块"布局的来源。
+7. **尾部不均**：硬件调度器偏爱老 wave，同一 CU 上两个 workgroup 的第二个晚 3–6 µs 结束。稳态循环本身已接近读取速率，损失主要在启动、前序和尾部。
+8. **编译器与 ISA**：循环里的条件读、条件计算、全局写或 break，会让编译器插入 vmcnt(0) 等全部读完，流水归零。改 kernel 后要看反汇编。
+9. **前一个 kernel 的脏 L2 行**：DeltaNet 写完 3 MB 状态后，紧接的 ssm\_out GEMV 要替它写回，每次多 2–3 µs。
+10. **递归模型的数值特性**：纯计算重排就会让困惑度漂 0.1–0.4%、贪心输出在平局处分叉；不要用困惑度或贪心 md5 判断正确性，用 KLD 对照噪声底线。
+11. **功耗与时钟**：decode 时 220–245 W（上限 300 W），核心稳定 1700 MHz，不受功耗限制。
+12. **并发与 prefill 不受影响**：所有改动只针对 ne11==1（单 token），prefill 和多序列批次走原路径。
+
+## 十、剩余差距与后续研究方向
+
+到 90 token/s 还差每 token 1.35 ms；单项调优已接近收敛，最有希望的是结构性改动——把整个 FFN 合成一个常驻 kernel。
+
+| 优先级 | 方向 | 预计收益 | 难度/风险 | 说明 |
+| --- | --- | --- | --- | --- |
+| 1 | 常驻 FFN kernel：gate/up → SwiGLU → down 一次启动，中间用轻量的全网格同步 | 0.3–0.6 ms（估计） | 高 | 每层省 1–2 个启动边界和一次前序/尾部。风险：网格同步本身可能要 3–5 µs（见第九节第 4 条），寄存器压力、整个 grid 必须同时驻留 |
+| 2 | 继续缩减关键路径指令数 | 0.1–0.2 ms | 低 | 未做：低比特模块和 iq4k 小形状 kernel 的前序；attn\_prep（约 1200 条指令）；DeltaNet prep 里约 20 条地址计算和 log1pf（约 130 条，不能位精确地缩短） |
+| 3 | 融合 gate+up 之后的 ffn\_down 仍需单独量化 | 约 0.1 ms | 中 | 31 个节点每个多 3.1–4.5 µs。融合 kernel 自己写 q8 的尝试因完成序列太贵而失败，需要更便宜的办法 |
+| 4 | 长上下文 FA 解码（KV > 1024） | 8K 时约 0.3–0.5 ms，32K 更多 | 中 | 现在 8K 为 74.6、32K 为 64.4 token/s。新 kernel 在 KV>1024 时输给 tile 路径，可试预取和更多分块 |
+| 5 | 缓解尾部不均 | 若可解约 0.2–0.5 ms | 高 | 已试多种调度方案均无效；可考虑按硬件偏好有意分配不等量工作 |
+| 6 | 多序列并发解码（M=2–8） | 对服务器吞吐很大 | 中 | 本次优化只覆盖 M=1；4 个并发请求时总吞吐仍约 75 token/s，与基线相同。把各 GEMV 模块扩展到小 M 即可受益 |
+| 7 | MTP / 投机解码 | 可超过 90 token/s | 中 | 不在本次范围。验证阶段是 M=4 的 GEMV，仍用 stock kernel；把新模块扩展到 M=4 后再开 MTP，收益会叠加 |
+| 8 | 去掉重复的权重副本 | 显存 −4–8 GB | 中 | prefill 的 MMQ 仍读原布局；若 MMQ 能读重排布局，就只需一份权重 |
+
+建议从第 2 项入手（低风险、快速见效），第 1 项作为主要研究方向先做原型：先在微基准里测一次网格同步在模型内的真实代价。
+
+## 十一、操作手册
+
+以下命令都在服务器宿主机 `/data/tools/mi210-opt` 下执行；用 GPU 的一律套 `gpu-run.sh`。
+
+**新开分支与编译**
+
+```bash
+cd /data/tools/mi210-opt/src && git worktree add -b mybranch /data/tools/mi210-opt/wt-mybranch mi210-final
+docker exec mi210-opt bash -lc "PAR=12 /lab/build-wt.sh /lab/wt-mybranch /lab/wt-mybranch/build ggml-hip llama-bench llama-perplexity llama-completion llama-server"
+```
+
+新增 `.cu` 文件后必须重新配置：`docker exec mi210-opt bash -lc "cmake /lab/wt-mybranch/build"`，再编译。首次完整编译约 6–10 分钟。
+
+**测速与评估**
+
+| 任务 | 命令（宿主机） | 输出 |
+| --- | --- | --- |
+| decode 测速 | `./gpu-run.sh t1 "/lab/bench.sh /lab/wt-mybranch/build/bin t1 -d 0,8192"` | `results/bench/t1.jsonl` |
+| KLD 对比基线 | `./gpu-run.sh k1 "/lab/eval/kld.sh /lab/wt-mybranch/build/bin t1"` | `results/kld-t1/kld.log` |
+| 困惑度 + 贪心 md5 | `./gpu-run.sh e1 "/lab/eval/eval.sh /lab/wt-mybranch/build/bin t1"` | `results/eval-t1/` |
+| 服务器测试 | `./gpu-run.sh s1 "python3 /lab/eval/server_test.py /lab/wt-mybranch/build/bin t1 4 8090"` | `results/server-t1-np4.json` |
+| 完整 decode + prefill | `./gpu-run.sh f1 "/lab/final-run.sh /lab/wt-mybranch/build/bin t1"` | `results/final/t1-*.jsonl` |
+
+运行环境保持 `CODEX_IQ3_PREPACK=1 CODEX_IQ3_XXS_PREPACK=1`（脚本已默认设置）。用环境变量做 A/B 时，在 `gpu-run.sh` 前导出变量即可透传。
+
+**剖析**
+
+- kernel trace：在容器里用 `/opt/rocm/bin/rocprofv3 --kernel-trace --output-format csv --output-directory <目录> -- <llama-bench ... -n 32 -r 1>`，再用 `python3 /lab/results/quick_trace.py <csv>` 按 LM head 切分 token 并按 kernel 汇总。小 kernel 的时长会被夸大。
+- 模型内真实节点耗时：把 `results/attn-misc-gpu-timestamps.patch` 打到一个单独的 worktree（已有 `wt-ts`），编译后用 `GGML_CUDA_TS=1 GGML_CUDA_TS_DUMP=60 GGML_CUDA_TS_OUT=<前缀>` 跑 llama-bench，再用 `python3 results/attn-misc-ts.py <前缀> 30 full` 分析。该补丁不要合进正式版本。
+- GEMV 微基准：`gemv/gemv_bench.hip` 与各模块自己的基准（`gemv/iq3/iq3_bench.hip`、`gemv/iq4k/iq4k_bench.hip`、`gemv/lowbit/lowbit_bench.hip`），用真实权重 `gemv/w/*.bin`，编译参数：`hipcc -O3 --offload-arch=gfx90a -std=c++17 -DGGML_USE_HIP -I/lab/src/ggml/include -I/lab/src/ggml/src -I/lab/src/ggml/src/ggml-cuda`。记住微基准是热的，结论要在模型内复核。
+
+**启动优化版 llama-server**
+
+```bash
+/data/tools/mi210-opt/deliver/llama-server-mi210.sh -m /data/model/Qwen3.8-27B-GSQ-RCO-GGUF/Qwen3.8-27B-GSQ-RCO-IQ3_S-mtp.gguf -ngl 999 -fa on -c 65536 -np 1 --port 8080
+```
+
+**常见坑**
+
+- 新 `.cu` 文件不重新配置 cmake：libggml-hip.so 有未定义符号，加载失败，报 `invalid device: ROCm0`。
+- 二进制依赖编译时路径 `/lab/...` 查找 CPU 后端：必须把工作区挂在容器的 `/lab`，否则报 `no CPU backend found`。
+- 一个分支曾用 CRLF 行尾提交，整个文件变成冲突：只提交 LF，合并时用 `-X ignore-space-at-eol`。
+- 重复出现的冲突点：`ggml-cuda.cu` 里 `ggml_cuda_try_fuse` 的各融合入口（FA 门、BF16 尾部、混合配对、iq4k 分组、attn\_prep，顺序有意义）、`q8-producers.cu` 的 norm kernel、`mixgemv.cuh` 的 gemv\_pair 模板参数。两边都要保留，结构要手工核对。
+- 服务器上还有其他业务容器：不要按镜像名批量 `docker stop`（曾因此误停 mi210-opt），测试容器请用固定名字。
+- GPU 与其他作业共享时噪声约 ±1%：只信交替进行的 A/B。
+- `llama-completion` 不加 `-c` 会按模型最大上下文 262144 分配 KV，显存峰值会到 40 GB，属正常。
+
+## 附录：开关、文件、分支
+
+代码在服务器仓库 `/data/tools/mi210-opt/src`，最终版本为标签 `mi210-final`；相对保留版改动 39 个文件、+12,493/−79 行、86 个提交，完整补丁为 `deliver/mi210-final-vs-retained.patch`。
+
+**环境变量开关**（未注明的默认都是开，设为 0 关闭）
+
+| 变量 | 默认 | 作用 |
+| --- | --- | --- |
+| `LLAMA_GDN_FUSED_DECODE` | 开 | 融合 DeltaNet 解码；0 回到原图 |
+| `GGML_GDN_DIET` | 1 | 0 用通用 GDN kernel；2/3 为预热变体 |
+| `GGML_GDN_DECODE_SPLIT` / `GGML_GDN_DECODE_Q8` | 开 | out kernel 每头拆分多 block / 产出 ssm\_out 的 q8 |
+| `GGML_MMVQ_Q8_CACHE` | 开 | q8 激活缓存 |
+| `GGML_Q8_PRODUCERS`（`_NORM`/`_GNORM`/`_CONT`） | 开 | 生产者侧写 q8 |
+| `GGML_Q8_NORM_SMALL` | 开 | 小代码版 norm kernel |
+| `GGML_MMVQ_IQ3` | 开 | IQ3 模块；0 回到 4-bit 展开路径 |
+| `GGML_MMVQ_IQ3_MULTI` / `_SM` / `_PF` | 开 / 开 / 7 | 同输入合并 / 步主序布局 / 前序顺序（5 为旧版） |
+| `GGML_MMVQ_IQ3_SMALLN` | 关 | 1024 行改走旧 kernel |
+| `GGML_MMVQ_IQ4K` / `_GROUP` | 开 | IQ4\_XS/Q4\_K 模块 / 分组（`_SMALL`、`_BIG`；后者默认关） |
+| `GGML_MMVQ_IQ4K_X` / `_Q` | — | 覆盖 IQ4\_XS/Q4\_K 的 "L:NW" 配置 |
+| `GGML_MMVQ_LOWBIT` | 开 | 低比特模块 |
+| `GGML_MMVQ_MIX` / `_ORD` / `_GLU` | 开 / 开 / 关 | 混合配对 / 其前序顺序 / SwiGLU 尾部 |
+| `GGML_MMVQF`（`_Q4K`、`_IQ4XS`、`_COOP`） | 1 | 早期的常驻自量化 kernel；2 为全部类型，`_IQ4XS` 为实验选项 |
+| `GGML_MMVF_THIN` / `GGML_MMVF_EPI` | 开 | BF16 细矩阵 kernel / 其尾部融合（开启融合 DeltaNet 时不会触发） |
+| `GGML_CUDA_DISABLE_ATTN_PREP_FUSION` | 关 | 设 1 关闭 attn\_prep |
+| `GGML_CUDA_DISABLE_FA_GATE_FUSION` | 关 | 设 1 关闭 FA 门融合 |
+| `GGML_CUDA_FA_DEC` / `GGML_CUDA_FA_DEC_MAX_KV` | 开 / 1024 | 短上下文 FA 解码及其 KV 长度上限 |
+| `GGML_CUDA_FUSED_ROPE_NO_MROPE` | 关 | 设 1 时 norm+rope 融合不覆盖 MROPE/IMROPE |
+| `GGML_SCHED_SYNC_UPLOADS` / `GGML_CUDA_NO_UPLOAD_BATCH` | 关 | 设 1 回到同步上传 / 不合并小上传 |
+| `GGML_CUDA_ATTN_PREP_VERIFY`、`GGML_GDN_DECODE_Q8_SELFTEST`、`GGML_MMVQ_MIX_EMPTY*` 等 | 关 | 调试与标定用 |
+| `CODEX_IQ3_PREPACK` / `CODEX_IQ3_XXS_PREPACK` | 需设 1 | 保留版补丁的开关；所有测量都在 =1 下进行 |
+
+**新增文件**（均在 `ggml/src/ggml-cuda/`，另有 `tests/test-gdn-decode.cpp`）
+
+| 文件 | 内容 |
+| --- | --- |
+| `iq3gemv.cuh`、`mmvq-iq3.cu` | IQ3 模块 |
+| `iq4k-gemv.cuh`、`mmvq-iq4k.cu` | IQ4\_XS/Q4\_K 模块 |
+| `lowbit-gemv.cuh`、`mmvq-lowbit.cu` | 低比特模块 |
+| `mixgemv.cuh` | 混合 IQ3+IQ4 配对 kernel |
+| `mmvq-fused.cu`、`mmvq-fused.cuh`、`mmvq-fused-host.cuh` | 早期常驻 GEMV 框架与各模块入口声明 |
+| `q8-producers.cu` | q8 生产者 kernel（norm、SwiGLU、门、门控 norm） |
+| `gdn-decode.cu`、`gdn-decode.cuh` | 融合 DeltaNet 解码 kernel |
+| `fattn-dec.cu`、`fattn-dec.cuh` | 短上下文 FA 解码 |
+
+**修改的主要文件**：`ggml-cuda.cu`（融合入口、重排缓存、上传合并）、`mmvq.cu`、`mmvf.cu`、`rope.cu`（attn\_prep）、`fattn-common.cuh`/`fattn.cu`、`norm.cu`、`iq3-repack.cuh`、`ggml.h`/`ggml.c`（新 op）、`ggml-cpu/ops.cpp`、`ggml-backend.cpp`（异步上传）、`ggml-rpc`、`ggml-backend-meta.cpp`、`src/models/qwen35.cpp`、`tests/test-backend-ops.cpp`。
+
+**分支与标签**
+
+- `master`：保留版源码（对照基线）。
+- 标签：`int-v8-base`（74.0 token/s）、`int-v9`（76.0）、`int-v11`（78.0）、`mi210-final`（80.3，等于分支 final）。
+- 工作分支：gemv、deltanet、attn、gemv-iq3、gemv-iq4k、iq3-r3、iq4k-r3、r4-mixgroup、r4-ffndown、r4-attn、fixes、diet-gdn、diet-gemv、integration，内容都已合入 final。低比特、IQ3、IQ4K 模块各自还有独立开发仓库（`gemv/lowbit`、`gemv/iq3`、`gemv/iq4k`），含基准和实验变体。
+- `wt-ts`：打了时间戳补丁的剖析版本（游离 HEAD），不要当正式版本用。

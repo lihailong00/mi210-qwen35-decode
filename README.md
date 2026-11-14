@@ -1,134 +1,74 @@
-# llama.cpp
+# mi210-qwen35-decode
 
-![llama](https://raw.githubusercontent.com/ggml-org/llama.brand/refs/heads/master/cover/llama-cpp/cover-llama-cpp-dark.svg)
+在单张 AMD Instinct MI210（gfx90a，ROCm 7.2.1）上，把 llama.cpp b12110 跑 Qwen3.8-27B-GSQ-RCO-IQ3_S-mtp.gguf（架构 qwen35）的单流解码（不开 MTP）从 **45.6 提升到 80.3 token/s（+76%）**。同一个 GGUF，没有重新量化或降精度；与基线 logits 的 KL 散度处在纯计算重排的噪声底线上。
 
-<div align="center">
+| 指标 | 基线（保留版） | 本仓库 | 变化 |
+| --- | --- | --- | --- |
+| decode tg128，上下文 0 | 45.6 token/s | 80.3 token/s | +76% |
+| decode tg128，上下文 8192 | 44.2 | 74.6 | +69% |
+| decode tg128，上下文 32768 | 40.7 | 64.4 | +58% |
+| prefill pp8192 | 1220 | 1245 | 未退化 |
+| llama-server 单请求 | 45.6 | 79.1 | +73% |
+| 每 token kernel 启动数 | 1933 | 601 | −69% |
+| 显存峰值 | 24.1 GB | 28–32 GB | 重排权重副本 |
 
-<b>LLM inference in C/C++</b>
+原定目标 90 token/s 未达到。原因分析、全部优化细节、失败的尝试和后续方向见 [docs/HANDOVER.md](docs/HANDOVER.md)。
 
-[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](https://opensource.org/licenses/MIT)
-[![Release](https://img.shields.io/github/v/release/ggml-org/llama.cpp?filter=v*&color=brightgreen)](https://github.com/ggml-org/llama.cpp/releases?q=tag:v0)
-[![Nightly](https://img.shields.io/github/v/release/ggml-org/llama.cpp?label=nightly&filter=b*&color=orange)](https://github.com/ggml-org/llama.cpp/releases?q=b)
-[![Server](https://img.shields.io/github/actions/workflow/status/ggml-org/llama.cpp/server.yml?label=Server)](https://github.com/ggml-org/llama.cpp/actions/workflows/server.yml)
-[![Docker](https://img.shields.io/github/actions/workflow/status/ggml-org/llama.cpp/docker.yml?label=Docker)](https://github.com/ggml-org/llama.cpp/actions/workflows/docker.yml)
-[![Winget](https://img.shields.io/github/actions/workflow/status/ggml-org/llama.cpp/winget.yml?label=Winget)](https://github.com/ggml-org/llama.cpp/actions/workflows/winget.yml)
+## 分支与标签
 
-[ggml](https://github.com/ggml-org/ggml) / [ops](https://github.com/ggml-org/llama.cpp/blob/master/docs/ops.md) / [maintainer PRs](https://github.com/ggml-org/llama.cpp/pulls?q=is%3Apr%20is%3Aopen%20draft%3AFalse%20(author%3Asanmai%20OR%20author%3Argerganov%20OR%20author%3AKitaitiMakoto%20OR%20author%3Adanbev%20OR%20author%3Aaldehir%20OR%20author%3Amax-krasnyansky%20OR%20author%3ACISC%20OR%20author%3Aggerganov%20OR%20author%3Aam17an%20OR%20author%3Ajhen0409%20OR%20author%3Abartowski1182%20OR%20author%3Anikwen%20OR%20author%3Ahipudding%20OR%20author%3Aravi9%20OR%20author%3AServeurpersoCom%20OR%20author%3Athelittlefireman%20OR%20author%3Apwilkin%20OR%20author%3Areeselevine%20OR%20author%3Angxson%20OR%20author%3Ajeffbolznv%20OR%20author%3Amarty1885%20OR%20author%3A0cc4m%20OR%20author%3ATitaniumtown%20OR%20author%3Aangt%20OR%20author%3AIMbackK%20OR%20author%3Aarthw%20OR%20author%3AJohannesGaessler%20OR%20author%3AORippler%20OR%20author%3Aruixiang63%20OR%20author%3Axctan%20OR%20author%3AmasterFoad%20OR%20author%3Aallozaur%20OR%20author%3AAndreas-Krebbel%20OR%20author%3Ayomaytk%20OR%20author%3Aaendk%20OR%20author%3Awine99%20OR%20author%3Agaugarg-nv%20OR%20author%3Ataronaeo%20OR%20author%3Aforforever73%20OR%20author%3Achaxu01%20OR%20author%3Alhez%20OR%20author%3AAlekseiNikiforovIBM%20OR%20author%3Anetrunnereve%20OR%20author%3Afairydreaming%20OR%20author%3Aynankani)%20sort%3Aupdated-desc) / [dev stats](https://github.com/ggml-org/llama.cpp-dev) / [lib llama API](https://github.com/ggml-org/llama.cpp/issues/9289) / [llama-server REST API](https://github.com/ggml-org/llama.cpp/issues/9291)
+- `main`：最终版本的代码（= 标签 `mi210-final`）加本说明、交接文档和实验脚本。
+- `baseline`：对照基线，即 llama.cpp b12110（提交 cd959bae）+ ROCm 7.2 兼容补丁 + IQ3_S/IQ3_XXS 4-bit 展开补丁（"保留版"）。`git diff baseline main` 就是全部优化。
+- 标签 `int-v8-base`（74.0 token/s）、`int-v9`（76.0）、`int-v11`（78.0）、`mi210-final`（80.3）为中间集成节点。
 
-</div>
+本仓库没有 llama.cpp 的上游提交历史；基线是一次性导入的源码快照。
 
-## Quick start
+## 编译
 
-A few options to get `llama.cpp` installed on your machine:
+需要 ROCm 7.2.x（hipcc/clang）、CMake ≥ 3.28、Ninja。示例（与实验时的配置相同）：
 
 ```bash
-# curl
-curl -LsSf https://llama.app/install.sh | sh
-
-# powershell
-irm https://llama.app/install.ps1 | iex
+cmake -S . -B build -G Ninja \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DCMAKE_HIP_COMPILER=/opt/rocm/llvm/bin/clang++ -DCMAKE_HIP_COMPILER_ROCM_ROOT=/opt/rocm \
+  -DAMDGPU_TARGETS=gfx90a -DGPU_TARGETS=gfx90a -DGGML_HIP=ON \
+  -DBUILD_SHARED_LIBS=ON -DGGML_BACKEND_DL=ON -DGGML_NATIVE=OFF -DGGML_CPU_ALL_VARIANTS=OFF \
+  -DGGML_HIP_GRAPHS=ON -DGGML_HIP_MMQ_MFMA=ON -DGGML_HIP_NO_VMM=ON -DGGML_HIP_RCCL=OFF \
+  -DGGML_CUDA_FA=ON -DGGML_CUDA_FA_ALL_QUANTS=OFF "-DGGML_CUDA_FA_QUANTS=q4_0-q4_0;q8_0-q8_0;f16-f16;bf16-bf16" \
+  -DLLAMA_BUILD_TOOLS=ON -DLLAMA_BUILD_SERVER=ON -DLLAMA_BUILD_TESTS=ON -DLLAMA_BUILD_UI=OFF
+cmake --build build --target ggml-hip llama-bench llama-perplexity llama-completion llama-server --parallel 16
 ```
 
-- Visit https://llama.app and follow the instructions
-- Run with Docker - see our [Docker documentation](docs/docker.md)
-- Download pre-built binaries from the [releases page](https://github.com/ggml-org/llama.cpp/releases)
-- Build from source by cloning this repository - check out [our build guide](docs/build.md)
+HIP 源文件在 configure 时按通配符收集：新增 `.cu` 文件后必须重新运行 cmake，否则 libggml-hip.so 加载失败（报 `invalid device: ROCm0`）。
 
-Once installed:
+## 运行
 
-```sh
-# Download and run a model directly from Hugging Face
-llama cli -hf ggml-org/Qwen3.5-0.8B-GGUF
+所有测量都在下面的环境变量下进行（基线补丁的开关；新的 IQ3 路径优先，旧路径作为回退）：
 
-# Launch OpenAI-compatible API server
-llama serve -hf ggml-org/Qwen3.5-0.8B-GGUF
+```bash
+export CODEX_IQ3_PREPACK=1 CODEX_IQ3_XXS_PREPACK=1
+./build/bin/llama-bench -m Qwen3.8-27B-GSQ-RCO-IQ3_S-mtp.gguf -ngl 999 -fa on -b 4096 -ub 4096 -ctk f16 -ctv f16 -p 0 -n 128 -r 2
+./build/bin/llama-server -m Qwen3.8-27B-GSQ-RCO-IQ3_S-mtp.gguf -ngl 999 -fa on -c 65536 -np 1 --host 127.0.0.1 --port 8080
 ```
 
-<table align="center">
-    <tr>
-        <td align="center" width=50%>
-            <img width="1310" height="888" alt="VLM session with `llama cli`" src="https://github.com/user-attachments/assets/88726b48-1713-48aa-a525-95a02e78afc4" />
-            <i>VLM session with <b>llama cli</b></i>
-        </td>
-        <td align="center">
-            <img width="1392" height="958" alt="Built-in web UI against `llama serve` running Qwen 3.6" src="https://github.com/user-attachments/assets/b402f972-2e32-4def-8771-8d849f08cf2e" />
-            <i>Built-in web UI against <b>llama serve</b></i>
-        </td>
-    </tr>
-<table>
+每项优化都有关闭开关（例如 `LLAMA_GDN_FUSED_DECODE=0`、`GGML_MMVQ_IQ3=0`），完整列表见交接文档附录。
 
-## Description
+## 适用范围
 
-The main goal of `llama.cpp` is to enable LLM (and VLM) inference with minimal setup and state-of-the-art performance on
-a wide range of hardware - locally and in the cloud.
+- 只优化 HIP / CDNA2（gfx90a）上的单 token、单序列解码；其他 GPU 和多序列批次走原代码路径。
+- 融合 DeltaNet 算子只用于 qwen35 架构、单序列、未开启投机回滚的情况，其余自动回退。
+- CUDA/MUSA 构建的修复只做过 clang 语法检查，未在 NVIDIA 平台编译测试。
 
-- Plain C/C++ implementation without any dependencies
-- Apple silicon is a first-class citizen - optimized via ARM NEON, Accelerate and Metal frameworks
-- AVX, AVX2, AVX512 and AMX support for x86 architectures
-- RVV, ZVFH, ZFH, ZICBOP and ZIHINTPAUSE support for RISC-V architectures
-- 1.5-bit, 2-bit, 3-bit, 4-bit, 5-bit, 6-bit, and 8-bit integer quantization for faster inference and reduced memory use
-- Custom CUDA kernels for running LLMs on NVIDIA GPUs (support for AMD GPUs via HIP and Moore Threads GPUs via MUSA)
-- Vulkan and SYCL backend support
-- CPU+GPU hybrid inference to partially accelerate models larger than the total VRAM capacity
+## 实验工具
 
-The `llama.cpp` project is build on top of the [ggml](https://github.com/ggml-org/ggml) library.
+`mi210-tools/` 收录实验时用的脚本（路径按原实验环境写死，使用前需按自己的目录修改）：
 
-## Supported backends
+- `gpu-run.sh`：用 flock 串行化 GPU 作业，记录温度与显存，85°C 中止。
+- `build-wt.sh`、`bench.sh`、`final-run.sh`、`merge-int.sh`：编译、测速、A/B、分支合并。
+- `eval/`：KL 散度（`kld.sh`）、困惑度与贪心输出（`eval.sh`）、服务器测试（`server_test.py`）、提示词。困惑度文本为 llama.cpp 仓库中 `README.md docs/build.md docs/function-calling.md docs/multimodal.md` 依次拼接。
+- `profiling/`：rocprofv3 trace 汇总脚本、graph 内 GPU 时间戳补丁（剖析专用，不要合入正式版本）及其分析脚本。
+- `gemv-bench/`：用真实权重测 GEMV kernel 的独立微基准。
+- `llama-server-mi210.sh`：在容器里启动服务器的示例脚本。
 
-| Backend | Target devices |
-| --- | --- |
-| [BLAS](docs/build.md#blas-build) | All |
-| [BLIS](docs/backend/BLIS.md) | All |
-| [CANN](docs/build.md#cann) | Huawei Ascend NPU |
-| [CUDA](docs/build.md#cuda) | Nvidia GPU |
-| [HIP](docs/build.md#hip) | AMD GPU |
-| [Hexagon](docs/backend/snapdragon/README.md) | Snapdragon |
-| [IBM zDNN](docs/backend/zDNN.md) | IBM Z & LinuxONE |
-| [MUSA](docs/build.md#musa) | Moore Threads GPU |
-| [Metal](docs/build.md#metal-build) | Apple Silicon |
-| [OpenCL](docs/backend/OPENCL.md) | Adreno GPU |
-| [OpenVINO [In Progress]](docs/backend/OPENVINO.md) | Intel CPUs, GPUs, and NPUs |
-| [RPC](https://github.com/ggml-org/llama.cpp/tree/master/tools/rpc) | All |
-| [SYCL](docs/backend/SYCL.md) | Intel GPU |
-| [VirtGPU](docs/backend/VirtGPU.md) | VirtGPU APIR |
-| [Vulkan](docs/build.md#vulkan) | GPU |
-| [WebGPU](docs/build.md#webgpu) | All |
-| [ZenDNN](docs/build.md#zendnn) | AMD CPU |
+## 许可
 
-## Documentation
-
-#### Tools
-
-- [cli](tools/cli/README.md)
-- [completion](tools/completion/README.md)
-- [server](tools/server/README.md)
-- [GBNF grammars](grammars/README.md)
-
-#### Development
-
-- [How to build](docs/build.md)
-- [Running on Docker](docs/docker.md)
-- [Build on Android](docs/android.md)
-- [Multi-GPU usage](docs/multi-gpu.md)
-- [Performance troubleshooting](docs/development/token_generation_performance_tips.md)
-- [GGML tips & tricks](https://github.com/ggml-org/llama.cpp/wiki/GGML-Tips-&-Tricks)
-- [XCFramework](docs/xcframework.md)
-- [Completions](docs/completions.md)
-- [Models](docs/models.md)
-- [Release process](docs/release.md)
-
-## Contributing
-
-- Contributors can open PRs
-- Collaborators will be invited based on contributions
-- Maintainers can push to branches in the `llama.cpp` repo and merge PRs into the `master` branch
-- Any help with managing issues, PRs and projects is very appreciated!
-- Read the [CONTRIBUTING.md](CONTRIBUTING.md) for more information
-
-## Acknowledgements
-
-- [yhirose/cpp-httplib](https://github.com/yhirose/cpp-httplib) - Single-header HTTP server, used by `llama-server` - MIT license
-- [nothings/stb](https://github.com/nothings/stb) - Single-header image format decoder, used by multimodal subsystem - Public domain
-- [nlohmann/json](https://github.com/nlohmann/json) - Single-header JSON library, used by various tools/examples - MIT License
-- [mackron/miniaudio](https://github.com/mackron/miniaudio) - Single-header audio format decoder, used by multimodal subsystem - Public domain
-- [sheredom/subprocess.h](https://github.com/sheredom/subprocess.h) - Single-header process launching solution for C and C++ - Public domain
+代码基于 llama.cpp（MIT 许可），沿用其 LICENSE。
