@@ -32,6 +32,27 @@ static __device__ __forceinline__ int q8p_sum8(int v) {
     return v;
 }
 
+// warp_reduce_sum<32> with the same butterfly (xor 16, 8, 4, 2, 1; float addition is commutative, so every lane gets
+// the bit-identical total) but with ds_swizzle / DPP instead of ds_bpermute: no lane-address arithmetic, less code
+static __device__ __forceinline__ float q8p_sum32(float v) {
+    v += __int_as_float(__builtin_amdgcn_ds_swizzle(__float_as_int(v), 0x401F)); // xor 16
+    v += __int_as_float(__builtin_amdgcn_ds_swizzle(__float_as_int(v), 0x201F)); // xor 8
+    v += __int_as_float(__builtin_amdgcn_ds_swizzle(__float_as_int(v), 0x101F)); // xor 4
+    v += __int_as_float(__builtin_amdgcn_update_dpp(0, __float_as_int(v), 0x4E, 0xF, 0xF, false)); // xor 2
+    v += __int_as_float(__builtin_amdgcn_update_dpp(0, __float_as_int(v), 0xB1, 0xF, 0xF, false)); // xor 1
+    return v;
+}
+
+// block_reduce<SUM, 1024> (32-lane groups, partial sums of the 32 groups in LDS) with q8p_sum32
+static __device__ __forceinline__ float q8p_block_sum1024(float v, float * s_sum) {
+    v = q8p_sum32(v);
+    if (threadIdx.x % 32 == 0) {
+        s_sum[threadIdx.x / 32] = v;
+    }
+    __syncthreads();
+    return q8p_sum32(s_sum[threadIdx.x % 32]);
+}
+
 static __device__ __forceinline__ float q8p_sigmoid(float x) {
     return 1.0f / (1.0f + expf(-x));
 }
@@ -69,7 +90,11 @@ static __global__ void __launch_bounds__(256) gated_q8_kernel(const float * __re
 // VALU-heavy, so the row is split over gridDim.x workgroups of 1024 threads: every workgroup computes the identical
 // full-row reduction (bit-identical scale), then outputs its own slice of 64 float4 (8 q8_1 blocks) with threads
 // 0..63. (One workgroup doing all 1280 float4 of a 5120 row spent ~4 us in situ on the q8 math of 16 waves on one CU.)
-template <int VPT>
+// SMALL: q = roundf(r / d) directly (the formula of quantize_q8_1, bit-identical results) instead of the
+// round-div fast path with its out-of-line division fallbacks, and the block reduction with swizzle/DPP (same
+// butterfly): ~85 instructions less code (398 -> ~315). In the model each dispatch
+// starts with a cold instruction cache, so code size on the critical path is a large part of this kernel's cost.
+template <int VPT, bool SMALL>
 static __global__ void __launch_bounds__(1024) rms_norm_mul_q8_kernel(const float * __restrict__ x, const float * __restrict__ w,
         float * __restrict__ dst, block_q8_1 * __restrict__ y, int * __restrict__ ysum, const int ncols, const float eps) {
     constexpr int block_size = 1024;
@@ -106,7 +131,11 @@ static __global__ void __launch_bounds__(1024) rms_norm_mul_q8_kernel(const floa
             tmp += xs[k].x*xs[k].x + xs[k].y*xs[k].y + xs[k].z*xs[k].z + xs[k].w*xs[k].w;
         }
     }
-    tmp = block_reduce<block_reduce_method::SUM, block_size>(tmp, s_sum);
+    if constexpr (SMALL) {
+        tmp = q8p_block_sum1024(tmp, s_sum);
+    } else {
+        tmp = block_reduce<block_reduce_method::SUM, block_size>(tmp, s_sum);
+    }
     const float scale = rsqrtf(tmp / ncols + eps);
 
     if (out) {
@@ -122,11 +151,19 @@ static __global__ void __launch_bounds__(1024) rms_norm_mul_q8_kernel(const floa
         float amax = fmaxf(fmaxf(fabsf(r.x), fabsf(r.y)), fmaxf(fabsf(r.z), fabsf(r.w)));
         amax = q8p_max8(amax);
         const float d = amax / 127.0f;
-        const float inv_d = 1.0f / d;
-        const int8_t q0 = amax == 0.0f ? 0 : q8p_round_div(r.x, d, inv_d);
-        const int8_t q1 = amax == 0.0f ? 0 : q8p_round_div(r.y, d, inv_d);
-        const int8_t q2 = amax == 0.0f ? 0 : q8p_round_div(r.z, d, inv_d);
-        const int8_t q3 = amax == 0.0f ? 0 : q8p_round_div(r.w, d, inv_d);
+        int8_t q0, q1, q2, q3;
+        if constexpr (SMALL) {
+            q0 = amax == 0.0f ? 0 : (int8_t) roundf(r.x / d);
+            q1 = amax == 0.0f ? 0 : (int8_t) roundf(r.y / d);
+            q2 = amax == 0.0f ? 0 : (int8_t) roundf(r.z / d);
+            q3 = amax == 0.0f ? 0 : (int8_t) roundf(r.w / d);
+        } else {
+            const float inv_d = 1.0f / d;
+            q0 = amax == 0.0f ? 0 : q8p_round_div(r.x, d, inv_d);
+            q1 = amax == 0.0f ? 0 : q8p_round_div(r.y, d, inv_d);
+            q2 = amax == 0.0f ? 0 : q8p_round_div(r.z, d, inv_d);
+            q3 = amax == 0.0f ? 0 : q8p_round_div(r.w, d, inv_d);
+        }
         int sum = (int) q0 + (int) q1 + (int) q2 + (int) q3;
         sum = q8p_sum8(sum);
         const uint32_t packed = (uint32_t) (uint8_t) q0 | ((uint32_t) (uint8_t) q1 << 8) |
@@ -265,11 +302,20 @@ bool ggml_cuda_rms_norm_mul_q8(ggml_backend_cuda_context & ctx, const ggml_tenso
     // VPT only bounds the per-thread loop (elements beyond ncols are skipped), so 2 and 4 give identical results;
     // one workgroup per 64 float4 (ne0 % 512 == 0)
     const int nwg = (int) (x->ne[0] / 256);
+    static const bool small = [] {
+        const char * v = getenv("GGML_Q8_NORM_SMALL");
+        return v == nullptr || v[0] != '0';
+    }();
     if (x->ne[0] <= 8192) {
-        rms_norm_mul_q8_kernel<2><<<nwg, 1024, 0, ctx.stream()>>>((const float *) x->data, (const float *) w->data, (float *) mul_node->data,
-                y, ysum, (int) x->ne[0], eps);
+        if (small) {
+            rms_norm_mul_q8_kernel<2, true><<<nwg, 1024, 0, ctx.stream()>>>((const float *) x->data, (const float *) w->data, (float *) mul_node->data,
+                    y, ysum, (int) x->ne[0], eps);
+        } else {
+            rms_norm_mul_q8_kernel<2, false><<<nwg, 1024, 0, ctx.stream()>>>((const float *) x->data, (const float *) w->data, (float *) mul_node->data,
+                    y, ysum, (int) x->ne[0], eps);
+        }
     } else {
-        rms_norm_mul_q8_kernel<4><<<nwg, 1024, 0, ctx.stream()>>>((const float *) x->data, (const float *) w->data, (float *) mul_node->data,
+        rms_norm_mul_q8_kernel<4, false><<<nwg, 1024, 0, ctx.stream()>>>((const float *) x->data, (const float *) w->data, (float *) mul_node->data,
                 y, ysum, (int) x->ne[0], eps);
     }
     CUDA_CHECK(cudaGetLastError());
