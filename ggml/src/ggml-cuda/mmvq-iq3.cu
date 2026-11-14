@@ -335,6 +335,9 @@ static int mixg_na(const ggml_tensor * w3, const ggml_tensor * w4) {
     if (force > 0 && force < mixg::NW) {
         return force;
     }
+    if (mixg_mode() == 4) {
+        return -1;   // alternating IQ3 / IQ4 units per wave
+    }
     if (mixg_mode() != 3) {
         return 0;
     }
@@ -409,10 +412,25 @@ bool ggml_cuda_mmvq_mix(ggml_backend_cuda_context & ctx, ggml_tensor * const * m
     const bool first3 = mixg_mode() != 2;
     float * d3 = (float *) m3->data;
     float * d4 = (float *) m4->data;
+    static const int n_empty_pre = [] { const char * v = getenv("GGML_MMVQ_MIX_EMPTY_PRE"); return v ? atoi(v) : 0; }();
+    for (int e = 0; e < n_empty_pre; ++e) {
+        mixg::empty_kernel<<<1, 64, 0, stream>>>();   // calibration probe: n empty launches before the pair (after a small kernel)
+    }
     if (s3 && x4)       mixg_launch<iq3s_t,   iq4k::iq4xs_t>(first3, na, soa3, d3, N3, s4, d4, N4, q8, K, ncu, stream);
     else if (s3)        mixg_launch<iq3s_t,   iq4k::q4k_t  >(first3, na, soa3, d3, N3, s4, d4, N4, q8, K, ncu, stream);
     else if (x4)        mixg_launch<iq3xxs_t, iq4k::iq4xs_t>(first3, na, soa3, d3, N3, s4, d4, N4, q8, K, ncu, stream);
     else                mixg_launch<iq3xxs_t, iq4k::q4k_t  >(first3, na, soa3, d3, N3, s4, d4, N4, q8, K, ncu, stream);
+    static const int n_empty = [] { const char * v = getenv("GGML_MMVQ_MIX_EMPTY"); return v ? atoi(v) : 0; }();
+    // probe shape (GGML_MMVQ_MIX_EMPTY_CFG): 0 = 1 x 64 threads, no LDS; 1 = 1 x 1024 threads with the pair kernel's LDS;
+    // 2 = ncu x 1024 threads with the pair kernel's LDS
+    static const int cfg_empty = [] { const char * v = getenv("GGML_MMVQ_MIX_EMPTY_CFG"); return v ? atoi(v) : 0; }();
+    for (int e = 0; e < n_empty; ++e) {
+        if (cfg_empty == 0) {
+            mixg::empty_kernel<<<1, 64, 0, stream>>>();
+        } else {
+            mixg::empty_kernel<<<cfg_empty == 1 ? 1 : ncu, dim3(64, mixg::NW), lds, stream>>>();
+        }
+    }
     CUDA_CHECK(cudaGetLastError());
     return true;
 }

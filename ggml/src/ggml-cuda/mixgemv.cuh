@@ -102,6 +102,9 @@ template <class T3, class T4>
 static inline size_t y4_offset(const int K) {
     return (iq3g::lds_bytes<T3, iq3g::none_t>(K) + 15) & ~(size_t) 15;
 }
+// calibration probe (GGML_MMVQ_MIX_EMPTY=n): n empty launches after every pair, to measure what a launch costs in graph replay
+static __global__ void empty_kernel() {}
+
 // nwv4 = waves that run IQ4 units (all waves in the flowing mode, (NW - na)*grid in the split mode)
 template <class T3, class T4>
 static inline size_t lds_bytes(const int K, const int N4, const int nwv4) {
@@ -156,6 +159,17 @@ __global__ void gemv_pair(const uint8_t * __restrict__ w3, float * __restrict__ 
         return;
     }
     const int w2 = (w + nwv - rot) % nwv;
+    if (na < 0) {
+        // alternating: the wave's IQ3 units (w, w + nwv, ..) and IQ4 units (w2, w2 + nwv, ..) one after the other, so that
+        // compute-heavy IQ3 units and memory-bound IQ4 units are mixed on every SIMD all the time
+        const int U3 = N3/RG, U4 = N4/RG, big = 1 << 30;
+        int u3 = w, u4 = w2;
+        while (u3 < U3 || u4 < U4) {
+            if (u3 < U3) { part3<T3, SM>(w3, d3, N3, K, u3, big, lane, grp); u3 += nwv; }
+            if (u4 < U4) { part4<T4>(s4, d4, N4, K, ys4, ow, u4, big, lane, grp); u4 += nwv; }
+        }
+        return;
+    }
     if constexpr (FIRST3) {
         part3<T3, SM>(w3, d3, N3, K, w, nwv, lane, grp);
         part4<T4>(s4, d4, N4, K, ys4, ow, w2, nwv, lane, grp);
