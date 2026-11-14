@@ -642,6 +642,689 @@ gdn_decode_out_split_f32(
     }
 }
 
+#if defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+#define GDN_DEC_DIET 1
+#else
+#define GDN_DEC_DIET 0
+#endif
+
+#if GDN_DEC_DIET
+// "Diet" variants of gdn_decode_prep_f32<bf16> and gdn_decode_out_split_f32 for the qwen3.5 shapes on wave64 devices
+// (H_k = 16, H_v = 48, S = 128, conv 4, bf16 alpha/beta rows of 5120 values). In the model every dispatch starts with a
+// cold instruction cache, so the code size on the critical path is a large part of these short kernels' time.
+// Same arithmetic as the generic kernels (bit-identical results), less code:
+// - constant shapes: no integer division (h % H_k), 32-bit offsets, a single load batch for the alpha/beta rows;
+// - the dst-row base pointers come from the host (the src row is still read from s_copy on the device);
+// - DPP / ds_swizzle reductions with the same butterflies instead of ds_bpermute (float addition is commutative, so
+//   every lane still gets the bit-identical value), exact max / int sums in any order;
+// - the gated-norm + q8_1 epilogue on one full wave: element e = lane + 64*pass, two rolled passes (one silu and one
+//   division of code instead of four of each).
+#define GDN_DIET_HK    16
+#define GDN_DIET_HV    48
+#define GDN_DIET_NCOL2 2560
+
+template <int ctrl>
+static __device__ __forceinline__ float gdn_diet_dpp(const float v) {
+    return __int_as_float(__builtin_amdgcn_update_dpp(0, __float_as_int(v), ctrl, 0xF, 0xF, false));
+}
+
+template <int ctrl>
+static __device__ __forceinline__ int gdn_diet_dpp_i(const int v) {
+    return __builtin_amdgcn_update_dpp(0, v, ctrl, 0xF, 0xF, false);
+}
+
+// lane ^ 16 within aligned groups of 32 lanes
+static __device__ __forceinline__ float gdn_diet_swz16(const float v) {
+    return __int_as_float(__builtin_amdgcn_ds_swizzle(__float_as_int(v), 0x401F));
+}
+
+// == warp_reduce_sum<16> (butterfly xor 8, 4, 2, 1). row_ror:8 is xor 8 within a DPP row of 16 lanes; after that step
+// v[j] == v[j ^ 8], so row_ror:4 delivers the value of lane j ^ 4; quad_perm [2,3,0,1] / [1,0,3,2] are xor 2 / xor 1
+static __device__ __forceinline__ float gdn_diet_sum16(float v) {
+    v += gdn_diet_dpp<0x128>(v);
+    v += gdn_diet_dpp<0x124>(v);
+    v += gdn_diet_dpp<0x4E>(v);
+    v += gdn_diet_dpp<0xB1>(v);
+    return v;
+}
+
+// == warp_reduce_sum<32>: xor 16 with ds_swizzle, then as above
+static __device__ __forceinline__ float gdn_diet_sum32(float v) {
+    v += gdn_diet_swz16(v);
+    return gdn_diet_sum16(v);
+}
+
+// == warp_reduce_sum<64>: xor 32 with ds_bpermute, then as above
+static __device__ __forceinline__ float gdn_diet_sum64(float v, const int tid) {
+    v += __int_as_float(__builtin_amdgcn_ds_bpermute(((tid ^ 32) & 63) << 2, __float_as_int(v)));
+    return gdn_diet_sum32(v);
+}
+
+// max / int sum over aligned groups of 32 lanes (exact operations, the order does not matter)
+static __device__ __forceinline__ float gdn_diet_max32(float v) {
+    v = fmaxf(v, gdn_diet_dpp<0xB1>(v));  // xor 1
+    v = fmaxf(v, gdn_diet_dpp<0x4E>(v));  // xor 2
+    v = fmaxf(v, gdn_diet_dpp<0x141>(v)); // row_half_mirror: the other quad of the 8
+    v = fmaxf(v, gdn_diet_dpp<0x140>(v)); // row_mirror: the other 8 of the row
+    v = fmaxf(v, gdn_diet_swz16(v));
+    return v;
+}
+
+static __device__ __forceinline__ int gdn_diet_isum32(int v) {
+    v += gdn_diet_dpp_i<0xB1>(v);
+    v += gdn_diet_dpp_i<0x4E>(v);
+    v += gdn_diet_dpp_i<0x141>(v);
+    v += gdn_diet_dpp_i<0x140>(v);
+    v += __builtin_amdgcn_ds_swizzle(v, 0x401F);
+    return v;
+}
+
+// == gdn_decode_prep_f32<nv_bfloat16> for the shapes above; cs_dst = conv state row dst_row
+template <bool warm>
+static __global__ void __launch_bounds__(2*GDN_DEC_MMV_BLOCK)
+gdn_decode_prep_diet(
+        const float       * __restrict__ qkv,
+        const float       * __restrict__ x,
+        const nv_bfloat16 * __restrict__ w_alpha,
+        const nv_bfloat16 * __restrict__ w_beta,
+        const float       * __restrict__ dt_bias,
+        const float       * __restrict__ a,
+        const float       * __restrict__ conv_w,
+        float             *              cs_dst,
+        const int32_t     * __restrict__ s_copy,
+        float             * __restrict__ out,
+        const int64_t                    cs_row_stride,
+        const int                        dst_row,
+        const float                      eps_l2,
+        const float                      scale_l2) {
+    constexpr int S  = GDN_DEC_S;
+    constexpr int HK = GDN_DIET_HK;
+    constexpr int HV = GDN_DIET_HV;
+    constexpr int nb = GDN_DIET_NCOL2/GDN_DEC_MMV_BLOCK; // one batch of loads per thread
+
+    const int b   = blockIdx.x;
+    const int tid = threadIdx.x;
+
+    __shared__ float s_y[S];
+    __shared__ float s_red[2*GDN_DEC_MMV_BLOCK/64];
+
+    if (b < 2*HK) {
+        if (tid < S) {
+            const int ch = b*S + tid;
+            float * cs = cs_dst + ch*(GDN_DEC_DCONV - 1);
+
+            float xc[GDN_DEC_DCONV];
+            float wc[GDN_DEC_DCONV];
+#pragma unroll
+            for (int j = 0; j < GDN_DEC_DCONV - 1; j++) {
+                xc[j] = cs[j]; // speculative: read row == written row
+            }
+            xc[GDN_DEC_DCONV - 1] = qkv[ch];
+#pragma unroll
+            for (int j = 0; j < GDN_DEC_DCONV; j++) {
+                wc[j] = conv_w[ch*GDN_DEC_DCONV + j];
+            }
+            const int32_t src_row = s_copy[0];
+            if (src_row != dst_row) {
+                const float * cs_src = cs + (int64_t) (src_row - dst_row)*cs_row_stride;
+#pragma unroll
+                for (int j = 0; j < GDN_DEC_DCONV - 1; j++) {
+                    xc[j] = cs_src[j];
+                }
+            }
+
+            s_y[tid] = gdn_dec_conv_silu(xc, wc);
+
+#pragma unroll
+            for (int j = 0; j < GDN_DEC_DCONV - 1; j++) {
+                cs[j] = xc[j + 1];
+            }
+        }
+
+        __syncthreads();
+        if (tid < 32) {
+            const float4 xs = ((const float4 *) s_y)[tid];
+            float tmp = gdn_dec_sumsq4(xs);
+            tmp = gdn_diet_sum32(tmp);
+            const float scale = rsqrtf(tmp / S + eps_l2);
+            float4 r = make_float4(scale*xs.x, scale*xs.y, scale*xs.z, scale*xs.w);
+            r.x *= scale_l2;
+            r.y *= scale_l2;
+            r.z *= scale_l2;
+            r.w *= scale_l2;
+            ((float4 *) (out + b*S))[tid] = r;
+        }
+        return;
+    }
+
+    // alpha/beta projections of v head h (threads [0, 128) -> alpha row h, [128, 256) -> beta row h); the row of a wave
+    // is wave-uniform
+    const int h    = b - 2*HK;
+    const int half = __builtin_amdgcn_readfirstlane(tid) / GDN_DEC_MMV_BLOCK;
+    const int t    = tid % GDN_DEC_MMV_BLOCK;
+    const nv_bfloat16 * w  = (half == 0 ? w_alpha : w_beta) + h*(2*GDN_DIET_NCOL2);
+    const float2      * x2 = (const float2 *) x;
+
+    if constexpr (!warm) {
+        float2 wv[nb];
+        float2 xv[nb];
+#pragma unroll
+        for (int u = 0; u < nb; u++) {
+            wv[u] = gdn_dec_load_w2<nv_bfloat16>(w, t + u*GDN_DEC_MMV_BLOCK);
+            xv[u] = x2[t + u*GDN_DEC_MMV_BLOCK];
+        }
+        float sumf = 0.0f;
+#pragma unroll
+        for (int u = 0; u < nb; u++) {
+            sumf = sumf + gdn_dec_mul(wv[u].x, xv[u].x);
+            sumf = sumf + gdn_dec_mul(wv[u].y, xv[u].y);
+        }
+
+        sumf = gdn_diet_sum64(sumf, tid);
+        if (tid % 64 == 0) {
+            s_red[tid / 64] = sumf;
+        }
+        __syncthreads();
+
+        if (tid == 0) {
+            const float alpha = (s_red[0] + s_red[1]) + dt_bias[h];
+            const float gate  = gdn_dec_softplus(alpha) * a[h];
+            out[2*HK*S + h]      = expf(gate);
+            out[2*HK*S + HV + h] = gdn_dec_sigmoid(s_red[2] + s_red[3]);
+            ((unsigned int *) (out + 2*HK*S + 2*HV))[h] = 0u;
+        }
+        return;
+    }
+
+    const float dt_h = dt_bias[h];
+    const float a_h  = a[h];
+
+    // warm: the gate math (softplus = log1pf(expf(x)) alone is ~130 instructions) runs twice through the same code: in
+    // the first pass on dummy inputs while the loads are in flight, which pulls its code into the cold instruction
+    // cache, then on the projections (the result of the first pass is discarded).
+    int    wr[nb]; // bf16 pairs, converted after the first pass
+    float2 xv[nb];
+    float va  = 0.0f;
+    float vb  = 0.0f;
+    float dtv = 0.0f;
+    float av  = 0.0f;
+    float gate_exp;
+    float beta_sig;
+#pragma unroll 1
+    for (int pass = 0; ; pass++) {
+        if (pass == 0) {
+            int zoff = 0; // opaque 0: keeps the address arithmetic next to the loads (uniform base + 32-bit offsets)
+            asm volatile("" : "+s"(zoff));
+            const int    * wp = (const int *) w + zoff;
+            const float2 * xp = x2 + zoff;
+#pragma unroll
+            for (int u = 0; u < nb; u++) {
+                wr[u] = wp[t + u*GDN_DEC_MMV_BLOCK];
+                xv[u] = xp[t + u*GDN_DEC_MMV_BLOCK];
+            }
+        }
+        const float alpha = va + dtv;
+        const float gate  = gdn_dec_softplus(alpha) * av;
+        gate_exp = expf(gate);
+        beta_sig = gdn_dec_sigmoid(vb);
+        asm volatile("" :: "v"(gate_exp), "v"(beta_sig)); // keep the first pass (not sunk behind the loop)
+        if (pass != 0) {
+            break;
+        }
+
+        float sumf = 0.0f;
+#pragma unroll
+        for (int u = 0; u < nb; u++) {
+            const float2 wv = gdn_dec_load_w2<nv_bfloat16>((const nv_bfloat16 *) &wr[u], 0); // same conversion
+            sumf = sumf + gdn_dec_mul(wv.x, xv[u].x);
+            sumf = sumf + gdn_dec_mul(wv.y, xv[u].y);
+        }
+
+        sumf = gdn_diet_sum64(sumf, tid);
+        if (tid % 64 == 0) {
+            s_red[tid / 64] = sumf;
+        }
+        __syncthreads();
+
+        // second stage of the block reduction (== the nw = 2 butterfly of gdn_decode_prep_f32), in every thread
+        va  = s_red[0] + s_red[1];
+        vb  = s_red[2] + s_red[3];
+        dtv = dt_h;
+        av  = a_h;
+    }
+
+    if (tid == 0) {
+        out[2*HK*S + h]      = gate_exp;
+        out[2*HK*S + HV + h] = beta_sig;
+        ((unsigned int *) (out + 2*HK*S + 2*HV))[h] = 0u;
+    }
+}
+
+// == gdn_decode_out_split_f32<q8> for the shapes above (wave64: 16 lanes per state column, 16 columns per block);
+// cs_dst / ss_dst = conv / recurrent state row dst_row
+template <bool q8>
+static __global__ void __launch_bounds__(GDN_DEC_SPLIT_BLOCK)
+gdn_decode_out_split_diet(
+        const float   * __restrict__ prep,
+        const float   * __restrict__ qkv,
+        const float   * __restrict__ conv_w,
+        float         *              cs_dst,
+        const float   * __restrict__ z,
+        const float   * __restrict__ norm_w,
+        float         *              ss_dst,
+        const int32_t * __restrict__ s_copy,
+        float         *              out,
+        const int64_t                cs_row_stride,
+        const int64_t                ss_row_stride,
+        const int                    dst_row,
+        const float                  scale,
+        const float                  eps,
+        block_q8_1    * __restrict__ y,
+        int           * __restrict__ ysum) {
+    constexpr int S              = GDN_DEC_S;
+    constexpr int HK             = GDN_DIET_HK;
+    constexpr int HV             = GDN_DIET_HV;
+    constexpr int lanes_per_col  = 16;
+    constexpr int rows_per_lane  = S / lanes_per_col;
+    constexpr int cols_per_block = GDN_DEC_SPLIT_BLOCK / lanes_per_col;
+    constexpr int split          = S / cols_per_block;
+
+    const int h           = blockIdx.x / split;
+    const int part        = blockIdx.x % split;
+    const int tid         = threadIdx.x;
+    const int lane_in_col = tid % lanes_per_col;
+    const int col         = part*cols_per_block + tid / lanes_per_col;
+    const int hk          = h % HK;
+
+    __shared__ float s_v[cols_per_block];
+    __shared__ int   s_last;
+
+    unsigned int * counters = (unsigned int *) (prep + 2*HK*S + 2*HV);
+
+    // ---- issue all loads first (state stored transposed: column col of head h is contiguous)
+    float * st = ss_dst + (unsigned) (h*S*S + col*S + lane_in_col);
+
+    float s_shard[rows_per_lane];
+#pragma unroll
+    for (int r = 0; r < rows_per_lane; r++) {
+        s_shard[r] = st[r*lanes_per_col]; // speculative: read row == written row
+    }
+
+    const float * q = prep + (unsigned) (hk*S + lane_in_col);
+    const float * k = q + HK*S;
+    float k_reg[rows_per_lane];
+    float q_reg[rows_per_lane];
+#pragma unroll
+    for (int r = 0; r < rows_per_lane; r++) {
+        k_reg[r] = k[r*lanes_per_col];
+        q_reg[r] = q[r*lanes_per_col];
+    }
+    const float g_val    = prep[2*HK*S + h];
+    const float beta_val = prep[2*HK*S + HV + h];
+
+    const int32_t src_row = s_copy[0];
+
+    // ---- conv1d + silu of this block's v channels (conv state shifted in place)
+    if (tid < cols_per_block) {
+        const unsigned ch = 2*HK*S + h*S + part*cols_per_block + tid;
+        float * cs = cs_dst + ch*(GDN_DEC_DCONV - 1);
+        float xc[GDN_DEC_DCONV];
+        float wc[GDN_DEC_DCONV];
+#pragma unroll
+        for (int j = 0; j < GDN_DEC_DCONV - 1; j++) {
+            xc[j] = cs[j]; // speculative
+        }
+        xc[GDN_DEC_DCONV - 1] = qkv[ch];
+#pragma unroll
+        for (int j = 0; j < GDN_DEC_DCONV; j++) {
+            wc[j] = conv_w[ch*GDN_DEC_DCONV + j];
+        }
+        if (src_row != dst_row) {
+            const float * cs_src = cs + (int64_t) (src_row - dst_row)*cs_row_stride;
+#pragma unroll
+            for (int j = 0; j < GDN_DEC_DCONV - 1; j++) {
+                xc[j] = cs_src[j];
+            }
+        }
+        s_v[tid] = gdn_dec_conv_silu(xc, wc);
+#pragma unroll
+        for (int j = 0; j < GDN_DEC_DCONV - 1; j++) {
+            cs[j] = xc[j + 1];
+        }
+    }
+
+    if (src_row != dst_row) {
+        const float * st_src = st + (int64_t) (src_row - dst_row)*ss_row_stride;
+#pragma unroll
+        for (int r = 0; r < rows_per_lane; r++) {
+            s_shard[r] = st_src[r*lanes_per_col];
+        }
+    }
+    __syncthreads();
+
+    // ---- delta rule (fused/unfused pattern of gated_delta_net_cuda<128, false, false, 4>, see gdn_decode_out_f32)
+    {
+        float kv_shard = 0.0f;
+#pragma unroll
+        for (int r = 0; r < rows_per_lane; r++) {
+            if (r < rows_per_lane/2) {
+                kv_shard = fmaf(s_shard[r], k_reg[r], kv_shard);
+            } else {
+                kv_shard = kv_shard + gdn_dec_mul(s_shard[r], k_reg[r]);
+            }
+        }
+        const float kv_col = gdn_diet_sum16(kv_shard);
+
+        const float delta_col = beta_val * fmaf(-g_val, kv_col, s_v[tid / lanes_per_col]);
+
+        float attn_partial = 0.0f;
+#pragma unroll
+        for (int r = 0; r < rows_per_lane; r++) {
+            if (r < rows_per_lane - 2) {
+                s_shard[r] = fmaf(g_val, s_shard[r], gdn_dec_mul(k_reg[r], delta_col));
+            } else {
+                s_shard[r] = gdn_dec_mul(g_val, s_shard[r]) + gdn_dec_mul(k_reg[r], delta_col);
+            }
+            attn_partial = fmaf(s_shard[r], q_reg[r], attn_partial);
+        }
+
+        const float attn_col = gdn_diet_sum16(attn_partial);
+
+        if (lane_in_col == 0) {
+            out[h*S + col] = attn_col * scale;
+        }
+
+#pragma unroll
+        for (int r = 0; r < rows_per_lane; r++) {
+            st[r*lanes_per_col] = s_shard[r];
+        }
+    }
+
+    // ---- the last block of the head applies the gated norm
+    __threadfence();
+    __syncthreads();
+    if (tid == 0) {
+        s_last = atomicAdd(&counters[h], 1u) == (unsigned int) (split - 1);
+    }
+    __syncthreads();
+    if (!s_last) {
+        return;
+    }
+    __threadfence();
+
+    // == rms_norm_f32<32, 1, true, do_multiply>(eps) * w, then silu(z) * x (+ q8_1): both halves of wave 0 redo the
+    // 32-lane reduction of the float4 sums of squares (identical totals), then lane l handles elements l and l + 64
+    if (tid < 64) {
+        const float * oh = out + h*S;
+        const float4 xs = ((const float4 *) oh)[tid % 32]; // L1 was invalidated by the fence
+        float x0 = oh[tid];
+        float x1 = oh[tid + 64];
+        float z0 = z[h*S + tid];
+        float z1 = z[h*S + tid + 64];
+        float w0 = norm_w[tid];
+        float w1 = norm_w[tid + 64];
+        float tmp = gdn_dec_sumsq4(xs);
+        tmp = gdn_diet_sum32(tmp);
+        const float sc = rsqrtf(tmp / S + eps);
+        int e = h*S + tid;
+#pragma unroll 1
+        for (int pass = 0; pass < 2; pass++) {
+            float r = sc*x0;
+            r *= w0;
+            const float o = ggml_cuda_op_silu_single(z0) * r;
+            out[e] = o;
+            if constexpr (q8) {
+                const float  amax = gdn_diet_max32(fabsf(o));
+                const float  d    = amax / 127.0f;
+                const int8_t qv   = amax == 0.0f ? 0 : roundf(o / d);
+                const int    sum  = gdn_diet_isum32(qv);
+                const int    ib   = e / QK8_1;
+                y[ib].qs[e % QK8_1] = qv;
+                if (e % QK8_1 == 0) {
+                    y[ib].ds  = make_half2(d, d * sum);
+                    ysum[ib] = sum;
+                }
+            }
+            x0 = x1;
+            z0 = z1;
+            w0 = w1;
+            e += 64;
+        }
+    }
+}
+
+// == gdn_decode_out_split_diet<q8>, but the epilogue code (silu, the q8_1 divisions and reductions) first runs once on
+// dummy inputs (no stores) in every block while the state loads are in flight, which pulls it into the cold
+// instruction cache before the last block of the head needs it: one rolled loop, pass -1 = dummy pass + main work
+template <bool q8>
+static __global__ void __launch_bounds__(GDN_DEC_SPLIT_BLOCK)
+gdn_decode_out_split_diet_warm(
+        const float   * __restrict__ prep,
+        const float   * __restrict__ qkv,
+        const float   * __restrict__ conv_w,
+        float         *              cs_dst,
+        const float   * __restrict__ z,
+        const float   * __restrict__ norm_w,
+        float         *              ss_dst,
+        const int32_t * __restrict__ s_copy,
+        float         *              out,
+        const int64_t                cs_row_stride,
+        const int64_t                ss_row_stride,
+        const int                    dst_row,
+        const float                  scale,
+        const float                  eps,
+        block_q8_1    * __restrict__ y,
+        int           * __restrict__ ysum) {
+    constexpr int S              = GDN_DEC_S;
+    constexpr int HK             = GDN_DIET_HK;
+    constexpr int HV             = GDN_DIET_HV;
+    constexpr int lanes_per_col  = 16;
+    constexpr int rows_per_lane  = S / lanes_per_col;
+    constexpr int cols_per_block = GDN_DEC_SPLIT_BLOCK / lanes_per_col;
+    constexpr int split          = S / cols_per_block;
+
+    const int h           = blockIdx.x / split;
+    const int part        = blockIdx.x % split;
+    const int tid         = threadIdx.x;
+    const int lane_in_col = tid % lanes_per_col;
+    const int col         = part*cols_per_block + tid / lanes_per_col;
+    const int hk          = h % HK;
+
+    __shared__ float s_v[cols_per_block];
+    __shared__ int   s_last;
+
+    unsigned int * counters = (unsigned int *) (prep + 2*HK*S + 2*HV);
+
+    // ---- issue all loads first (state stored transposed: column col of head h is contiguous)
+    float * st = ss_dst + (unsigned) (h*S*S + col*S + lane_in_col);
+
+    float s_shard[rows_per_lane];
+#pragma unroll
+    for (int r = 0; r < rows_per_lane; r++) {
+        s_shard[r] = st[r*lanes_per_col]; // speculative: read row == written row
+    }
+
+    const float * q = prep + (unsigned) (hk*S + lane_in_col);
+    const float * k = q + HK*S;
+    float k_reg[rows_per_lane];
+    float q_reg[rows_per_lane];
+#pragma unroll
+    for (int r = 0; r < rows_per_lane; r++) {
+        k_reg[r] = k[r*lanes_per_col];
+        q_reg[r] = q[r*lanes_per_col];
+    }
+    const float g_val    = prep[2*HK*S + h];
+    const float beta_val = prep[2*HK*S + HV + h];
+
+    const unsigned ch = 2*HK*S + h*S + part*cols_per_block + tid;
+    float * cs = cs_dst + ch*(GDN_DEC_DCONV - 1);
+    float xc[GDN_DEC_DCONV] = {0.0f, 0.0f, 0.0f, 0.0f};
+    float wc[GDN_DEC_DCONV] = {0.0f, 0.0f, 0.0f, 0.0f};
+    if (tid < cols_per_block) {
+#pragma unroll
+        for (int j = 0; j < GDN_DEC_DCONV - 1; j++) {
+            xc[j] = cs[j]; // speculative
+        }
+        xc[GDN_DEC_DCONV - 1] = qkv[ch];
+#pragma unroll
+        for (int j = 0; j < GDN_DEC_DCONV; j++) {
+            wc[j] = conv_w[ch*GDN_DEC_DCONV + j];
+        }
+    }
+
+    const int32_t src_row = s_copy[0];
+
+    // epilogue inputs; dummies (non-zero, so that the division path runs) in pass -1
+    float sc = 1.0f;
+    float x0 = 1.0f;
+    float x1 = 1.0f;
+    float z0 = 1.0f;
+    float z1 = 1.0f;
+    float w0 = 1.0f;
+    float w1 = 1.0f;
+    int   e  = 0;
+#pragma unroll 1
+    for (int pass = -1; pass < 2; pass++) {
+        // == rms_norm_f32<32, 1, true, do_multiply>(eps) * w, then silu(z) * x (+ q8_1), element e (see the diet kernel)
+        {
+            float r = sc*x0;
+            r *= w0;
+            const float o = ggml_cuda_op_silu_single(z0) * r;
+            asm volatile("" :: "v"(o));
+            if (pass >= 0) {
+                out[e] = o;
+            }
+            if constexpr (q8) {
+                const float  amax = gdn_diet_max32(fabsf(o));
+                const float  d    = amax / 127.0f;
+                const int8_t qv   = amax == 0.0f ? 0 : roundf(o / d);
+                const int    sum  = gdn_diet_isum32(qv);
+                asm volatile("" :: "v"(d), "v"((int) qv), "v"(sum));
+                if (pass >= 0) {
+                    const int ib = e / QK8_1;
+                    y[ib].qs[e % QK8_1] = qv;
+                    if (e % QK8_1 == 0) {
+                        y[ib].ds  = make_half2(d, d * sum);
+                        ysum[ib] = sum;
+                    }
+                }
+            }
+            x0 = x1;
+            z0 = z1;
+            w0 = w1;
+            e += 64;
+        }
+        if (pass >= 0) {
+            continue;
+        }
+
+        // ---- pass -1: conv1d + silu of this block's v channels (conv state shifted in place)
+        if (tid < cols_per_block) {
+            if (src_row != dst_row) {
+                const float * cs_src = cs + (int64_t) (src_row - dst_row)*cs_row_stride;
+#pragma unroll
+                for (int j = 0; j < GDN_DEC_DCONV - 1; j++) {
+                    xc[j] = cs_src[j];
+                }
+            }
+            s_v[tid] = gdn_dec_conv_silu(xc, wc);
+#pragma unroll
+            for (int j = 0; j < GDN_DEC_DCONV - 1; j++) {
+                cs[j] = xc[j + 1];
+            }
+        }
+
+        if (src_row != dst_row) {
+            const float * st_src = st + (int64_t) (src_row - dst_row)*ss_row_stride;
+#pragma unroll
+            for (int r = 0; r < rows_per_lane; r++) {
+                s_shard[r] = st_src[r*lanes_per_col];
+            }
+        }
+        __syncthreads();
+
+        // ---- delta rule (fused/unfused pattern of gated_delta_net_cuda<128, false, false, 4>)
+        {
+            float kv_shard = 0.0f;
+#pragma unroll
+            for (int r = 0; r < rows_per_lane; r++) {
+                if (r < rows_per_lane/2) {
+                    kv_shard = fmaf(s_shard[r], k_reg[r], kv_shard);
+                } else {
+                    kv_shard = kv_shard + gdn_dec_mul(s_shard[r], k_reg[r]);
+                }
+            }
+            const float kv_col = gdn_diet_sum16(kv_shard);
+
+            const float delta_col = beta_val * fmaf(-g_val, kv_col, s_v[tid / lanes_per_col]);
+
+            float attn_partial = 0.0f;
+#pragma unroll
+            for (int r = 0; r < rows_per_lane; r++) {
+                if (r < rows_per_lane - 2) {
+                    s_shard[r] = fmaf(g_val, s_shard[r], gdn_dec_mul(k_reg[r], delta_col));
+                } else {
+                    s_shard[r] = gdn_dec_mul(g_val, s_shard[r]) + gdn_dec_mul(k_reg[r], delta_col);
+                }
+                attn_partial = fmaf(s_shard[r], q_reg[r], attn_partial);
+            }
+
+            const float attn_col = gdn_diet_sum16(attn_partial);
+
+            if (lane_in_col == 0) {
+                out[h*S + col] = attn_col * scale;
+            }
+
+#pragma unroll
+            for (int r = 0; r < rows_per_lane; r++) {
+                st[r*lanes_per_col] = s_shard[r];
+            }
+        }
+
+        // ---- the last block of the head applies the gated norm (passes 0 and 1, wave 0)
+        __threadfence();
+        __syncthreads();
+        if (tid == 0) {
+            s_last = atomicAdd(&counters[h], 1u) == (unsigned int) (split - 1);
+        }
+        __syncthreads();
+        if (!s_last || tid >= 64) {
+            return;
+        }
+        __threadfence();
+
+        const float * oh = out + h*S;
+        const float4 xs = ((const float4 *) oh)[tid % 32]; // L1 was invalidated by the fence
+        x0 = oh[tid];
+        x1 = oh[tid + 64];
+        z0 = z[h*S + tid];
+        z1 = z[h*S + tid + 64];
+        w0 = norm_w[tid];
+        w1 = norm_w[tid + 64];
+        float tmp = gdn_dec_sumsq4(xs);
+        tmp = gdn_diet_sum32(tmp);
+        sc = rsqrtf(tmp / S + eps);
+        e  = h*S + tid;
+        // wait for these loads here, not at the loop header (where pass -1 would wait for the state loads)
+        asm volatile("" : "+v"(x0), "+v"(x1), "+v"(z0), "+v"(z1), "+v"(w0), "+v"(w1), "+v"(sc));
+    }
+}
+
+// GGML_GDN_DIET: 0 = the generic kernels, 1 (default) = diet kernels, 2 = + the warm-up pass of the prep gates,
+// 3 = + the warm-up pass of the out epilogue (all bit-identical; 2 and 3 measured within noise of 1, experimental)
+static int gdn_dec_diet_level() {
+    static const int level = [] {
+        const char * e = getenv("GGML_GDN_DIET");
+        return e == nullptr ? 1 : atoi(e);
+    }();
+    return level;
+}
+
+static bool gdn_dec_diet_enabled() {
+    return gdn_dec_diet_level() != 0;
+}
+#endif // GDN_DEC_DIET
+
 bool ggml_cuda_gdn_decode_supported(const ggml_tensor * op) {
     const int S = ggml_get_op_params_i32(op, 3);
     if (S != GDN_DEC_S) {
@@ -700,6 +1383,22 @@ void ggml_cuda_op_gdn_decode_prep(ggml_backend_cuda_context & ctx, ggml_tensor *
 
     const dim3 grid(2*H_k + H_v, 1, 1);
     const dim3 block(2*GDN_DEC_MMV_BLOCK, 1, 1);
+
+#if GDN_DEC_DIET
+    if (gdn_dec_diet_enabled() && H_k == GDN_DIET_HK && H_v == GDN_DIET_HV && w_alpha->type == GGML_TYPE_BF16 &&
+            ncols2 == GDN_DIET_NCOL2 && w_row_stride == 2*GDN_DIET_NCOL2 &&
+            ggml_cuda_info().devices[ctx.device].warp_size == 64) {
+        auto * kernel = gdn_dec_diet_level() == 1 ? gdn_decode_prep_diet<false> : gdn_decode_prep_diet<true>;
+        kernel<<<grid, block, 0, stream>>>(
+            (const float *) qkv->data, (const float *) x->data,
+            (const nv_bfloat16 *) w_alpha->data, (const nv_bfloat16 *) w_beta->data,
+            (const float *) dt_bias->data, (const float *) a->data, (const float *) conv_w->data,
+            (float *) cs->data + (int64_t) dst_row*cs_row_stride, (const int32_t *) s_copy->data, (float *) dst->data,
+            cs_row_stride, dst_row, eps_l2, scale_l2);
+        CUDA_CHECK(cudaGetLastError());
+        return;
+    }
+#endif // GDN_DEC_DIET
 
     if (w_alpha->type == GGML_TYPE_BF16) {
         gdn_decode_prep_f32<nv_bfloat16><<<grid, block, 0, stream>>>(
@@ -778,6 +1477,20 @@ void ggml_cuda_op_gdn_decode_out_q8(ggml_backend_cuda_context & ctx, ggml_tensor
 
     auto launch = [&](auto q8_c) {
         constexpr bool Q8 = decltype(q8_c)::value;
+#if GDN_DEC_DIET
+        if (use_split && gdn_dec_diet_enabled() && H_k == GDN_DIET_HK && H_v == GDN_DIET_HV && warp_size == 64) {
+            const int64_t cs_row_stride = (int64_t) (cs->nb[1] / sizeof(float));
+            const int64_t ss_row_stride = (int64_t) (ss->nb[1] / sizeof(float));
+            auto * kernel = gdn_dec_diet_level() >= 3 ? gdn_decode_out_split_diet_warm<Q8> : gdn_decode_out_split_diet<Q8>;
+            kernel<<<H_v*split, GDN_DEC_SPLIT_BLOCK, 0, stream>>>(
+                (const float *) prep->data, (const float *) qkv->data, (const float *) conv_w->data,
+                (float *) cs->data + (int64_t) dst_row*cs_row_stride, (const float *) z->data,
+                (const float *) norm_w->data, (float *) ss->data + (int64_t) dst_row*ss_row_stride,
+                (const int32_t *) s_copy->data, (float *) dst->data, cs_row_stride, ss_row_stride,
+                dst_row, scale, eps, y, ysum);
+            return;
+        }
+#endif // GDN_DEC_DIET
         if (use_split && split >= 1) {
             gdn_decode_out_split_f32<Q8><<<H_v*split, GDN_DEC_SPLIT_BLOCK, 0, stream>>>(
                 (const float *) prep->data, (const float *) qkv->data, (const float *) conv_w->data, (float *) cs->data,
