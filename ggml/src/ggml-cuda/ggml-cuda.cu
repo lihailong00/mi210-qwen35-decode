@@ -2964,7 +2964,26 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
             ggml_cuda_op_gdn_decode_prep(ctx, dst);
             break;
         case GGML_OP_GDN_DECODE_OUT:
+#if defined(GGML_USE_HIP)
+            {
+                // also produce the q8_1 activation of the following single-token GEMV (ssm_out)
+                static const bool q8_out = [] {
+                    const char * v = getenv("GGML_Q8_PRODUCERS");
+                    const char * g = getenv("GGML_GDN_DECODE_Q8");
+                    return (v == nullptr || v[0] != '0') && (g == nullptr || g[0] != '0');
+                }();
+                block_q8_1 * q8      = nullptr;
+                int        * q8_sums = nullptr;
+                if (q8_out && ggml_cuda_info().devices[ctx.device].warp_size == 64 &&
+                        ggml_cuda_mmvq_cache_produce(ctx, dst, &q8, &q8_sums)) {
+                    ggml_cuda_op_gdn_decode_out_q8(ctx, dst, q8, q8_sums);
+                } else {
+                    ggml_cuda_op_gdn_decode_out(ctx, dst);
+                }
+            }
+#else
             ggml_cuda_op_gdn_decode_out(ctx, dst);
+#endif // defined(GGML_USE_HIP)
             break;
         case GGML_OP_DSV4_HC_COMB:
             ggml_cuda_op_dsv4_hc_comb(ctx, dst);
