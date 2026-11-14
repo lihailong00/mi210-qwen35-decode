@@ -206,7 +206,7 @@ template <class T3, class T4, int SM, bool FIRST3, bool ORD = false>   // ORD: i
 __launch_bounds__(NW*64, 1)
 __global__ void gemv_pair(const uint8_t * __restrict__ w3, float * __restrict__ d3, const int N3,
         const iq4k::soa s4, float * __restrict__ d4, const int N4,
-        const block_q8_1 * __restrict__ yg, const int K, const int y4off, const int rot, const int na, const glu_args ga) {
+        const block_q8_1 * __restrict__ yg, const int K, const int y4off, const int rot, const int na, const int maxu4, const glu_args ga) {
     extern __shared__ __align__(16) uint32_t smem[];
 #if defined(__HIP_DEVICE_COMPILE__)
     if ((uint32_t) (size_t) (__attribute__((address_space(3))) uint32_t *) smem != 0) __builtin_trap();
@@ -237,7 +237,7 @@ __global__ void gemv_pair(const uint8_t * __restrict__ w3, float * __restrict__ 
     }
 
     const int nwv4 = na > 0 ? (NW - na)*gridDim.x : nwv;
-    const int nunits4 = N4/RG, maxu4 = (int) ((uint32_t) (nunits4 + nwv4 - 1)/(uint32_t) nwv4);   // operands >= 0
+    // maxu4 = (N4/RG + nwv4 - 1)/nwv4 (IQ4 units per wave = the per-wave LDS slot stride) comes from the host (no division here)
     float * ow = (float *) (ys4 + (K/32/T4::YPI)*T4::YW) + wy*maxu4*RG;
     if (na > 0) {
         if (wy < na) {

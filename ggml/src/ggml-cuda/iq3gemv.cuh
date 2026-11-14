@@ -403,12 +403,12 @@ static __device__ __forceinline__ void pro_load(pro_regs<TA, TB, TWO> & r, const
         const int nrec = K/32;
         const int sy = CY ? min(tid, nrec - 1) : tid % nrec;
         const uint8_t * b = (const uint8_t *) (yg + sy);
+        // diet-gemv: no zero fill for the non-owners (9 v_mov in the prologue) - every consumer of q0/q1/ds (pro_store, the
+        // pair kernel's put_y) is guarded by the same tid < K/32
         if (!CY || tid < nrec) {
             r.q0 = *(const uint4 *) (b + 4);
             r.q1 = *(const uint4 *) (b + 20);
             r.ds = *(const uint32_t *) b;
-        } else {
-            r.q0 = make_uint4(0, 0, 0, 0); r.q1 = r.q0; r.ds = 0;
         }
         return;
     }
