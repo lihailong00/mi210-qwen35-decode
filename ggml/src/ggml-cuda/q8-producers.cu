@@ -65,7 +65,10 @@ static __global__ void __launch_bounds__(256) gated_q8_kernel(const float * __re
     q8p_quantize_1(r, i, y, ysum);
 }
 
-// rms_norm(x) * w for one row, block 1024 / 4 float4 per thread: same arithmetic as rms_norm_f32<1024, 4, true, true>
+// rms_norm(x) * w for one row, block 1024 / 4 float4 per thread: same arithmetic as rms_norm_f32<1024, 4, true, true>.
+// Every block of the grid redoes the (cheap, L2-resident) reduction with exactly the same order and writes only its
+// slice of the output + q8_1, so the output/quantization tail is spread over several CUs (bit-identical for any grid
+// size); the weights of the slice are loaded before the reduction (they are cold after the preceding GEMV).
 template <int VPT>
 static __global__ void __launch_bounds__(1024) rms_norm_mul_q8_kernel(const float * __restrict__ x, const float * __restrict__ w,
         float * __restrict__ dst, block_q8_1 * __restrict__ y, int * __restrict__ ysum, const int ncols, const float eps) {
@@ -77,7 +80,13 @@ static __global__ void __launch_bounds__(1024) rms_norm_mul_q8_kernel(const floa
     const float4 * mul4 = (const float4 *) w;
     float4       * dst4 = (float4 *) dst;
 
+    // output slice of this block, whole q8 blocks (8 float4)
+    const int per_block = ((ncols4/8 + (int) gridDim.x - 1) / (int) gridDim.x) * 8;
+    const int o0 = (int) blockIdx.x * per_block;
+    const int o1 = min(o0 + per_block, ncols4);
+
     float4 xs[VPT];
+    float4 ms[VPT];
     float  tmp = 0.0f;
 #pragma unroll
     for (int k = 0; k < VPT; k++) {
@@ -87,15 +96,22 @@ static __global__ void __launch_bounds__(1024) rms_norm_mul_q8_kernel(const floa
             tmp += xs[k].x*xs[k].x + xs[k].y*xs[k].y + xs[k].z*xs[k].z + xs[k].w*xs[k].w;
         }
     }
+#pragma unroll
+    for (int k = 0; k < VPT; k++) {
+        const int i = tid + k*block_size;
+        if (i >= o0 && i < o1) {
+            ms[k] = mul4[i];
+        }
+    }
     tmp = block_reduce<block_reduce_method::SUM, block_size>(tmp, s_sum);
     const float scale = rsqrtf(tmp / ncols + eps);
 
 #pragma unroll
     for (int k = 0; k < VPT; k++) {
         const int i = tid + k*block_size;
-        if (i < ncols4) {
+        if (i >= o0 && i < o1) {
             float4 r = make_float4(scale*xs[k].x, scale*xs[k].y, scale*xs[k].z, scale*xs[k].w);
-            const float4 m = mul4[i];
+            const float4 m = ms[k];
             r.x *= m.x;
             r.y *= m.y;
             r.z *= m.z;
@@ -169,7 +185,11 @@ bool ggml_cuda_rms_norm_mul_q8(ggml_backend_cuda_context & ctx, const ggml_tenso
     }
     float eps;
     memcpy(&eps, rms_norm->op_params, sizeof(float));
-    rms_norm_mul_q8_kernel<4><<<1, 1024, 0, ctx.stream()>>>((const float *) x->data, (const float *) w->data, (float *) mul_node->data,
+    // ~256 float4 of output per block (5 blocks for 5120 columns), GGML_Q8_NORM_BLOCKS overrides (1 = single block)
+    static const int nb_env = getenv("GGML_Q8_NORM_BLOCKS") ? atoi(getenv("GGML_Q8_NORM_BLOCKS")) : 0;
+    const int ncols4 = (int) x->ne[0] / 4;
+    const int nb = nb_env > 0 ? std::min(nb_env, ncols4/8) : std::max(1, std::min(16, ncols4/256));
+    rms_norm_mul_q8_kernel<4><<<nb, 1024, 0, ctx.stream()>>>((const float *) x->data, (const float *) w->data, (float *) mul_node->data,
             y, ysum, (int) x->ne[0], eps);
     CUDA_CHECK(cudaGetLastError());
     return true;
