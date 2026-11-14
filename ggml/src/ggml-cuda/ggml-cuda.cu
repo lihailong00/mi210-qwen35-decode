@@ -2757,7 +2757,9 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
                     ggml_cuda_op_geglu(ctx, dst);
                     break;
                 case GGML_GLU_OP_SWIGLU:
-                    ggml_cuda_op_swiglu(ctx, dst);
+                    if (!ggml_cuda_swiglu_q8(ctx, dst)) {
+                        ggml_cuda_op_swiglu(ctx, dst);
+                    }
                     break;
                 case GGML_GLU_OP_SWIGLU_OAI:
                     ggml_cuda_op_swiglu_oai(ctx, dst);
@@ -4972,7 +4974,9 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     }
 
     if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL }, {})) {
-        ggml_cuda_op_rms_norm_fused(*cuda_ctx, node, cgraph->nodes[i + 1]);
+        if (!ggml_cuda_rms_norm_mul_q8(*cuda_ctx, node, cgraph->nodes[i + 1])) {
+            ggml_cuda_op_rms_norm_fused(*cuda_ctx, node, cgraph->nodes[i + 1]);
+        }
         return 1;
     }
 
@@ -4994,7 +4998,9 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_UNARY, GGML_OP_MUL }, { GGML_UNARY_OP_SILU }) ||
         ggml_cuda_can_fuse(cgraph, i, { GGML_OP_UNARY, GGML_OP_MUL }, { GGML_UNARY_OP_SIGMOID }) ||
         ggml_cuda_can_fuse(cgraph, i, { GGML_OP_UNARY, GGML_OP_MUL }, { GGML_UNARY_OP_SOFTPLUS })) {
-        ggml_cuda_op_unary_mul(*cuda_ctx, node, cgraph->nodes[i + 1]);
+        if (!ggml_cuda_unary_mul_q8(*cuda_ctx, node, cgraph->nodes[i + 1])) {
+            ggml_cuda_op_unary_mul(*cuda_ctx, node, cgraph->nodes[i + 1]);
+        }
         return 1;
     }
 

@@ -9,6 +9,13 @@ bool ggml_cuda_mmvq_fused(ggml_backend_cuda_context & ctx, const ggml_tensor * s
 
 // invalidate the per-stream cache of the quantized single-token activation (call at the start of every graph evaluation)
 void ggml_cuda_mmvq_cache_reset(ggml_backend_cuda_context & ctx);
+// producer API (mmvq.cu): get the cache buffer for the q8_1 blocks + int sums of the single-row activation t
+bool ggml_cuda_mmvq_cache_produce(ggml_backend_cuda_context & ctx, const ggml_tensor * t, block_q8_1 ** q8, int ** sums);
+
+// q8-producing variants of activation kernels (q8-producers.cu); return false if not applicable (nothing launched)
+bool ggml_cuda_rms_norm_mul_q8(ggml_backend_cuda_context & ctx, const ggml_tensor * rms_norm, ggml_tensor * mul_node);
+bool ggml_cuda_swiglu_q8(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
+bool ggml_cuda_unary_mul_q8(ggml_backend_cuda_context & ctx, ggml_tensor * unary_node, ggml_tensor * mul_node);
 
 // Single-token GEMV for IQ2_S/IQ2_XS/IQ2_XXS/Q2_K/IQ1_M on SoA re-laid-out weights (activation already quantized to q8_1).
 bool ggml_cuda_mmvq_lowbit(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const block_q8_1 * src1_q8_1, ggml_tensor * dst,

@@ -1619,6 +1619,41 @@ void ggml_cuda_mmvq_cache_reset(ggml_backend_cuda_context & ctx) {
     }
 }
 
+// Producer side: a kernel that creates the single-row activation t (K % 512 == 0) also writes its q8_1 blocks + sums
+// into the cache buffer; returns false if the cache cannot be used (then the producer must not write q8 data).
+bool ggml_cuda_mmvq_cache_produce(ggml_backend_cuda_context & ctx, const ggml_tensor * t, block_q8_1 ** q8, int ** sums) {
+    const int64_t ne10 = ggml_nelements(t);
+    if (mmvq_q8_cache_disabled() || ne10 % MATRIX_ROW_PADDING != 0 || !ggml_is_contiguous(t)) {
+        return false;
+    }
+    cudaStream_t stream = ctx.stream();
+    const size_t q8_bytes = ne10/QK8_1*sizeof(block_q8_1);
+    const size_t need = q8_bytes + ne10/QK8_1*sizeof(int) + 256;
+    std::lock_guard<std::mutex> lock(mmvq_q8_cache_mutex);
+    mmvq_q8_cache_entry & e = mmvq_q8_caches[{ctx.device, stream}];
+    if (e.size < need) {
+        hipStreamCaptureStatus status;
+        CUDA_CHECK(hipStreamIsCapturing(stream, &status));
+        if (status != hipStreamCaptureStatusNone) {
+            return false;
+        }
+        if (e.buf) {
+            CUDA_CHECK(cudaStreamSynchronize(stream));
+            CUDA_CHECK(cudaFree(e.buf));
+        }
+        e.size = std::max(need, (size_t) 1 << 20);
+        CUDA_CHECK(cudaMalloc(&e.buf, e.size));
+    }
+    const size_t sums_off = (q8_bytes + 255) & ~(size_t) 255;
+    *q8   = (block_q8_1 *) e.buf;
+    *sums = (int *) (e.buf + sums_off);
+    e.src   = t;
+    e.data  = t->data;
+    e.ne10  = ne10;
+    e.valid = true;
+    return true;
+}
+
 // returns false if the cache cannot be used (then the caller quantizes into a pool buffer)
 static bool mmvq_q8_cache_get(ggml_backend_cuda_context & ctx, const ggml_tensor * src1, const int64_t ne10, const int64_t ne10_padded,
         const block_q8_1 ** q8, const int ** sums) {
@@ -1647,7 +1682,9 @@ static bool mmvq_q8_cache_get(ggml_backend_cuda_context & ctx, const ggml_tensor
     const size_t sums_off = (q8_bytes + 255) & ~(size_t) 255;
     *q8   = (const block_q8_1 *) e.buf;
     *sums = (const int *) (e.buf + sums_off);
-    if (e.valid && e.src == src1 && e.data == src1->data && e.ne10 == ne10) {
+    const ggml_tensor * base_src1 = src1->view_src ? src1->view_src : src1;
+    const ggml_tensor * base_e    = e.src ? (e.src->view_src ? e.src->view_src : e.src) : nullptr;
+    if (e.valid && base_e == base_src1 && e.data == src1->data && e.ne10 == ne10) {
         return true;
     }
     const int64_t nblk = (ne10_padded + CUDA_QUANTIZE_BLOCK_SIZE - 1) / CUDA_QUANTIZE_BLOCK_SIZE;
