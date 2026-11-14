@@ -5,6 +5,8 @@
 #include "fattn-vec.cuh"
 #include "fattn.cuh"
 
+thread_local ggml_cuda_fattn_gate_epilogue * ggml_cuda_fattn_epilogue = nullptr;
+
 #if !defined(GGML_USE_MUSA)
 
 // one list per group of ncols1 queries: a column is selected if any query of the group can see it

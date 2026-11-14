@@ -4563,6 +4563,88 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
 }
 
 // try and fuse nodes and return the number of nodes to skip
+// flash attention (single query) followed by sigmoid(gate) * attn (qwen3.5 gated attention): the gating and the q8_1 of
+// the gated output for the attn_output GEMV are done by the FA combine kernel (one launch less per layer).
+// Matches FLASH_ATTN_EXT, views, UNARY(SIGMOID, gate), MUL(view(FA), SIGMOID); returns the nodes to skip or 0.
+static int ggml_cuda_try_fattn_gate_fusion(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, const int i) {
+    static const bool disabled = getenv("GGML_CUDA_DISABLE_FA_GATE_FUSION") != nullptr;
+    if (disabled) {
+        return 0;
+    }
+    ggml_tensor * fa = cgraph->nodes[i];
+    const ggml_tensor * Q = fa->src[0];
+    if (Q->ne[1] != 1 || Q->ne[3] != 1 || fa->type != GGML_TYPE_F32 || !ggml_is_contiguous(fa) ||
+        (fa->flags & GGML_TENSOR_FLAG_OUTPUT)) {
+        return 0;
+    }
+    int iu = -1;
+    int im = -1;
+    for (int j = i + 1; j < cgraph->n_nodes; ++j) {
+        const ggml_tensor * n = cgraph->nodes[j];
+        if (ggml_cuda_is_view_or_noop(n)) {
+            // only views of the FA output may sit in between
+            const ggml_tensor * r = n;
+            while (r->view_src) {
+                r = r->view_src;
+            }
+            if (r != fa || ggml_node_get_use_count(cgraph, j) != 1 || (n->flags & GGML_TENSOR_FLAG_OUTPUT)) {
+                return 0;
+            }
+            continue;
+        }
+        if (iu < 0) {
+            if (n->op != GGML_OP_UNARY || ggml_get_unary_op(n) != GGML_UNARY_OP_SIGMOID) {
+                return 0;
+            }
+            iu = j;
+            continue;
+        }
+        if (n->op != GGML_OP_MUL) {
+            return 0;
+        }
+        im = j;
+        break;
+    }
+    if (iu < 0 || im < 0) {
+        return 0;
+    }
+    ggml_tensor * un  = cgraph->nodes[iu];
+    ggml_tensor * mul = cgraph->nodes[im];
+    const ggml_tensor * gate  = un->src[0];
+    const ggml_tensor * other = mul->src[0] == un ? mul->src[1] : (mul->src[1] == un ? mul->src[0] : nullptr);
+    if (other == nullptr) {
+        return 0;
+    }
+    const ggml_tensor * root = other;
+    while (root->view_src) {
+        root = root->view_src;
+    }
+    const int64_t n = ggml_nelements(fa);
+    if (root != fa || other->data != fa->data || !ggml_is_contiguous(other) || ggml_nelements(other) != n ||
+        gate->type != GGML_TYPE_F32 || un->type != GGML_TYPE_F32 || mul->type != GGML_TYPE_F32 ||
+        !ggml_is_contiguous(gate) || !ggml_is_contiguous(un) || !ggml_is_contiguous(mul) ||
+        ggml_nelements(gate) != n || ggml_nelements(un) != n || ggml_nelements(mul) != n ||
+        ggml_node_get_use_count(cgraph, i) != 1 || ggml_node_get_use_count(cgraph, iu) != 1 ||
+        (un->flags & GGML_TENSOR_FLAG_OUTPUT)) {
+        return 0;
+    }
+
+    ggml_cuda_fattn_gate_epilogue ep;
+    ep.ctx      = cuda_ctx;
+    ep.gate     = (const float *) gate->data;
+    ep.mul_node = mul;
+    ggml_cuda_fattn_epilogue = &ep;
+    ggml_cuda_flash_attn_ext(*cuda_ctx, fa);
+    ggml_cuda_fattn_epilogue = nullptr;
+    if (!ep.applied) {
+        // no combine step in this call: gate separately, exactly like the UNARY+MUL fusion below
+        if (!ggml_cuda_unary_mul_q8(*cuda_ctx, un, mul)) {
+            ggml_cuda_op_unary_mul(*cuda_ctx, un, mul);
+        }
+    }
+    return im - i;
+}
+
 static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
 
     if (ggml_cuda_fusion_disabled()) {
@@ -4570,6 +4652,13 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     }
 
     ggml_tensor * node = cgraph->nodes[i];
+
+    if (node->op == GGML_OP_FLASH_ATTN_EXT) {
+        const int nodes_to_skip = ggml_cuda_try_fattn_gate_fusion(cuda_ctx, cgraph, i);
+        if (nodes_to_skip > 0) {
+            return nodes_to_skip;
+        }
+    }
 
     // full-attention prep chain (q/k norm + rope, gate copy, k/v cache stores) as one kernel
     if (node->op == GGML_OP_RMS_NORM) {
