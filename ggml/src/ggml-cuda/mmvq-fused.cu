@@ -253,7 +253,13 @@ bool ggml_cuda_mmvq_fused_preq(ggml_backend_cuda_context & ctx, const ggml_tenso
         const char * v = getenv("GGML_MMVQF_Q4K");
         return v == nullptr || v[0] != '0';
     }();
-    if (!enabled || !mmvqf_enabled() || src0->type != GGML_TYPE_Q4_K || !q8 || !sums) {
+    static const int iq4xs_cfg = [] {   // experimental: 0 off, 1..3 configs
+        const char * v = getenv("GGML_MMVQF_IQ4XS");
+        return v ? atoi(v) : 0;
+    }();
+    const bool is_q4k   = src0->type == GGML_TYPE_Q4_K && enabled;
+    const bool is_iq4xs = src0->type == GGML_TYPE_IQ4_XS && iq4xs_cfg > 0;
+    if (!mmvqf_enabled() || (!is_q4k && !is_iq4xs) || !q8 || !sums) {
         return false;
     }
     const int64_t K = src0->ne[0];
@@ -284,7 +290,16 @@ bool ggml_cuda_mmvq_fused_preq(ggml_backend_cuda_context & ctx, const ggml_tenso
     p.N          = (int) N;
     p.vx         = (const char *) src0->data;
     p.stride_row = (int) (src0->nb[1] / ggml_type_size(src0->type));
-    launch_pp<pipe_q4k, 8, 16, 1, false>(p, ggml_cuda_info().devices[device].nsm, 2, ctx.stream());
+    const int ncu = ggml_cuda_info().devices[device].nsm;
+    if (is_q4k) {
+        launch_pp<pipe_q4k, 8, 16, 1, false>(p, ncu, 2, ctx.stream());
+    } else if (iq4xs_cfg == 1) {
+        launch_pp<pipe_iq4xs, 8, 32, 2, false>(p, ncu, 1, ctx.stream());
+    } else if (iq4xs_cfg == 2) {
+        launch_pp<pipe_iq4xs, 8, 32, 1, false>(p, ncu, 2, ctx.stream());
+    } else {
+        launch_pp<pipe_iq4xs, 4, 32, 1, false>(p, ncu, 4, ctx.stream());
+    }
     CUDA_CHECK(cudaGetLastError());
     return true;
 }
