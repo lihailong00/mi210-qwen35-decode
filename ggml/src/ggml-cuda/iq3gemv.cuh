@@ -840,6 +840,7 @@ __global__ void gemv_sk(const uint8_t * __restrict__ wa, const uint8_t * __restr
     uint32_t t = wstart(w);
     const uint32_t tend = wstart(w + 1);
     int u = (int) (t / (uint32_t) S), s0 = (int) (t - (uint32_t) u*S);   // one division; then incremental
+    int sp_u[4], sp_n[4], nsplit = 0;          // split pieces of this wave (at most 2 in practice)
     while (t < tend) {
         const int s1 = (int) min((uint32_t) S, (uint32_t) s0 + (tend - t));
         float acc = 0.0f, accb = 0.0f;
@@ -892,25 +893,32 @@ __global__ void gemv_sk(const uint8_t * __restrict__ wa, const uint8_t * __restr
             if (lane == 0) dst[row] = GLU ? vb * silu(v) : (residual ? v + residual[row] : v);
             continue;
         }
-        // split unit: pieces = waves whose (non-empty) ranges intersect [ub, ue)
+        // split unit: pieces = waves whose (non-empty) ranges intersect [ub, ue). Store the partial now, do the
+        // counter / fix-up after the wave's last piece (one fence per wave instead of one per split piece).
         const uint32_t ub = (uint32_t) cu*(uint32_t) S, ue = ub + (uint32_t) S;
         uint32_t wf = w; while (wf > 0 && wstart(wf) > ub) --wf;
         uint32_t wl = w; while (wl + 1 < W && wstart(wl + 1) < ue) ++wl;
         const int slot = (int) (w - wf), npieces = (int) (wl - wf + 1);
         float * pp = part + ((size_t) cu*S + slot)*(RG*2);
         if (lane == 0) { pp[2*grp] = v; pp[2*grp + 1] = vb; }
-        __threadfence();
+        if (nsplit < 4) { sp_u[nsplit] = cu; sp_n[nsplit] = npieces; ++nsplit; }
+    }
+    if (nsplit == 0) return;
+    __threadfence();
+    for (int k = 0; k < nsplit; ++k) {
+        const int cu = sp_u[k], npieces = sp_n[k];
         int old = 0;
         if (threadIdx.x == 0) old = atomicAdd(cnt + cu, 1);
         old = __shfl(old, 0, 64);
         if (old == npieces - 1) {
             __threadfence();
             if (lane == 0) {
+                const int row = cu*RG + grp;
                 float sv = 0.0f, svb = 0.0f;
-                for (int k = 0; k < npieces; ++k) {
-                    const float * q = part + ((size_t) cu*S + k)*(RG*2);
-                    sv += __builtin_nontemporal_load(q + 2*grp);
-                    if constexpr (GLU) svb += __builtin_nontemporal_load(q + 2*grp + 1);
+                for (int q = 0; q < npieces; ++q) {
+                    const float * pq = part + ((size_t) cu*S + q)*(RG*2);
+                    sv += __builtin_nontemporal_load(pq + 2*grp);
+                    if constexpr (GLU) svb += __builtin_nontemporal_load(pq + 2*grp + 1);
                 }
                 dst[row] = GLU ? svb * silu(sv) : (residual ? sv + residual[row] : sv);
             }
