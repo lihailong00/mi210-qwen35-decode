@@ -359,6 +359,9 @@ static void ggml_cuda_op_gated_delta_net_impl(
         if (ggml_cuda_gdn_mma_launch(ctx.device, args, stream)) {
             return;
         }
+        if (!keep_rs && ggml_cuda_gdn_mfma_launch(ctx.device, args, stream)) {
+            return;
+        }
     }
     if (kda) {
         if (keep_rs) {
