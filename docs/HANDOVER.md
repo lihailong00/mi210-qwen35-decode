@@ -15,7 +15,7 @@
 | decode tg128，上下文 0 | 45.63 token/s | 80.33 token/s | +76.0% |
 | decode tg128，上下文 8192 | 44.23 token/s | 74.57 token/s | +68.6% |
 | decode tg128，上下文 32768 | 40.65 token/s | 64.43 token/s | +58.5% |
-| prefill pp8192 | 1220 token/s | 1895 token/s | +55%（第十三节的各项 prefill 修正；只做 decode 优化时为 1245） |
+| prefill pp8192 | 1220 token/s | 2000 token/s | +64%（第十三节的各项 prefill 修正；只做 decode 优化时为 1245） |
 | llama-server 单请求（-np 1） | 45.6 token/s | 79.1 token/s | +73% |
 | 每 token kernel 启动数 | 1933 | 601 | −69% |
 | 显存峰值（llama-bench） | 24.1 GB | 28.1–31.9 GB | +4–8 GB |
@@ -489,7 +489,7 @@ docker exec mi210-opt bash -lc "PAR=12 /lab/build-wt.sh /lab/wt-mybranch /lab/wt
 | 物理上限：50.5 GFLOP 以 171 TFLOPS 计算（零数据峰值；真实数据受功耗上限限制，见第 6 小节） | 约 3390 |
 | 物理上限（真实数据，约 150 TFLOPS） | 约 2980 |
 | GEMM 全部用最优库 kernel（hipBLASLt 平均约 150 TFLOPS），其余开销为零 | 约 3000 |
-| 当前版本（pp8192） | 1895 |
+| 当前版本（pp8192） | 2000 |
 
 修正前，rocprofv3 测得每 token 0.804 ms：GEMM 0.577 ms（权重先反量化为 f16，再走 rocBLAS，平均只有 84 TFLOPS），非 GEMM 0.227 ms（逐 token 递推的 DeltaNet kernel 0.065，flash attention 0.047、只有 34 TFLOPS，反量化 0.031，其余小算子约 0.08）。
 
@@ -602,10 +602,51 @@ pp8192 时 `flash_attn_ext_f16<256,256,8,8>` 每次调用 12.1 ms（约 34 TFLOP
 - 注意：kv_rows（索引表）在 `ggml_cuda_get_best_fattn_kernel` 里目前只对 NVIDIA 开放，所以快速路径里的 `if (indices)` 分支在 CDNA 上到不了；它们在放开该限制的私有构建里验证过一次（仅 head 256）。
 - 还剩：kernel 的 MFMA 下限约 2.75 ms（150 TFLOPS）；剩下的是每次迭代 4 个 barrier、约 275 条普通指令和 LDS 流量。
 
-### 10. 剩余 prefill 方向
+### 10. prefill 小算子融合（四项，后端内模式匹配，不改图的语义）
 
-- 非 GEMM 部分：小算子融合（SwiGLU 直接输出 f16、合并 f32→f16 转换、卷积直接读 token 顺序的数据，合计约 +8%），DeltaNet kernel 第二轮（约 +2%）。反量化离带宽下限（约 45 ms/批次）还差约 20 ms，主要影响短 prompt。
-- GEMM 部分已接近库 kernel 在功耗上限下的水平。卷积可以直接从按 token 排列的激活计算、完全跳过转置拷贝（约再 +2%）；gate/up 等共用输入的 f32→f16 转换可以去重（约 +1%）；SwiGLU 可以直接输出 f16（约 +1%）。
+flash attention 之后，pp8192 每 token 562 µs 里 GEMM 和注意力以外的小算子还有约 68 µs。四项融合各自先在私有构建里做原型，每项由两个独立的 agent 复核（一个找正确性问题，一个重测速度），再合并成一个补丁并整体复核两轮。
+
+| 融合 | 做法 | 每 token 节省（pp8192） | 开关（设 0 关闭） |
+|---|---|---|---|
+| 卷积输入 | `CONCAT → SSM_CONV+SILU`：不再生成转置后的 concat 缓冲，`ssm_conv4_silu_stream_f32` 直接在按 token 排列的 qkv GEMM 输出上做 4 行模板计算；`conv_fuse_prep_f32` 只写后面还会被读到的部分（状态列、尾部几列、每个分块前的 3 行） | 约 11.8 µs | `GGML_CUDA_CONV_FUSE` |
+| SwiGLU | `GLU(SWIGLU) → MUL_MAT`：`swiglu_f32_f16_kernel` 把 `silu(gate)·up` 直接写成 ffn_down GEMM 的 f16 输入，省掉 f32 写出和随后的转换 | 约 8.2 µs | `GGML_CUDA_SWIGLU_F16` |
+| f16 副本共享 | 同一个 F32 激活被多个 GEMM 读取时（q/k/v、gate/up、qkv/z 等）只转换一次；融合的 rms_norm·weight kernel 顺带写出 f16 副本 | 约 7.1 µs（其中 rms_norm 写出约 2.7） | `GGML_CUDA_F16_SHARE`、`GGML_CUDA_RMS_NORM_F16` |
+| 残差加法 | `MUL_MAT → ADD(residual, mm)`：GEMM 以 beta=1 直接累加到残差上；与 SwiGLU 组合成三节点融合 | 约 3.6 µs | `GGML_CUDA_GEMM_ADD_FUSION` |
+
+四项相加 30.7 µs，合在一起实测 28.5 µs。gate/up GEMM 的输出没有改成 f16（那会损失精度）。
+
+实现要点：
+
+- **统一的路由判断。** `ggml_cuda_mul_mat_get_route()` 是 MUL_MAT 选 kernel 族的唯一位置，`ggml_cuda_mul_mat` 自己按它分发，三项融合都通过 `ggml_cuda_mul_mat_cublas_gemm_type()` 询问，不存在各自复制一份分发条件的问题。
+- **残差加法需要改图里的操作数顺序。** 原图是 `add(cur, residual)`，ggml-alloc 把和放在 GEMM 输出上，折叠就得先拷贝残差。`qwen35.cpp` 在 n_tokens ≥ 256 时改成 `add(residual, cur)`，和就落在残差上，GEMM 直接累加。条件化是因为无条件交换会改变单 token 的缓冲布局，让一层全注意力丢掉 `fattn_dec_gate` 融合。两种形式在最后一层的节点顺序不同，所以大批次之后跟一个小的多 token 批次时调度器会重新 reserve 一次（已验证结果正确，pp4196 为 1918 对 1805）；`qwen35.cpp` 里的注释写明了这一点。
+- **f16 副本缓存的失效规则。** 每个上下文两个专用缓冲；条目按张量指针、数据范围、形状、类型和 stream 匹配；每次图计算开始时全部清空，执行任何输出字节与源重叠的节点之前清除对应条目（融合组内每个非 view 成员都算，包括 beta=1 累加写入的 ADD 节点）；并发 stream 区域内不使用缓存。
+- **卷积融合的适用条件。** F32、d_conv = 4、无 bias、n_t ≥ 256；concat 的全部引用必须是这个 SSM_CONV 加上若干只读尾部列的 view，并且引用数要等于图的 use count（否则另一个调度分片里的读者会读到没有生成的缓冲）；concat 与 SSM_CONV 之间不能有别的 CONCAT；输出要么与 GEMM 输出完全重合，要么完全不相交。分块长度随批次变化（n_t/16 取整到 32 的倍数，32–256）：固定 256 时 256–400 token 的批次反而比不融合慢约 1%。
+- **bit 一致。** 新的卷积 kernel 关掉了 fma 合并（`#pragma clang fp contract(off)`），因为旧 kernel 编译出来是分开的乘和加；SwiGLU kernel 保留原来的 expf 和除法。
+- f16 副本共享和 rms_norm 的 f16 输出目前只在 HIP 构建里启用（非 HIP 构建没有编译验证过）；其余融合本身就在 `GGML_USE_HIP` 内。`GGML_CUDA_FUSION_STATS=1` 在上下文销毁时打印各融合的计数，`GGML_CUDA_F16_SHARE_VERIFY=1`（配合 `GGML_CUDA_DISABLE_GRAPHS=1`）在每次复用时按位复核。
+
+结果（独立从头构建，各臂交替运行，ub 4096；“之前”为同一构建关掉全部开关，与上一版一致）：
+
+| 测试 | 之前（token/s） | 之后（token/s） | 变化 |
+|---|---|---|---|
+| pp256 | 919 | 944 | +2.8% |
+| pp512 | 1180 | 1222 | +3.6% |
+| pp1024 | 1537 | 1618 | +5.3% |
+| pp2048 | 1850 | 1952 | +5.5% |
+| pp8192 | 1889 | 2000 | +5.9% |
+| pp16384 | 1834 | 1938 | +5.7% |
+| decode（深度 0） | 79.8 | 79.9 | 不变（噪声内） |
+
+- 正确性：固定 GEMM 选核（`GGML_CUDA_GEMM_TUNE=0`）时，`llama-perplexity --kl-divergence-base` 的输出在“全开 / 全关 / 上一版”之间 md5 完全相同，覆盖 c512、c4096、c2999、c300、c256、c400、跨阈值的 256+44 和 4096+100、以及 `-ngl 40` 部分卸载；对参考的 KLD 0.000002、top-1 99.951%；c=8192 的 perplexity 3.5637 不变；贪心生成逐字节相同。
+- decode 的 kernel 名称和调用次数与上一版完全相同（60 个名称、82409 次调用）。
+- 测试：`test-backend-ops` 新增 `SSM_CONV_CONCAT_SILU`（22 例）和 `GEMM_FUSION`（45 例），用计数器确认每个用例确实走到融合 kernel；其中 `concat_between=1` 是原型里一个静默错误（两个 CONCAT 之间计划被清掉）的回归用例，`res-reused` 在去掉组后失效逻辑的构建上会失败。另有 195 个对抗性合成图场景（对 CPU 后端、对关闭开关逐字节比较）全部通过。全量 `test-backend-ops` 只有与本改动无关、上一版同样存在的 `TOPK_MOE` 失败。
+- 过程中发现但没有在这里处理的两个问题：
+  - 逐形状的 GEMM 选核对 5120×6144 这个形状不稳定，约 40% 的进程会选到稳态慢 11% 的 kernel（突发计时里两者相同），pp8192 因此呈双峰，相差约 0.8%。
+  - 2D 权重 × 3D（广播）src1 的批量 cuBLAS 路径在同一进程先跑过其它图之后会出现 GPU 访存错误，与本改动无关，未修。
+
+### 11. 剩余 prefill 方向
+
+- 非 GEMM 部分：DeltaNet kernel 第二轮（约 +2%）；还剩 6144 宽的单消费者 f32→f16 转换（约 1.8 µs/token）和约 0.9 TB/s 的流式 kernel 离带宽上限的差距。反量化离带宽下限（约 45 ms/批次）还差约 20 ms，主要影响短 prompt。
+- GEMM 部分已接近库 kernel 在功耗上限下的水平，剩下的是自写 GEMM 和修掉 5120×6144 形状的选核不稳定（约 +0.3% 的期望值，并消除双峰）。
 
 微基准源码在 `mi210-tools/peak-bench/`：`peak_bench.hip`（带宽、MFMA、方阵 GEMM）、`bound_bench.hip`（逐张量读取 graph、实际形状 GEMM 全候选扫描）、`gemm_sweep.hip`（不同 token 数下的选核对比）、`mfma_rand.hip`（零数据与随机数据下的 MFMA 峰值，显示功耗上限的影响）。编译：`hipcc -O3 --offload-arch=gfx90a -std=c++17 <file> -lrocblas`。
 
@@ -636,6 +677,9 @@ pp8192 时 `flash_attn_ext_f16<256,256,8,8>` 每次调用 12.1 ms（约 34 TFLOP
 | `GGML_CUDA_DISABLE_FA_GATE_FUSION` | 关 | 设 1 关闭 FA 门融合 |
 | `GGML_CUDA_FA_DEC` / `GGML_CUDA_FA_DEC_MAX_KV` | 开 / 1024 | 短上下文 FA 解码及其 KV 长度上限 |
 | `GGML_CUDA_FUSED_ROPE_NO_MROPE` | 关 | 设 1 时 norm+rope 融合不覆盖 MROPE/IMROPE |
+| `GGML_CUDA_CONV_FUSE` / `GGML_CUDA_SWIGLU_F16` / `GGML_CUDA_GEMM_ADD_FUSION` | 开 | prefill 小算子融合：卷积输入 / SwiGLU 直接写 f16 / 残差加法并入 GEMM |
+| `GGML_CUDA_F16_SHARE` / `GGML_CUDA_RMS_NORM_F16` | 开 | GEMM 输入的 f16 副本共享 / rms\_norm 顺带写出 f16 副本 |
+| `GGML_CUDA_FUSION_STATS`、`GGML_CUDA_F16_SHARE_VERIFY`、`GGML_CUDA_CONV_FUSE_CHUNK` | 关 | 融合计数 / 复用时按位复核 / 覆盖卷积分块长度 |
 | `GGML_SCHED_SYNC_UPLOADS` / `GGML_CUDA_NO_UPLOAD_BATCH` | 关 | 设 1 回到同步上传 / 不合并小上传 |
 | `GGML_CUDA_ATTN_PREP_VERIFY`、`GGML_GDN_DECODE_Q8_SELFTEST`、`GGML_MMVQ_MIX_EMPTY*` 等 | 关 | 调试与标定用 |
 | `CODEX_IQ3_PREPACK` / `CODEX_IQ3_XXS_PREPACK` | 需设 1 | 保留版补丁的开关；所有测量都在 =1 下进行 |
