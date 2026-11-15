@@ -285,6 +285,20 @@ static void ggml_cuda_flash_attn_ext_mma_f16_switch_ncols2(ggml_backend_cuda_con
         }
     }
 
+    // On CDNA with a GQA ratio of 6, 2 out of 8 head columns of the ncols2=8 kernel would be padding.
+    // Except for small batches it is faster to process the Q heads in pairs at the cost of loading K/V 3 times.
+    // GGML_CUDA_FATTN_GQA6_MIN_BATCH sets the minimum number of Q tokens, 0 disables.
+    if constexpr (DKQ == 256 && DV == 256) {
+        static const int64_t gqa6_min_batch = [] {
+            const char * e = getenv("GGML_CUDA_FATTN_GQA6_MIN_BATCH");
+            return e ? (int64_t) atoll(e) : (int64_t) 64;
+        }();
+        if (amd_mfma_available(cc) && use_gqa_opt && gqa_ratio == 6 && gqa6_min_batch > 0 && Q->ne[1] >= gqa6_min_batch) {
+            ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1<DKQ, DV, 2>(ctx, dst);
+            return;
+        }
+    }
+
     if (use_gqa_opt && gqa_ratio > 4) {
         ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1<DKQ, DV, 8>(ctx, dst);
         return;

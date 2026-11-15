@@ -5,6 +5,39 @@
 
 using namespace ggml_cuda_mma;
 
+// Fast path for the 512-thread DKQ=DV=256 configuration on CDNA (wave64, MFMA), see flash_attn_ext_f16_iter.
+// Compile with -DGGML_CUDA_FATTN_MMA_CDNA_FAST=0 to only use the generic code path.
+#ifndef GGML_CUDA_FATTN_MMA_CDNA_FAST
+#define GGML_CUDA_FATTN_MMA_CDNA_FAST 1
+#endif // GGML_CUDA_FATTN_MMA_CDNA_FAST
+
+#if defined(AMD_MFMA_AVAILABLE) && GGML_CUDA_FATTN_MMA_CDNA_FAST
+#define FATTN_MMA_CDNA_FAST_AVAILABLE
+typedef int       fattn_i4a __attribute__((ext_vector_type(4))); // 16 bytes of K, 16 byte aligned (LDS)
+typedef fattn_i4a fattn_i4u __attribute__((aligned(4)));         // same, as found in VRAM
+typedef short     fattn_s8a __attribute__((ext_vector_type(8))); // 8 half of V, 16 byte aligned (LDS)
+typedef fattn_s8a fattn_s8u __attribute__((aligned(4)));         // same, as found in VRAM
+typedef short     fattn_s4  __attribute__((ext_vector_type(4)));
+
+// V is staged transposed: the 8 byte unit (r4, d) holds V[4*r4 + 0..3][d], which is one lane of an MFMA A operand.
+// The 16 units of one MFMA are padded to 144 bytes, otherwise the 64 lanes of a store hit only 4 of the 32 LDS banks.
+#define FATTN_MMA_CDNA_FAST_VT_STRIDE_D16 144
+#define FATTN_MMA_CDNA_FAST_VT_STRIDE_R4  (16*FATTN_MMA_CDNA_FAST_VT_STRIDE_D16)
+#endif // defined(AMD_MFMA_AVAILABLE) && GGML_CUDA_FATTN_MMA_CDNA_FAST
+
+#if defined(FATTN_MMA_CDNA_FAST_AVAILABLE)
+// v holds 8 half each of 4 consecutive V rows. Returns the 2 units for columns e and e+1, i.e. {v[0..3][e], v[0..3][e+1]}.
+template <int e>
+static __device__ __forceinline__ fattn_s8a ggml_cuda_fattn_mma_cdna_fast_transpose(const fattn_s8a * const v) {
+    const fattn_s4 ab = __builtin_shufflevector(v[0], v[1], e, 8 + e, e + 1, 9 + e);
+    const fattn_s4 cd = __builtin_shufflevector(v[2], v[3], e, 8 + e, e + 1, 9 + e);
+    return __builtin_shufflevector(ab, cd, 0, 1, 4, 5, 2, 3, 6, 7);
+}
+#endif // defined(FATTN_MMA_CDNA_FAST_AVAILABLE)
+
+// Bytes of shared memory needed for the transposed V tile of the CDNA fast path (64 rows of 256 half).
+#define FATTN_MMA_CDNA_FAST_VT_NBYTES (16*16*144)
+
 // Config options for the MMA kernel.
 // Should not affect results, only speed/register pressure/shared memory use.
 struct fattn_mma_config {
@@ -490,6 +523,35 @@ static __device__ __forceinline__ void flash_attn_ext_f16_load_tile(
     }
 }
 
+// Whether the kernel uses the CDNA fast path. ncols2 > 1 guarantees that there is a mask and no OOB check.
+// When widening this, also adjust the shared memory size in ggml_cuda_flash_attn_ext_mma_f16_case (cdna_fast_maybe).
+template <int DKQ, int DV, int ncols1, int ncols2, int nwarps, bool V_is_K_view, bool use_sparse>
+static constexpr __device__ bool ggml_cuda_fattn_mma_cdna_fast() {
+#if defined(FATTN_MMA_CDNA_FAST_AVAILABLE)
+    return ggml_cuda_get_physical_warp_size() == 64 && DKQ == 256 && DV == 256 && nwarps == 8 &&
+        ncols1*ncols2 == 64 && ncols2 > 1 && !V_is_K_view && !use_sparse &&
+        ggml_cuda_fattn_mma_get_nbatch_fa(DKQ, DV, ncols1*ncols2) ==  64 &&
+        ggml_cuda_fattn_mma_get_nbatch_K2(DKQ, DV, ncols1*ncols2) == 128 &&
+        ggml_cuda_fattn_mma_get_nbatch_V2(DKQ, DV, ncols1*ncols2) == 128 &&
+        ggml_cuda_fattn_mma_get_Q_in_reg (DKQ, DV, ncols1*ncols2) &&
+        ggml_cuda_fattn_mma_get_nstages  (DKQ, DV, ncols1, ncols2, use_sparse) <= 1;
+#else
+    return false;
+#endif // defined(FATTN_MMA_CDNA_FAST_AVAILABLE)
+}
+
+// exp for the softmax. On the CDNA fast path this is a single instruction. Due to the rounding of x*log2(e) the result
+// is up to ~1e-6 (relative) off expf, far below the FP16 precision of the values it is converted to.
+template <bool cdna_fast>
+static __device__ __forceinline__ float ggml_cuda_fattn_mma_expf(const float x) {
+#if defined(FATTN_MMA_CDNA_FAST_AVAILABLE)
+    if constexpr (cdna_fast) {
+        return __builtin_amdgcn_exp2f(x*1.44269504088896341f);
+    }
+#endif // defined(FATTN_MMA_CDNA_FAST_AVAILABLE)
+    return expf(x);
+}
+
 template<int ncols1, int nwarps, int nbatch_fa, bool use_cp_async, bool oob_check, bool use_sparse>
 static __device__ __forceinline__ void flash_attn_ext_f16_load_mask(
         const half * const __restrict__ mask_h, half * const __restrict__ tile_mask,
@@ -606,7 +668,8 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
         float        * const __restrict__ KQ_rowsum,
         const int jt,
         const int kb0,
-        const int k_VKQ_sup) {
+        const int k_VKQ_sup,
+        void * const K_next_v = nullptr) {
 #if defined(VOLTA_MMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE) || defined(AMD_MFMA_AVAILABLE)
     constexpr int  warp_size       = ggml_cuda_get_physical_warp_size();
     constexpr int  ncols           = ncols1 * ncols2;
@@ -624,6 +687,58 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
     constexpr int stride_tile_V = V_is_K_view ? stride_tile_K : (swz ? nbatch_V2 : nbatch_V2 + 4);
 
     const int k_VKQ_0 = kb0 * nbatch_fa;
+
+    // CDNA fast path: a wave takes several hundred cycles to get data from VRAM and stalls on every load it has to wait for.
+    // Therefore all loads of a tile are issued together and one phase ahead of their use:
+    //     store K (loaded during the previous iter), issue V + mask loads | KQ | store mask | softmax |
+    //     store V transposed, issue K loads for the next iter | VKQ
+    // The loads stay in flight across the MFMAs and __syncthreads in between.
+    constexpr bool cdna_fast = ggml_cuda_fattn_mma_cdna_fast<DKQ, DV, ncols1, ncols2, nwarps, V_is_K_view, use_sparse>();
+#if defined(FATTN_MMA_CDNA_FAST_AVAILABLE)
+    static_assert(!cdna_fast || (!oob_check && np == 2 && cols_per_warp == 16 && ncols1 <= 32), "bad CDNA fast path config");
+    static_assert(!cdna_fast || (sizeof(T_A_VKQ::x) == 8 && T_A_VKQ::I == 16 && T_A_VKQ::J == 8), "bad CDNA fast path tile");
+    static_assert(FATTN_MMA_CDNA_FAST_VT_NBYTES == 16*FATTN_MMA_CDNA_FAST_VT_STRIDE_R4, "bad CDNA fast path V tile size");
+    constexpr int fast_nmask = (ncols1 + 15)/16; // mask rows per thread
+    fattn_i4a * const K_next = (fattn_i4a *) K_next_v;
+    fattn_s8a fast_V[4];
+    half2     fast_mask[2] = {make_half2(0.0f, 0.0f), make_half2(0.0f, 0.0f)};
+    const int fast_c      = threadIdx.x % 32;                    // 16 byte chunk of a K row / 8 half of a V row
+    const int fast_r      = threadIdx.y*2 + threadIdx.x/32;      // 0..15: K rows r + 16*q, V rows 4*r + q, mask rows r + 16*m
+    const bool fast_mask_active = fast_r < ncols1;
+    if constexpr (cdna_fast) {
+#pragma unroll
+        for (int q = 0; q < 4; ++q) {
+            *(fattn_i4a *) (tile_K + (fast_r + 16*q)*stride_tile_K + fast_c*4) = K_next[q];
+        }
+        int64_t row[4];
+        if (indices) {
+            // K/V rows given per mask column, negative rows are padding.
+            // NOTE: ggml_cuda_get_best_fattn_kernel currently only allows kv_rows on NVIDIA, so indices is always nullptr here.
+            //     The index branches of the fast path were validated once with that restriction lifted (head size 256 only).
+#pragma unroll
+            for (int q = 0; q < 4; ++q) {
+                row[q] = max(indices[k_VKQ_0 + 4*fast_r + q], 0);
+            }
+        } else {
+#pragma unroll
+            for (int q = 0; q < 4; ++q) {
+                row[q] = k_VKQ_0 + 4*fast_r + q;
+            }
+        }
+#pragma unroll
+        for (int q = 0; q < 4; ++q) {
+            fast_V[q] = *(const fattn_s8u *) (V_h2 + row[q]*stride_V + 4*fast_c);
+        }
+#pragma unroll
+        for (int m = 0; m < fast_nmask; ++m) {
+            if (fast_nmask > 1 || fast_mask_active) {
+                const int j_vram = fastmodulo(jt*ncols1 + 16*m + fast_r, ne01);
+                fast_mask[m] = *(const half2 *) (mask_h + int64_t(j_vram)*stride_mask + k_VKQ_0 + 2*fast_c);
+            }
+        }
+    }
+#endif // defined(FATTN_MMA_CDNA_FAST_AVAILABLE)
+
 #if defined(TURING_MMA_AVAILABLE)
     T_C_KQ KQ_C[nbatch_fa/(np*(cols_per_warp == 8 ? T_C_KQ::I : T_C_KQ::J))];
 #elif defined(AMD_WMMA_AVAILABLE) || defined(AMD_MFMA_AVAILABLE)
@@ -644,9 +759,11 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
     } else {
         // the sparse mask values are gathered per element, always load them synchronously
         constexpr bool use_cp_async = nstages == 1 && !use_sparse;
-        if (ncols2 > 1 || mask_h) {
-            flash_attn_ext_f16_load_mask<ncols1, nwarps, nbatch_fa, use_cp_async, oob_check, use_sparse>
-                (mask_h, tile_mask, stride_mask, k_VKQ_0, k_VKQ_sup, jt*ncols1, ne01, indices);
+        if constexpr (!cdna_fast) {
+            if (ncols2 > 1 || mask_h) {
+                flash_attn_ext_f16_load_mask<ncols1, nwarps, nbatch_fa, use_cp_async, oob_check, use_sparse>
+                    (mask_h, tile_mask, stride_mask, k_VKQ_0, k_VKQ_sup, jt*ncols1, ne01, indices);
+            }
         }
     }
 
@@ -659,8 +776,10 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
         if constexpr (nstages <= 1) {
             const int k0_diff = k0_stop - k0_start;
             constexpr bool use_cp_async = nstages == 1;
-            flash_attn_ext_f16_load_tile<stride_tile_K, nwarps, nbatch_fa, use_cp_async, oob_check, use_sparse>
-                (K_h2 + k0_start, tile_K, k0_diff, stride_K, k_VKQ_0, k_VKQ_sup, indices);
+            if constexpr (!cdna_fast) {
+                flash_attn_ext_f16_load_tile<stride_tile_K, nwarps, nbatch_fa, use_cp_async, oob_check, use_sparse>
+                    (K_h2 + k0_start, tile_K, k0_diff, stride_K, k_VKQ_0, k_VKQ_sup, indices);
+            }
             if (use_cp_async) {
                 cp_async_wait_all();
             }
@@ -720,6 +839,16 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
         }
 
         if constexpr (nstages <= 1) {
+#if defined(FATTN_MMA_CDNA_FAST_AVAILABLE)
+            if constexpr (cdna_fast) {
+#pragma unroll
+                for (int m = 0; m < fast_nmask; ++m) {
+                    if (fast_nmask > 1 || fast_mask_active) {
+                        *(half2 *) (tile_mask + (16*m + fast_r)*(nbatch_fa + 8) + 2*fast_c) = fast_mask[m];
+                    }
+                }
+            }
+#endif // defined(FATTN_MMA_CDNA_FAST_AVAILABLE)
             __syncthreads(); // Only needed if tile_K == tile_V.
         }
     }
@@ -891,7 +1020,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
                     // Turing + Volta:
                     const int KQ_idx = (l/2) % 2;
 #endif // defined(AMD_WMMA_AVAILABLE) || defined(AMD_MFMA_AVAILABLE)
-                    KQ_C[(k0/(np*T_C_KQ::J))].x[l] = expf(KQ_C[(k0/(np*T_C_KQ::J))].x[l] - KQ_max_new[KQ_idx]);
+                    KQ_C[(k0/(np*T_C_KQ::J))].x[l] = ggml_cuda_fattn_mma_expf<cdna_fast>(KQ_C[(k0/(np*T_C_KQ::J))].x[l] - KQ_max_new[KQ_idx]);
                     KQ_rowsum_add[KQ_idx] += KQ_C[(k0/(np*T_C_KQ::J))].x[l];
                 } else {
                     KQ_C[(k0/(np*T_C_KQ::J))].x[l] = 0.0f;
@@ -905,7 +1034,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
 #pragma unroll
         for (int col = 0; col < cols_per_thread; ++col) {
             const float KQ_max_diff = KQ_max[col] - KQ_max_new[col];
-            KQ_max_scale[col] = expf(KQ_max_diff);
+            KQ_max_scale[col] = ggml_cuda_fattn_mma_expf<cdna_fast>(KQ_max_diff);
             KQ_max[col] = KQ_max_new[col];
 
             *((uint32_t *) &KQ_max_scale[col]) *= KQ_max_diff >= SOFTMAX_FTZ_THRESHOLD;
@@ -949,11 +1078,20 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
             }
         } else {
             static_assert(std::is_same_v<decltype(T_C_VKQ::x), float[T_C_VKQ::ne]>, "bad VKQ type");
+            // On the CDNA fast path, skip rescaling the accumulators if no maximum in the wave changed.
+            bool rescale = true;
+#if defined(FATTN_MMA_CDNA_FAST_AVAILABLE)
+            if constexpr (cdna_fast) {
+                rescale = __any(KQ_max_scale[0] != 1.0f);
+            }
+#endif // defined(FATTN_MMA_CDNA_FAST_AVAILABLE)
+            if (rescale) {
 #pragma unroll
-            for (int i = 0; i < DV/T_C_VKQ::J; ++i) {
+                for (int i = 0; i < DV/T_C_VKQ::J; ++i) {
 #pragma unroll
-                for (int l = 0; l < T_C_VKQ::ne; ++l) {
-                    VKQ_C[i].x[l] *= KQ_max_scale[0];
+                    for (int l = 0; l < T_C_VKQ::ne; ++l) {
+                        VKQ_C[i].x[l] *= KQ_max_scale[0];
+                    }
                 }
             }
         }
@@ -1012,8 +1150,39 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
             const int i0_diff = i0_stop - i0_start;
             if (!V_is_K_view || i0_stop > 2*nbatch_K2) {
                 constexpr bool use_cp_async = nstages == 1;
-                flash_attn_ext_f16_load_tile<stride_tile_V, nwarps, nbatch_fa, use_cp_async, oob_check, use_sparse>
-                    (V_h2 + i0_start/2, tile_V, i0_diff/2, stride_V, k_VKQ_0, k_VKQ_sup, indices);
+#if defined(FATTN_MMA_CDNA_FAST_AVAILABLE)
+                if constexpr (cdna_fast) {
+                    // Transpose the 4x8 half of V in registers and store them as 4 pairs of 8 byte units.
+                    char * const dst_V = ((char *) tile_V) + fast_r*FATTN_MMA_CDNA_FAST_VT_STRIDE_R4
+                        + (fast_c/2)*FATTN_MMA_CDNA_FAST_VT_STRIDE_D16 + (fast_c % 2)*64;
+                    *(fattn_s8a *) (dst_V +  0) = ggml_cuda_fattn_mma_cdna_fast_transpose<0>(fast_V);
+                    *(fattn_s8a *) (dst_V + 16) = ggml_cuda_fattn_mma_cdna_fast_transpose<2>(fast_V);
+                    *(fattn_s8a *) (dst_V + 32) = ggml_cuda_fattn_mma_cdna_fast_transpose<4>(fast_V);
+                    *(fattn_s8a *) (dst_V + 48) = ggml_cuda_fattn_mma_cdna_fast_transpose<6>(fast_V);
+                    if constexpr (!last_iter) {
+                        int64_t row[4];
+                        if (indices) {
+#pragma unroll
+                            for (int q = 0; q < 4; ++q) {
+                                row[q] = max(indices[k_VKQ_0 + nbatch_fa + fast_r + 16*q], 0);
+                            }
+                        } else {
+#pragma unroll
+                            for (int q = 0; q < 4; ++q) {
+                                row[q] = k_VKQ_0 + nbatch_fa + fast_r + 16*q;
+                            }
+                        }
+#pragma unroll
+                        for (int q = 0; q < 4; ++q) {
+                            K_next[q] = *(const fattn_i4u *) (K_h2 + row[q]*stride_K + fast_c*4);
+                        }
+                    }
+                } else
+#endif // defined(FATTN_MMA_CDNA_FAST_AVAILABLE)
+                {
+                    flash_attn_ext_f16_load_tile<stride_tile_V, nwarps, nbatch_fa, use_cp_async, oob_check, use_sparse>
+                        (V_h2 + i0_start/2, tile_V, i0_diff/2, stride_V, k_VKQ_0, k_VKQ_sup, indices);
+                }
                 if (use_cp_async) {
                     cp_async_wait_all();
                 }
@@ -1023,6 +1192,23 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
         const int tile_V_offset_i = !V_is_K_view || i0_stop > 2*nbatch_K2 ? 0 : i0_start/2;
 
 #if defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE) || defined(AMD_MFMA_AVAILABLE)
+#if defined(FATTN_MMA_CDNA_FAST_AVAILABLE)
+        if constexpr (cdna_fast) {
+            // V is already transposed in SRAM, a single 8 byte read per lane gives the A tile.
+#pragma unroll
+            for (int k00 = 0; k00 < nbatch_fa/2; k00 += np*T_A_VKQ::J) {
+                const int k0 = k00 + (threadIdx.y % np)*T_A_VKQ::J;
+                const char * const src_V = ((const char *) tile_V) + (k0/2 + threadIdx.x/16)*FATTN_MMA_CDNA_FAST_VT_STRIDE_R4
+                    + (threadIdx.x % 16)*8;
+#pragma unroll
+                for (int i_VKQ_0 = i0_start; i_VKQ_0 < i0_stop; i_VKQ_0 += T_A_VKQ::I) {
+                    T_A_VKQ A;
+                    ggml_cuda_memcpy_1<8>(A.x, src_V + (i_VKQ_0/T_A_VKQ::I)*FATTN_MMA_CDNA_FAST_VT_STRIDE_D16);
+                    mma(VKQ_C[i_VKQ_0/T_A_VKQ::I], A, B[k00/(np*T_A_VKQ::J)]);
+                }
+            }
+        } else
+#endif // defined(FATTN_MMA_CDNA_FAST_AVAILABLE)
 #pragma unroll
         for (int i_VKQ_0 = i0_start; i_VKQ_0 < i0_stop; i_VKQ_0 += T_A_VKQ::I) {
             static_assert((nbatch_fa/2) % (np*T_A_VKQ::J) == 0, "bad loop size");
@@ -1256,7 +1442,12 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
     extern __shared__ half2 tile_Q[];
     half2 * tile_K    = Q_in_reg              ? tile_Q                             : tile_Q + ncols     * stride_tile_Q;
     half2 * tile_V    =           nstages > 1 ? tile_K + nbatch_fa * stride_tile_K : tile_K;
-    half  * tile_mask = (half *) (nstages > 1 ? tile_V + nbatch_fa * stride_tile_V : tile_V + nbatch_fa * stride_tile_KV_max);
+    // The CDNA fast path stages V transposed with padding, see ggml_cuda_flash_attn_ext_mma_f16_case.
+    constexpr bool cdna_fast = ggml_cuda_fattn_mma_cdna_fast<DKQ, DV, ncols1, ncols2, nwarps, V_is_K_view, use_sparse>();
+    constexpr int  nh2_tile_KV_generic = nbatch_fa * stride_tile_KV_max;
+    constexpr int  nh2_tile_KV_fast    = FATTN_MMA_CDNA_FAST_VT_NBYTES / int(sizeof(half2));
+    constexpr int  nh2_tile_KV_1stage  = cdna_fast && nh2_tile_KV_fast > nh2_tile_KV_generic ? nh2_tile_KV_fast : nh2_tile_KV_generic;
+    half  * tile_mask = (half *) (nstages > 1 ? tile_V + nbatch_fa * stride_tile_V : tile_V + nh2_tile_KV_1stage);
 
     T_B_KQ    Q_B[(Q_in_reg ? DKQ/(2*T_B_KQ::J) : 1)];
 #if defined(TURING_MMA_AVAILABLE)
@@ -1337,6 +1528,34 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
 
     int kb0 = kb0_start;
 
+#if defined(FATTN_MMA_CDNA_FAST_AVAILABLE)
+    // CDNA fast path: the K data for an iter is loaded during the previous one and kept in registers, see flash_attn_ext_f16_iter.
+    fattn_i4a K_next[4];
+    if constexpr (cdna_fast) {
+        const int c = threadIdx.x % 32;
+        const int r = threadIdx.y*2 + threadIdx.x/32;
+        int64_t row[4];
+        if (indices) {
+#pragma unroll
+            for (int q = 0; q < 4; ++q) {
+                row[q] = max(indices[kb0*nbatch_fa + r + 16*q], 0);
+            }
+        } else {
+#pragma unroll
+            for (int q = 0; q < 4; ++q) {
+                row[q] = kb0*nbatch_fa + r + 16*q;
+            }
+        }
+#pragma unroll
+        for (int q = 0; q < 4; ++q) {
+            K_next[q] = *(const fattn_i4u *) (K_h2 + row[q]*stride_K + c*4);
+        }
+    }
+    void * const K_next_v = (void *) K_next;
+#else
+    void * const K_next_v = nullptr;
+#endif // defined(FATTN_MMA_CDNA_FAST_AVAILABLE)
+
     // Preload mask and K data for first iteration when using cp_async with multiple stages:
     if constexpr (nstages > 1) {
         static_assert(!use_sparse, "sparse gather not implemented for multi-stage loading");
@@ -1363,7 +1582,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
                  T_A_KQ, T_B_KQ, T_C_KQ, T_A_VKQ, T_B_VKQ, T_C_VKQ>
                 (Q_f2, K_h2, V_h2, mask_h, indices, dstk, dstk_fixup, scale, slope, logit_softcap,
                  ne01, ne02, stride_K, stride_V, stride_mask, tile_Q, tile_K, tile_V, tile_mask, Q_B, VKQ_C,
-                 KQ_max, KQ_rowsum, jt, kb0, k_VKQ_sup);
+                 KQ_max, KQ_rowsum, jt, kb0, k_VKQ_sup, K_next_v);
         }
         constexpr bool last_iter = true;
         const     int  k_VKQ_sup = ne11 - kb0*nbatch_fa;
@@ -1372,7 +1591,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
               T_A_KQ, T_B_KQ, T_C_KQ, T_A_VKQ, T_B_VKQ, T_C_VKQ>
             (Q_f2, K_h2, V_h2, mask_h, indices, dstk, dstk_fixup, scale, slope, logit_softcap,
              ne01, ne02, stride_K, stride_V, stride_mask, tile_Q, tile_K, tile_V, tile_mask, Q_B, VKQ_C,
-             KQ_max, KQ_rowsum, jt, kb0, k_VKQ_sup);
+             KQ_max, KQ_rowsum, jt, kb0, k_VKQ_sup, K_next_v);
     } else {
         constexpr bool oob_check = false;
         for (; kb0 < kb0_stop-1; ++kb0) {
@@ -1383,7 +1602,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
                  T_A_KQ, T_B_KQ, T_C_KQ, T_A_VKQ, T_B_VKQ, T_C_VKQ>
                 (Q_f2, K_h2, V_h2, mask_h, indices, dstk, dstk_fixup, scale, slope, logit_softcap,
                  ne01, ne02, stride_K, stride_V, stride_mask, tile_Q, tile_K, tile_V, tile_mask, Q_B, VKQ_C,
-                 KQ_max, KQ_rowsum, jt, kb0, k_VKQ_sup);
+                 KQ_max, KQ_rowsum, jt, kb0, k_VKQ_sup, K_next_v);
         }
         constexpr bool last_iter = true;
         constexpr int  k_VKQ_sup = nbatch_fa;
@@ -1392,7 +1611,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
              T_A_KQ, T_B_KQ, T_C_KQ, T_A_VKQ, T_B_VKQ, T_C_VKQ>
             (Q_f2, K_h2, V_h2, mask_h, indices, dstk, dstk_fixup, scale, slope, logit_softcap,
              ne01, ne02, stride_K, stride_V, stride_mask, tile_Q, tile_K, tile_V, tile_mask, Q_B, VKQ_C,
-             KQ_max, KQ_rowsum, jt, kb0, k_VKQ_sup);
+             KQ_max, KQ_rowsum, jt, kb0, k_VKQ_sup, K_next_v);
     }
 
     // With multi-stage loading there is no __syncthreads at the end of the iter,
@@ -2039,7 +2258,10 @@ void ggml_cuda_flash_attn_ext_mma_f16_case(ggml_backend_cuda_context & ctx, ggml
     const bool swz = ggml_cuda_fattn_mma_get_swizzled(DKQ, DV, ncols, cc);
     const int stride_tile_K = swz ? nbatch_K2 : nbatch_K2 + 4;
     const int stride_tile_V = V_is_K_view ? stride_tile_K : (swz ? nbatch_V2 : nbatch_V2 + 4);
-    const size_t nbytes_shared_KV_1stage = nbatch_fa            * std::max(stride_tile_K,  stride_tile_V) * sizeof(half2);
+    // Superset of ggml_cuda_fattn_mma_cdna_fast, the fast path needs more space for V.
+    const bool cdna_fast_maybe = amd_mfma_available(cc) && DKQ == 256 && DV == 256 && ncols == 64 && ncols2 > 1;
+    const size_t nbytes_shared_KV_1stage = std::max<size_t>(cdna_fast_maybe ? FATTN_MMA_CDNA_FAST_VT_NBYTES : 0,
+                                           nbatch_fa            * std::max(stride_tile_K,  stride_tile_V) * sizeof(half2));
     const size_t nbytes_shared_KV_2stage = nbatch_fa            *         (stride_tile_K + stride_tile_V) * sizeof(half2);
     const size_t nbytes_shared_Q         = ncols                * (DKQ/2 + 4)                             * sizeof(half2);
     const size_t nbytes_shared_mask      = ncols1               * (nbatch_fa/2 + 4)                       * sizeof(half2);
