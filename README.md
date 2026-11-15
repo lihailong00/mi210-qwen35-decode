@@ -7,12 +7,12 @@
 | decode tg128，上下文 0 | 45.6 token/s | 80.3 token/s | +76% |
 | decode tg128，上下文 8192 | 44.2 | 74.6 | +69% |
 | decode tg128，上下文 32768 | 40.7 | 64.4 | +58% |
-| prefill pp512 / pp2048 / pp8192 | 893 / 1099 / 1220 | 1175 / 1842 / 1821 | +32% / +68% / +49% |
+| prefill pp512 / pp2048 / pp8192 | 893 / 1099 / 1220 | 1176 / 1848 / 1895 | +32% / +68% / +55% |
 | llama-server 单请求 | 45.6 | 79.1 | +73% |
 | 每 token kernel 启动数 | 1933 | 601 | −69% |
 | 显存峰值 | 24.1 GB | 28–32 GB | 重排权重副本 |
 
-prefill 的提升来自两处：让 rocBLAS 在 CDNA2 上默认使用 hipBLASLt 后端（rocBLAS 自带选核对 ffn_down 形状只跑到 47 TFLOPS），更快的权重反量化启动方式、逐形状的 GEMM 选核，以及为 wave64 重写的分块 fp32 MFMA DeltaNet kernel；本机实测的 decode / prefill 上限约 124 / 2980 token/s（prefill 受 300 W 功耗上限限制），见交接文档第十三节。
+prefill 的提升来自两处：让 rocBLAS 在 CDNA2 上默认使用 hipBLASLt 后端（rocBLAS 自带选核对 ffn_down 形状只跑到 47 TFLOPS），更快的权重反量化启动方式、逐形状的 GEMM 选核，为 wave64 重写的分块 fp32 MFMA DeltaNet kernel，以及 flash attention 的装载预取和 GQA 6 分发修正；本机实测的 decode / prefill 上限约 124 / 2980 token/s（prefill 受 300 W 功耗上限限制），见交接文档第十三节。
 
 原定目标 90 token/s 未达到。原因分析、全部优化细节、失败的尝试和后续方向见 [docs/HANDOVER.md](docs/HANDOVER.md)。
 

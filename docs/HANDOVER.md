@@ -15,7 +15,7 @@
 | decode tg128，上下文 0 | 45.63 token/s | 80.33 token/s | +76.0% |
 | decode tg128，上下文 8192 | 44.23 token/s | 74.57 token/s | +68.6% |
 | decode tg128，上下文 32768 | 40.65 token/s | 64.43 token/s | +58.5% |
-| prefill pp8192 | 1220 token/s | 1821 token/s | +49%（第十三节的各项 prefill 修正；只做 decode 优化时为 1245） |
+| prefill pp8192 | 1220 token/s | 1895 token/s | +55%（第十三节的各项 prefill 修正；只做 decode 优化时为 1245） |
 | llama-server 单请求（-np 1） | 45.6 token/s | 79.1 token/s | +73% |
 | 每 token kernel 启动数 | 1933 | 601 | −69% |
 | 显存峰值（llama-bench） | 24.1 GB | 28.1–31.9 GB | +4–8 GB |
@@ -489,7 +489,7 @@ docker exec mi210-opt bash -lc "PAR=12 /lab/build-wt.sh /lab/wt-mybranch /lab/wt
 | 物理上限：50.5 GFLOP 以 171 TFLOPS 计算（零数据峰值；真实数据受功耗上限限制，见第 6 小节） | 约 3390 |
 | 物理上限（真实数据，约 150 TFLOPS） | 约 2980 |
 | GEMM 全部用最优库 kernel（hipBLASLt 平均约 150 TFLOPS），其余开销为零 | 约 3000 |
-| 当前版本（pp8192） | 1821 |
+| 当前版本（pp8192） | 1895 |
 
 修正前，rocprofv3 测得每 token 0.804 ms：GEMM 0.577 ms（权重先反量化为 f16，再走 rocBLAS，平均只有 84 TFLOPS），非 GEMM 0.227 ms（逐 token 递推的 DeltaNet kernel 0.065，flash attention 0.047、只有 34 TFLOPS，反量化 0.031，其余小算子约 0.08）。
 
@@ -569,9 +569,42 @@ llama-bench 中 pp512 是一个 512-token 批次，pp2048 是一个 2048-token �
 - **结果**：独立基准中每次调用 5.5 → 2.17 ms，与双精度 CPU 参考的相对误差 2.5e-7。模型里（A→B→B→A，ub 4096）：pp512 1136 → 1175（+3.4%），pp2048 1720 → 1842（+7.1%），pp8192 1693 → 1821（+7.5%），decode 不变（80.6 / 74.8）。prefill 路径 KLD 0.000002、top-1 99.95%，与噪声底线相同。`test-backend-ops -o GATED_DELTA_NET` 48/48 通过（新增了 128 维、长序列的用例）。
 - **还可以做的**：kernel 每块约 1.4 万个周期，MFMA 只占其中约 4 千；前代法约 2.3 千个周期只在一个 wave 上跑。独立基准和 CPU 参考在 `mi210-tools/peak-bench/gdn_mfma_bench.hip`。
 
-### 9. 剩余 prefill 方向
+### 9. prefill flash attention（`fattn-mma-f16.cuh` 的 CDNA 快速路径 + GQA 6 的分发）
 
-- 非 GEMM 部分：flash attention 提高 MFMA 利用率（pp8192 约 +5%，上下文越长越多），小算子融合。反量化离带宽下限（约 45 ms/批次）还差约 20 ms，主要影响短 prompt。
+pp8192 时 `flash_attn_ext_f16<256,256,8,8>` 每次调用 12.1 ms（约 34 TFLOPS），每 token 47 µs。四个方向并行分析（配置、汇编、数据流、另写 kernel），每条建议再由独立的 agent 复测，结论是 MFMA 只占这个 kernel 的 15–25%，其余是三类浪费：
+
+- **分发**：GQA 比为 6 时走 ncols2=8 的实例，每 8 个 head 列有 2 列是补零，25% 的 MFMA、softmax 和 K/V 装载都白做。现在 ≥ 64 个 token 的批次改走已有的 ncols2=2 实例（32 个 token × 2 个 head，K/V 每个 KV head 装载 3 次）。单独这一项 12.1 → 9.1 ms。`GGML_CUDA_FATTN_GQA6_MIN_BATCH` 设最小批次，0 关闭。
+- **装载延迟**：原来每次迭代有 9 次全局装载，每次后面都紧跟一个 `s_waitcnt vmcnt(0)`，wave 被串行地卡住。消融实验表明代价在延迟而不在带宽（把所有装载指向同一批行只省 0.4–0.7 ms，去掉装载省 3 ms）。现在一个 tile 的装载一起发出，并且提前一个阶段：本次迭代的 K 在上一次迭代的 VKQ 阶段装载并留在寄存器里，V 和 mask 在迭代开头发出、KQ 的 MFMA 之后才写入 LDS。gfx90a 上 `s_barrier` 之前只需要 `lgkmcnt(0)`，全局装载可以跨 barrier 保持在途。
+- **V 操作数的拼装**：原来每条 VKQ 的 MFMA 要 4 次 `ds_read_u16` + 2 次 `v_perm_b32`。现在 V 在写入 LDS 时就转置好（8 字节单元 (r4, d) = V[4·r4+0..3][d]），一次 8 字节读取就是一个 A 操作数。
+- **softmax**：exp 换成单条 `v_exp_f32`（`exp2(x·log2e)`，相对误差约 1e-6，远小于随后转成 f16 的精度）；wave 内没有任何最大值变化时跳过对 16 个累加器 tile 的重新缩放。
+
+调优中学到的硬件行为：
+
+- **LDS bank 冲突是一阶效应。** 完全相同的指令，只改 V 在 LDS 里的布局，相差 2.3 ms：慢的布局让一次写入的 64 个 lane 只落在 32 个 dword bank 中的 4 个上。现在每 16 个 d 的 128 字节补到 144 字节，使各 lane 的地址在 bank 上均匀分布。规则：每条 `ds_read`/`ds_write` 的（dword 地址 mod 32）要在 lane 间均匀分布。
+- 指令条数不能单独预测时间：朴素的转置布局每次迭代少约 250 条指令，却慢 15%。
+- LDS 的 64 KB 是按 CU 算的，不是按 block；这个 kernel 用 255 个 VGPR（每 SIMD 2 个 wave），每 CU 正好一个 512 线程的 block。调配置表（线程数、nbatch_fa、K2/V2、Q 是否放寄存器）都不如现状；`nbatch_combine=128` 会让 8x8 实例挂死。
+- 另写一个专用 kernel（3 个计算 wave + 1 个装载 wave、32x32x8 的 MFMA、惰性 softmax）的独立原型是 4.8 ms，只比改进后的现有 kernel 快 0.9 ms，但要重做 mask、KV_max、sinks、kv_rows 等全部通用性，没有采用。原型在服务器的 `peak/fa-alt/fa_proto2.hip`。
+
+适用范围：CDNA2 上 DKQ=DV=256、512 线程、ncols=64 且 ncols2>1 的实例（8x8、16x4、32x2），其它实例、decode、稀疏和 V_is_K_view 路径不变。`-DGGML_CUDA_FATTN_MMA_CDNA_FAST=0` 只编译通用路径。
+
+结果（A→B→B→A，ub 4096）：
+
+| 测试 | 之前（token/s） | 之后（token/s） | 变化 |
+|---|---|---|---|
+| pp512 | 1170 | 1176 | +0.5% |
+| pp2048 | 1835 | 1848 | +0.7% |
+| pp8192 | 1808 | 1895 | +4.8% |
+| pp16384 | 1668 | 1841 | +10.4% |
+| decode（深度 0） | 79.9 | 79.4 | 不变（噪声内） |
+
+- kernel 每次调用 12.1 → 5.7 ms（412 GFLOP，约 73 TFLOPS）；mask 扫描 kernel 从 0.09 升到 0.26 ms（32 行一个 tile，block 数变少），已计入上面的结果。
+- 正确性：prefill 路径 KLD 0.000002、top-1 99.95%（噪声底线）；c=8192 的 perplexity 3.5638 → 3.5636；快速路径与通用路径逐张量比较 NMSE ≤ 2.3e-9；`test-backend-ops -o FLASH_ATTN_EXT` 4065/4065（新增 5 个 GQA 6 prefill 用例）。独立评审（同步、适用条件、数值三个角度，逐条复核）没有发现缺陷。
+- 注意：kv_rows（索引表）在 `ggml_cuda_get_best_fattn_kernel` 里目前只对 NVIDIA 开放，所以快速路径里的 `if (indices)` 分支在 CDNA 上到不了；它们在放开该限制的私有构建里验证过一次（仅 head 256）。
+- 还剩：kernel 的 MFMA 下限约 2.75 ms（150 TFLOPS）；剩下的是每次迭代 4 个 barrier、约 275 条普通指令和 LDS 流量。
+
+### 10. 剩余 prefill 方向
+
+- 非 GEMM 部分：小算子融合（SwiGLU 直接输出 f16、合并 f32→f16 转换、卷积直接读 token 顺序的数据，合计约 +8%），DeltaNet kernel 第二轮（约 +2%）。反量化离带宽下限（约 45 ms/批次）还差约 20 ms，主要影响短 prompt。
 - GEMM 部分已接近库 kernel 在功耗上限下的水平。卷积可以直接从按 token 排列的激活计算、完全跳过转置拷贝（约再 +2%）；gate/up 等共用输入的 f32→f16 转换可以去重（约 +1%）；SwiGLU 可以直接输出 f16（约 +1%）。
 
 微基准源码在 `mi210-tools/peak-bench/`：`peak_bench.hip`（带宽、MFMA、方阵 GEMM）、`bound_bench.hip`（逐张量读取 graph、实际形状 GEMM 全候选扫描）、`gemm_sweep.hip`（不同 token 数下的选核对比）、`mfma_rand.hip`（零数据与随机数据下的 MFMA 峰值，显示功耗上限的影响）。编译：`hipcc -O3 --offload-arch=gfx90a -std=c++17 <file> -lrocblas`。
