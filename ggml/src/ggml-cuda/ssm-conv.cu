@@ -123,6 +123,77 @@ static __global__ void ssm_conv_long_token_f32(const float * __restrict__ src0, 
     }
 }
 
+#if defined(GGML_USE_HIP)
+// Long-sequence conv through 64-channel x 64-token LDS tiles: rows of the channel-major input are read
+// as contiguous runs and the token-major output is written 64 channels at a time. The per-element
+// arithmetic and its order are the same as in ssm_conv_long_token_f32, so the output is identical; that
+// kernel's 128x35 tiles read one scattered float per thread and reach ~0.4 TB/s on MI210.
+// GGML_CUDA_SSM_CONV_TILE=0 restores it.
+template <bool apply_silu, int d_conv>
+static __global__ void __launch_bounds__(256) ssm_conv_tile_f32(
+        const float * __restrict__ src0, const float * __restrict__ src1, const float * __restrict__ bias,
+        const int64_t x_s1, const int64_t x_s2, const int64_t w_s1,
+        float * __restrict__ dst, const int64_t y_s1, const int64_t y_s2,
+        const int64_t n_t, const int64_t nr) {
+    constexpr int TS   = 64;
+    constexpr int NCOL = TS + d_conv - 1;
+    __shared__ float smem[TS*NCOL];
+
+    const int64_t c0 = (int64_t) blockIdx.y*TS;
+    const int64_t t0 = (int64_t) blockIdx.z*TS;
+    const float * x  = src0 + blockIdx.x*x_s2 + c0*x_s1 + t0;
+    float *       y  = dst  + blockIdx.x*y_s2 + t0*y_s1 + c0;
+
+    const int tid = threadIdx.x;
+    const int lo  = tid % TS;
+    const int hi  = tid / TS;
+
+    const int64_t cols_left = n_t + d_conv - 1 - t0;
+    const int     n_cols    = cols_left < NCOL ? (int) cols_left : NCOL;
+
+    for (int idx = tid; idx < TS*NCOL; idx += 256) {
+        const int c   = idx / NCOL;
+        const int col = idx - c*NCOL;
+        if (col < n_cols && c0 + c < nr) {
+            smem[idx] = x[c*x_s1 + col];
+        }
+    }
+    __syncthreads();
+
+    if (c0 + lo >= nr) {
+        return;
+    }
+
+    float w[d_conv];
+#pragma unroll
+    for (int j = 0; j < d_conv; j++) {
+        w[j] = src1[(c0 + lo)*w_s1 + j];
+    }
+    const float b = bias != nullptr ? bias[c0 + lo] : 0.0f;
+
+    for (int p = 0; p < TS/4; ++p) {
+        const int t = p*4 + hi;
+        if (t0 + t < n_t) {
+            float sumf = 0.0f;
+#pragma unroll
+            for (int j = 0; j < d_conv; j++) {
+                sumf += smem[lo*NCOL + t + j] * w[j];
+            }
+            sumf += b;
+            y[t*y_s1 + lo] = apply_silu ? ggml_cuda_op_silu_single(sumf) : sumf;
+        }
+    }
+}
+
+static bool ggml_cuda_ssm_conv_tile_enabled() {
+    static const bool enabled = [] {
+        const char * e = getenv("GGML_CUDA_SSM_CONV_TILE");
+        return e == nullptr || atoi(e) != 0;
+    }();
+    return enabled;
+}
+#endif // defined(GGML_USE_HIP)
+
 template <bool apply_silu>
 static void ssm_conv_f32_cuda(const float * src0, const float * src1, const float * bias, const int src0_nb0, const int src0_nb1,
                               const int src0_nb2, const int src1_nb1, float * dst, const int dst_nb0, const int dst_nb1,
@@ -139,6 +210,15 @@ static void ssm_conv_f32_cuda(const float * src0, const float * src1, const floa
             ggml_cuda_kernel_launch(ssm_conv_f32<apply_silu, threads, kNC>, launch_params, src0, src1, bias, src0_nb0, src0_nb1,
                                                                         src0_nb2, src1_nb1, dst, dst_nb0, dst_nb1, dst_nb2, n_t);
         } else {
+#if defined(GGML_USE_HIP)
+            if (n_t >= 64 && nr % 64 == 0 && dst_nb0 == (int) sizeof(float) && ggml_cuda_ssm_conv_tile_enabled()) {
+                const dim3 blocks(n_s, nr/64, (n_t + 63)/64);
+                ssm_conv_tile_f32<apply_silu, kNC><<<blocks, 256, 0, stream>>>(
+                    src0, src1, bias, src0_nb1/(int) sizeof(float), src0_nb2/(int) sizeof(float), src1_nb1/(int) sizeof(float),
+                    dst, dst_nb1/(int) sizeof(float), dst_nb2/(int) sizeof(float), n_t, nr);
+                return;
+            }
+#endif // defined(GGML_USE_HIP)
             const int64_t split_n_t = 32;
             dim3          blocks(n_s, (nr + threads - 1) / threads, (n_t + split_n_t - 1) / split_n_t);
             const size_t  smem_size = threads * (kNC - 1 + split_n_t) * sizeof(float);

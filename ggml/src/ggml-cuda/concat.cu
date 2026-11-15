@@ -139,6 +139,58 @@ static __global__ void __launch_bounds__(CUDA_CONCAT_BLOCK_SIZE)
     }
 }
 
+#if defined(GGML_USE_HIP)
+// dim-0 concat of a contiguous src0 [ne00, C] with a transposed view src1 [n_t, C] (element (t, c) at
+// x[t*C + c]), written to a contiguous dst [ne00 + n_t, C]. This is the conv-input build of the
+// delta-net models. The generic non-contiguous kernel reads src1 with a C-element stride (~0.09 TB/s on
+// MI210); here each block transposes a 64x64 tile through LDS so both the read and the write are
+// coalesced. Output is identical. GGML_CUDA_CONCAT_TILE=0 restores the generic kernel.
+template <typename T>
+static __global__ void __launch_bounds__(256) concat_dim0_transposed_tile(
+        const T * __restrict__ a, const T * __restrict__ x, T * __restrict__ dst,
+        const int64_t ne00, const int64_t n_t, const int64_t C, const int64_t ne0,
+        const int64_t a_s2, const int64_t x_s2, const int64_t d_s2) {
+    constexpr int TS = 64;
+    __shared__ T smem[TS*TS];
+
+    const int64_t c0 = (int64_t) blockIdx.x*TS;
+    const int64_t t0 = (int64_t) blockIdx.y*TS;
+    a   += blockIdx.z*a_s2;
+    x   += blockIdx.z*x_s2;
+    dst += blockIdx.z*d_s2;
+
+    const int lo = threadIdx.x % TS;
+    const int hi = threadIdx.x / TS;
+
+    for (int p = 0; p < TS/4; ++p) {
+        const int t = p*4 + hi;
+        if (t0 + t < n_t && c0 + lo < C) {
+            smem[lo*TS + t] = x[(t0 + t)*C + c0 + lo];
+        }
+    }
+    __syncthreads();
+    for (int p = 0; p < TS/4; ++p) {
+        const int c = p*4 + hi;
+        if (t0 + lo < n_t && c0 + c < C) {
+            dst[(c0 + c)*ne0 + ne00 + t0 + lo] = smem[c*TS + lo];
+        }
+    }
+    if (blockIdx.y == 0 && hi == 0 && c0 + lo < C) {
+        for (int64_t j = 0; j < ne00; ++j) {
+            dst[(c0 + lo)*ne0 + j] = a[(c0 + lo)*ne00 + j];
+        }
+    }
+}
+
+static bool ggml_cuda_concat_tile_enabled() {
+    static const bool enabled = [] {
+        const char * e = getenv("GGML_CUDA_CONCAT_TILE");
+        return e == nullptr || atoi(e) != 0;
+    }();
+    return enabled;
+}
+#endif // defined(GGML_USE_HIP)
+
 template <typename T>
 static void concat_cuda(const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst, int dim, cudaStream_t stream) {
     if (dim != 3 && ggml_is_contiguous_to_3(src0) && ggml_is_contiguous_to_3(src1)) {
@@ -162,6 +214,20 @@ static void concat_cuda(const ggml_tensor * src0, const ggml_tensor * src1, ggml
         CUDA_CHECK(cudaMemcpyAsync((char *) dst->data + size0, src1->data, size1, cudaMemcpyDeviceToDevice, stream));
     } else {
         GGML_ASSERT(!ggml_is_quantized(src0->type));
+
+#if defined(GGML_USE_HIP)
+        if (dim == 0 && ggml_cuda_concat_tile_enabled() && src0->ne[3] == 1 && src1->ne[3] == 1 &&
+            ggml_is_contiguous(src0) && ggml_is_contiguous(dst) && src1->ne[0] >= 64 &&
+            src1->nb[1] == sizeof(T) && src1->nb[0] == src1->ne[1]*sizeof(T) && src1->nb[2] % sizeof(T) == 0) {
+            const int64_t C = dst->ne[1];
+            const dim3 grid((C + 63)/64, (src1->ne[0] + 63)/64, dst->ne[2]);
+            concat_dim0_transposed_tile<T><<<grid, 256, 0, stream>>>(
+                (const T *) src0->data, (const T *) src1->data, (T *) dst->data,
+                src0->ne[0], src1->ne[0], C, dst->ne[0],
+                src0->nb[2]/sizeof(T), src1->nb[2]/sizeof(T), dst->nb[2]/sizeof(T));
+            return;
+        }
+#endif // defined(GGML_USE_HIP)
 
         dim3 grid_dim(dst->ne[1], dst->ne[2], dst->ne[3]);
         auto launch_kernel = [&](auto dim) {
