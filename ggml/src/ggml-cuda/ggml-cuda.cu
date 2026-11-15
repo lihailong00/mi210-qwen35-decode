@@ -6,6 +6,13 @@
 
 #include "ggml-cuda/allreduce.cuh"
 #include "ggml-cuda/common.cuh"
+#if defined(GGML_USE_HIP)
+#define ROCBLAS_BETA_FEATURES_API
+#include <rocblas/rocblas.h>
+#include <chrono>
+#include <map>
+#include <tuple>
+#endif // defined(GGML_USE_HIP)
 #include "ggml-cuda/acc.cuh"
 #include "ggml-cuda/add-id.cuh"
 #include "ggml-cuda/arange.cuh"
@@ -1851,6 +1858,116 @@ struct batched_mul_mat_traits<GGML_TYPE_F16> {
     static inline auto convert_nc(ggml_type src_type) { return ggml_get_to_fp16_nc_cuda(src_type); }
 };
 
+#if defined(GGML_USE_HIP)
+// Per-shape GEMM kernel selection for large prefill GEMMs on CDNA2 with the hipBLASLt backend.
+// hipBLASLt's default choice is 3-10% slower than its best kernel for most prefill shapes. The first
+// time a (m, k, n-bucket) shape is seen, a short list of known-good solution indices (those the
+// library reports as valid for the problem) is timed against the default and the fastest is cached.
+// The default is kept unless a candidate is at least 2% faster, so a library with different indices can
+// only fall back to the default. Costs ~0.1-0.2 s once per shape. GGML_CUDA_GEMM_TUNE=0 disables it.
+// Different kernels differ in fp32 summation order only.
+static bool ggml_cuda_hip_gemm_tuned(cublasHandle_t handle, cudaStream_t stream, int cc,
+        const int m, const int n, const int k,
+        const void * alpha, const void * a, const int lda, const void * b, const int ldb,
+        const void * beta, void * c, const int ldc) {
+    static const bool enabled = [] {
+        const char * e = getenv("GGML_CUDA_GEMM_TUNE");
+        const char * l = getenv("ROCBLAS_USE_HIPBLASLT");
+        return (e == nullptr || atoi(e) != 0) && l != nullptr && atoi(l) == 1;
+    }();
+    if (!enabled || !GGML_CUDA_CC_IS_CDNA2(cc) || n < 2048 || (int64_t) m*k < (1 << 22)) {
+        return false;
+    }
+
+    // with the rocBLAS backend of hipBLAS the hipBLAS handle is the rocBLAS handle
+    rocblas_handle h = (rocblas_handle) handle;
+    const auto run = [&](rocblas_gemm_algo algo, int32_t sol) {
+        return rocblas_gemm_ex(h, rocblas_operation_transpose, rocblas_operation_none, m, n, k, alpha,
+            a, rocblas_datatype_f16_r, lda, b, rocblas_datatype_f16_r, ldb, beta,
+            c, rocblas_datatype_f32_r, ldc, c, rocblas_datatype_f32_r, ldc,
+            rocblas_datatype_f32_r, algo, sol, 0) == rocblas_status_success;
+    };
+
+    static std::mutex mutex;
+    static std::map<std::tuple<int, int, int>, int32_t> cache;
+    const auto key = std::make_tuple(m, k, n >= 4096 ? 1 : 0);
+
+    int32_t sol = 0;
+    bool    known;
+    {
+        std::lock_guard<std::mutex> lock(mutex);
+        const auto it = cache.find(key);
+        known = it != cache.end();
+        if (known) {
+            sol = it->second;
+        }
+    }
+
+    if (!known) {
+        static const int32_t candidates[] = { 107806, 107812, 107817, 107825, 108043, 108049, 108091, 108169, 108210, 108434 };
+
+        rocblas_int n_valid = 0;
+        std::vector<rocblas_int> valid;
+        if (rocblas_gemm_ex_get_solutions(h, rocblas_operation_transpose, rocblas_operation_none, m, n, k, alpha,
+                a, rocblas_datatype_f16_r, lda, b, rocblas_datatype_f16_r, ldb, beta,
+                c, rocblas_datatype_f32_r, ldc, c, rocblas_datatype_f32_r, ldc,
+                rocblas_datatype_f32_r, rocblas_gemm_algo_solution_index, 0, nullptr, &n_valid) == rocblas_status_success && n_valid > 0) {
+            valid.resize(n_valid);
+            if (rocblas_gemm_ex_get_solutions(h, rocblas_operation_transpose, rocblas_operation_none, m, n, k, alpha,
+                    a, rocblas_datatype_f16_r, lda, b, rocblas_datatype_f16_r, ldb, beta,
+                    c, rocblas_datatype_f32_r, ldc, c, rocblas_datatype_f32_r, ldc,
+                    rocblas_datatype_f32_r, rocblas_gemm_algo_solution_index, 0, valid.data(), &n_valid) != rocblas_status_success) {
+                valid.clear();
+            }
+        }
+
+        const auto time_it = [&](rocblas_gemm_algo algo, int32_t s) -> double {
+            if (!run(algo, s)) {
+                return -1.0;
+            }
+            CUDA_CHECK(cudaStreamSynchronize(stream));
+            const auto t0 = std::chrono::steady_clock::now();
+            run(algo, s);
+            run(algo, s);
+            CUDA_CHECK(cudaStreamSynchronize(stream));
+            return std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+        };
+
+        const double t_default = time_it(rocblas_gemm_algo_standard, 0);
+        double       t_best    = t_default;
+        if (t_default > 0.0) {
+            for (const int32_t cand : candidates) {
+                if (std::find(valid.begin(), valid.end(), cand) == valid.end()) {
+                    continue;
+                }
+                const double t = time_it(rocblas_gemm_algo_solution_index, cand);
+                if (t > 0.0 && t < t_best) {
+                    t_best = t;
+                    sol    = cand;
+                }
+            }
+            if (t_best > 0.98*t_default) {
+                sol = 0;
+            }
+        }
+        GGML_LOG_DEBUG("%s: m=%d n=%d k=%d -> solution %d (%.3f ms vs default %.3f ms)\n", __func__, m, n, k,
+                       (int) sol, t_best*500.0, t_default*500.0);
+        std::lock_guard<std::mutex> lock(mutex);
+        cache[key] = sol;
+    }
+
+    if (sol == 0) {
+        return false;
+    }
+    if (run(rocblas_gemm_algo_solution_index, sol)) {
+        return true;
+    }
+    std::lock_guard<std::mutex> lock(mutex);
+    cache[key] = 0;
+    return false;
+}
+#endif // defined(GGML_USE_HIP)
+
 template<ggml_type compute_type>
 static void ggml_cuda_mul_mat_cublas_impl(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
     using traits = batched_mul_mat_traits<compute_type>;
@@ -1994,6 +2111,12 @@ static void ggml_cuda_mul_mat_cublas_impl(ggml_backend_cuda_context & ctx, const
                                            (const float *) src1_ptr, s11,
                     (const float *) beta,  (float       *)  dst_ptr, ldc));
     } else if (ne12 == 1 && ne13 == 1) {
+#if defined(GGML_USE_HIP)
+        if (compute_type == GGML_TYPE_F16 && prefer_f32_output &&
+            ggml_cuda_hip_gemm_tuned(cublas_h, main_stream, cc, ne01, ne11, ne10, alpha, src0_ptr, s01, src1_ptr, s11, beta, dst_ptr, ldc)) {
+            // done with a tuned kernel
+        } else
+#endif // defined(GGML_USE_HIP)
         CUBLAS_CHECK(
             cublasGemmEx(cublas_h, CUBLAS_OP_T, CUBLAS_OP_N,
                     ne01, ne11, ne10,
