@@ -15,7 +15,7 @@
 | decode tg128，上下文 0 | 45.63 token/s | 80.33 token/s | +76.0% |
 | decode tg128，上下文 8192 | 44.23 token/s | 74.57 token/s | +68.6% |
 | decode tg128，上下文 32768 | 40.65 token/s | 64.43 token/s | +58.5% |
-| prefill pp8192 | 1220 token/s | 1608 token/s | +32%（第十三节的 GEMM 选核与反量化修正；只做 decode 优化时为 1245） |
+| prefill pp8192 | 1220 token/s | 1687 token/s | +38%（第十三节的各项 prefill 修正；只做 decode 优化时为 1245） |
 | llama-server 单请求（-np 1） | 45.6 token/s | 79.1 token/s | +73% |
 | 每 token kernel 启动数 | 1933 | 601 | −69% |
 | 显存峰值（llama-bench） | 24.1 GB | 28.1–31.9 GB | +4–8 GB |
@@ -486,9 +486,10 @@ docker exec mi210-opt bash -lc "PAR=12 /lab/build-wt.sh /lab/wt-mybranch /lab/wt
 
 | 上限 | token/s |
 |---|---|
-| 物理上限：50.5 GFLOP 以 171 TFLOPS 计算 | 约 3390 |
+| 物理上限：50.5 GFLOP 以 171 TFLOPS 计算（零数据峰值；真实数据受功耗上限限制，见第 6 小节） | 约 3390 |
+| 物理上限（真实数据，约 150 TFLOPS） | 约 2980 |
 | GEMM 全部用最优库 kernel（hipBLASLt 平均约 150 TFLOPS），其余开销为零 | 约 3000 |
-| 两项修正后的当前版本（pp8192） | 1608 |
+| 当前版本（pp8192） | 1687 |
 
 修正前，rocprofv3 测得每 token 0.804 ms：GEMM 0.577 ms（权重先反量化为 f16，再走 rocBLAS，平均只有 84 TFLOPS），非 GEMM 0.227 ms（逐 token 递推的 DeltaNet kernel 0.065，flash attention 0.047、只有 34 TFLOPS，反量化 0.031，其余小算子约 0.08）。
 
@@ -527,12 +528,37 @@ llama-bench 中 pp512 是一个 512-token 批次，pp2048 是一个 2048-token �
 - **修正（`convert.cu`）**：在 HIP 上，IQ2_XXS/IQ2_XS/IQ2_S/IQ3_XXS/IQ3_S/IQ4_XS/Q4_K/Q2_K 改用 256 线程 block，每组线程用原来的逐线程公式把一个超块展开到 LDS，再用 16 字节写回。输出逐位相同。`GGML_CUDA_DEQUANT_LDS=0` 恢复原来的启动方式。
 - **结果**（A→B→B→A）：每批次反量化 119 → 66 ms（约 0.9 TB/s）。pp512 1006 → 1119（+11%），pp2048 1544 → 1597（+3.4%），pp8192 1583 → 1608（+1.6%），decode 不变。每个 chunk 的困惑度完全相同，test-backend-ops MUL_MAT 2490/2490 通过。
 
-### 6. 剩余 prefill 方向
+### 6. 功耗上限对 prefill 上限的修正
 
-- 非 GEMM 部分：DeltaNet 改为分块（chunked）算法，flash attention 提高 MFMA 利用率，小算子融合。估计可再到约 2400 token/s。反量化离带宽下限（约 45 ms/批次）还差约 20 ms，主要影响短 prompt。
-- GEMM 部分：直接对量化权重做 MFMA（避免反量化写回），或逐形状为 hipBLASLt 选最优解（再快约 5%）。
+前面的 MFMA 峰值（171 TFLOPS）和 GEMM 微基准用的是全零或常数操作数，功耗低，频率能保持在 1700 MHz。换成随机数据后：
 
-微基准源码在 `mi210-tools/peak-bench/`：`peak_bench.hip`（带宽、MFMA、方阵 GEMM）、`bound_bench.hip`（逐张量读取 graph、实际形状 GEMM 全候选扫描）、`gemm_sweep.hip`（不同 token 数下的选核对比）。编译：`hipcc -O3 --offload-arch=gfx90a -std=c++17 <file> -lrocblas`。
+| 测试 | 零/常数数据 | 随机数据 |
+|---|---|---|
+| MFMA FP16 循环（纯寄存器） | 173 TFLOPS | 150.6 TFLOPS |
+| hipBLASLt 默认 kernel，实际 prefill 形状合计 | 约 146 TFLOPS | 约 122 TFLOPS |
+| hipBLASLt 每个形状的最优 kernel | 约 154 TFLOPS | 约 128 TFLOPS |
+
+原因是显卡功耗上限 300 W（`power1_cap` 已等于 `power1_cap_max`，无法再调高），真实数据下功耗更高，频率被压到约 1600 MHz 以下。因此：
+
+- prefill 的物理上限应按约 150 TFLOPS 计算：50.5 GFLOP ÷ 150.6 TFLOPS ≈ **2980 token/s**（不是 3390）。
+- 用库里最好的 GEMM kernel（约 128 TFLOPS）、其余开销为零时约 **2600 token/s**。
+- 模型里实测的 GEMM 约 124 TFLOPS，已经接近库 kernel 在真实数据下的水平，GEMM 部分剩余空间很小。
+
+### 7. 卷积输入拼接、卷积与 GEMM 逐形状选核
+
+- **拼接（`concat.cu`）**：DeltaNet 层在卷积前把卷积状态和转置后的激活拼成按通道排列的输入，通用的非连续拼接 kernel 以 C 个元素的步长读取，每层每批次 1.89 ms。改为 64×64 的 LDS 分块转置后为 0.74 ms。`GGML_CUDA_CONCAT_TILE=0` 关闭。
+- **长序列卷积（`ssm-conv.cu`）**：同样改为 64×64 LDS 分块，0.87 → 0.67 ms。`GGML_CUDA_SSM_CONV_TILE=0` 关闭。两者的逐元素计算和顺序不变，输出逐位相同。
+- **GEMM 逐形状选核（`ggml-cuda.cu` 的 `ggml_cuda_hip_gemm_tuned`）**：n ≥ 2048 的大 GEMM 第一次遇到某个（m、k、n 档位）时，把一小组已知较好的 hipBLASLt solution index（只取库报告为对该问题有效的）与默认选择各计时一次，缓存最快的；候选不比默认快 2% 以上就保留默认。每个形状每个进程一次，约 0.1–0.2 s。`GGML_CUDA_GEMM_TUNE=0` 关闭。不同 kernel 只有 fp32 求和顺序的差别；因为按计时选择，不同进程之间 prefill 的 logits 可能有这个量级的差别。
+- **结果**（A→B→B→A，ub 4096，三项一起）：pp2048 1601 → 1715（+7%），pp8192 1610 → 1687（+5%），pp512 不变，decode 不变（80.0 / 74.5）。prefill 路径 KLD 0.000002、top-1 99.95%，与噪声底线相同。
+
+修正后 pp8192 每 token 约 0.585 ms：GEMM 约 375 µs，DeltaNet 65 µs，flash attention 47 µs，SwiGLU 16 µs，f32→f16 转换 15 µs，反量化 16 µs，拼接 + 卷积 16 µs，其余约 35 µs。
+
+### 8. 剩余 prefill 方向
+
+- 非 GEMM 部分：DeltaNet 改为分块（chunked）算法，flash attention 提高 MFMA 利用率，小算子融合。估计 DeltaNet 约 +7%、flash attention 约 +5%（pp8192）。反量化离带宽下限（约 45 ms/批次）还差约 20 ms，主要影响短 prompt。
+- GEMM 部分已接近库 kernel 在功耗上限下的水平。卷积可以直接从按 token 排列的激活计算、完全跳过转置拷贝（约再 +2%）；gate/up 等共用输入的 f32→f16 转换可以去重（约 +1%）；SwiGLU 可以直接输出 f16（约 +1%）。
+
+微基准源码在 `mi210-tools/peak-bench/`：`peak_bench.hip`（带宽、MFMA、方阵 GEMM）、`bound_bench.hip`（逐张量读取 graph、实际形状 GEMM 全候选扫描）、`gemm_sweep.hip`（不同 token 数下的选核对比）、`mfma_rand.hip`（零数据与随机数据下的 MFMA 峰值，显示功耗上限的影响）。编译：`hipcc -O3 --offload-arch=gfx90a -std=c++17 <file> -lrocblas`。
 
 ## 附录：开关、文件、分支
 
