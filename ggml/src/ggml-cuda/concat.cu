@@ -1,4 +1,5 @@
 #include "concat.cuh"
+#include "ssm-conv.cuh"
 
 #include <stdint.h>
 
@@ -266,6 +267,13 @@ void ggml_cuda_op_concat(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     cudaStream_t stream = ctx.stream();
 
     const int32_t dim = ((int32_t *) dst->op_params)[0];
+
+#if defined(GGML_USE_HIP)
+    if (ctx.conv_fuse_concat == dst) {
+        ggml_cuda_conv_fuse_prep(ctx, dst);
+        return;
+    }
+#endif // defined(GGML_USE_HIP)
 
     GGML_ASSERT(src0->type == src1->type);
     GGML_ASSERT(dst->type  == src0->type);

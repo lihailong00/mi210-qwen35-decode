@@ -4918,6 +4918,86 @@ struct test_ssm_conv_bias_silu : public test_case {
     }
 };
 
+// The conv input of a delta-net layer: concat(conv state, transposed token-major x) -> GGML_OP_SSM_CONV -> SILU, with
+// the conv state update reading the trailing columns of the concat through a view. A backend may leave the
+// channel-major concat output unmaterialized and compute the conv from the concat sources (the HIP backend does for
+// n_t >= 256), so both the conv output and what the views read are checked.
+struct test_ssm_conv_concat_silu : public test_case {
+    const int64_t n_t; // tokens per sequence
+    const int64_t n_c; // channels
+    const int64_t n_s; // sequences
+    const int     n_win; // 0: the last 3 columns as [3, C, n_s]; > 0: that many overlapping 3-column windows
+    const bool    concat_between; // an unrelated concat between the conv input and the conv
+    std::vector<ggml_tensor *> outs;
+    std::vector<ggml_tensor *> expand_order;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "SSM_CONV_CONCAT_SILU";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    std::vector<ggml_tensor *> fusion_test_nodes() override { return outs; }
+
+    std::string vars() override {
+        return VARS_TO_STR5(n_t, n_c, n_s, n_win, concat_between);
+    }
+
+    test_ssm_conv_concat_silu(int64_t n_t, int64_t n_c, int64_t n_s, int n_win = 0, bool concat_between = false)
+        : n_t(n_t), n_c(n_c), n_s(n_s), n_win(n_win), concat_between(concat_between) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        const size_t fs = sizeof(float);
+
+        ggml_tensor * state = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 3, n_c, n_s);
+        ggml_tensor * x_in  = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_c, n_t, n_s);
+        ggml_tensor * w     = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 4, n_c);
+        ggml_set_name(state, "state");
+        ggml_set_name(w, "w");
+
+        // stand-in for the projection output (a computed node, like the MUL_MAT in the model)
+        ggml_tensor * x   = ggml_scale(ctx, x_in, 1.0f);
+        ggml_tensor * cin = ggml_concat(ctx, state, ggml_transpose(ctx, x), 0);
+        ggml_set_name(cin, "conv_input");
+
+        ggml_tensor * tail;
+        if (n_win > 0) {
+            tail = ggml_view_4d(ctx, cin, 3, n_win, n_c, n_s, fs, cin->nb[1], cin->nb[2], (n_t - (n_win - 1))*fs);
+        } else {
+            tail = ggml_view_3d(ctx, cin, 3, n_c, n_s, cin->nb[1], cin->nb[2], n_t*fs);
+        }
+        ggml_tensor * new_state = ggml_cont(ctx, tail);
+        ggml_set_name(new_state, "new_state");
+
+        ggml_tensor * other = nullptr;
+        if (concat_between) {
+            ggml_tensor * p = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 5, n_c);
+            ggml_tensor * q = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 7, n_c);
+            other = ggml_concat(ctx, p, q, 0);
+        }
+
+        ggml_tensor * out = ggml_silu(ctx, ggml_ssm_conv(ctx, cin, w));
+        ggml_set_name(out, "out");
+
+        // the test framework expands the returned tensor last; record the desired expansion order
+        expand_order = { new_state };
+        outs         = { new_state, out };
+        if (other != nullptr) {
+            expand_order.push_back(other);
+            outs.push_back(other);
+        }
+
+        return out;
+    }
+
+    void expand_graph(ggml_cgraph * gf) override {
+        for (ggml_tensor * t : expand_order) {
+            ggml_build_forward_expand(gf, t);
+        }
+    }
+};
+
 // GGML_OP_SSM_SCAN
 struct test_ssm_scan : public test_case {
     const ggml_type type;
@@ -8053,6 +8133,137 @@ struct test_mul_mat_add : public test_case {
         ggml_set_name(out, "out");
 
         return out;
+    }
+};
+
+// Large-batch GEMM patterns that backends may fuse around a weight mat-mul (the HIP backend does when the mat-mul is a
+// cuBLAS fp16 GEMM): the weights live in a weights buffer like model weights, the residual is updated in place.
+enum gemm_fusion_pattern {
+    GEMM_FUSION_GLU,             // swiglu(gate, up) -> mul_mat
+    GEMM_FUSION_ADD,             // mul_mat -> res += mm
+    GEMM_FUSION_ADD_RESHAPE,     // mul_mat -> reshape -> res += mm
+    GEMM_FUSION_GLU_ADD,         // swiglu(gate, up) -> mul_mat -> res += mm
+    GEMM_FUSION_NORM_SHARED,     // rms_norm(x) * w -> two mul_mat that read the same activation
+    GEMM_FUSION_NORM_SHARED_ADD, // as above, the first mul_mat accumulates onto the residual
+    GEMM_FUSION_RES_REUSED,      // the same residual tensor is a mat-mul input before and after res += mm
+};
+
+static std::string var_to_str(gemm_fusion_pattern pattern) {
+    switch (pattern) {
+        case GEMM_FUSION_GLU:             return "glu-mm";
+        case GEMM_FUSION_ADD:             return "mm-add";
+        case GEMM_FUSION_ADD_RESHAPE:     return "mm-reshape-add";
+        case GEMM_FUSION_GLU_ADD:         return "glu-mm-add";
+        case GEMM_FUSION_NORM_SHARED:     return "norm-2mm";
+        case GEMM_FUSION_NORM_SHARED_ADD: return "norm-2mm-add";
+        case GEMM_FUSION_RES_REUSED:      return "res-reused";
+    }
+    return "unknown";
+}
+
+struct test_gemm_fusion : public test_case {
+    const ggml_type type_a;
+    const int64_t m;
+    const int64_t n;
+    const int64_t k;
+    const gemm_fusion_pattern pattern;
+    std::vector<ggml_tensor *> expand_order; // expanded in this order before the returned tensor
+
+    test_gemm_fusion(ggml_type type_a, int64_t m, int64_t n, int64_t k, gemm_fusion_pattern pattern)
+        : type_a(type_a), m(m), n(n), k(k), pattern(pattern) {}
+
+    std::string vars() override {
+        return VARS_TO_STR5(type_a, m, n, k, pattern);
+    }
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "GEMM_FUSION";
+    }
+
+    bool run_whole_graph() override { return true; }
+    bool use_weight_context() override { return true; }
+
+    double max_nmse_err() override {
+        return 5e-4;
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        return build_graph(ctx, ctx);
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx, ggml_context * ctx_weights) override {
+        expand_order.clear();
+
+        ggml_tensor * a = ggml_new_tensor_2d(ctx_weights, type_a, k, m);
+        ggml_set_name(a, "a");
+
+        ggml_tensor * out = nullptr;
+        switch (pattern) {
+            case GEMM_FUSION_GLU:
+            case GEMM_FUSION_GLU_ADD:
+                {
+                    ggml_tensor * gate = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, n);
+                    ggml_tensor * up   = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, n);
+                    out = ggml_mul_mat(ctx, a, ggml_swiglu_split(ctx, gate, up));
+                    if (pattern == GEMM_FUSION_GLU_ADD) {
+                        ggml_tensor * res = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, m, n);
+                        out = ggml_add_inplace(ctx, res, out);
+                    }
+                } break;
+            case GEMM_FUSION_ADD:
+            case GEMM_FUSION_ADD_RESHAPE:
+                {
+                    ggml_tensor * b   = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, n);
+                    ggml_tensor * res = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, m, n);
+                    out = ggml_mul_mat(ctx, a, b);
+                    if (pattern == GEMM_FUSION_ADD_RESHAPE) {
+                        res = ggml_reshape_3d(ctx, res, m, n/2, 2);
+                        out = ggml_reshape_3d(ctx, out, m, n/2, 2);
+                    }
+                    out = ggml_add_inplace(ctx, res, out);
+                } break;
+            case GEMM_FUSION_NORM_SHARED:
+            case GEMM_FUSION_NORM_SHARED_ADD:
+                {
+                    ggml_tensor * x  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, n);
+                    ggml_tensor * w  = ggml_new_tensor_1d(ctx_weights, GGML_TYPE_F32, k);
+                    ggml_tensor * a2 = ggml_new_tensor_2d(ctx_weights, type_a, k, m);
+                    ggml_tensor * y  = ggml_mul(ctx, ggml_rms_norm(ctx, x, 1e-6f), w);
+                    ggml_tensor * mm = ggml_mul_mat(ctx, a, y);
+                    if (pattern == GEMM_FUSION_NORM_SHARED_ADD) {
+                        ggml_tensor * res = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, m, n);
+                        mm = ggml_add_inplace(ctx, res, mm);
+                    }
+                    out = ggml_add(ctx, mm, ggml_mul_mat(ctx, a2, y));
+                } break;
+            case GEMM_FUSION_RES_REUSED:
+                {
+                    // u = (wa + wb) res; res += a b (in place); v = (wa + wb) res; out = u + v, evaluated in this order.
+                    // The mat-muls of v read the very same tensor as those of u, but behind the in-place sum: they
+                    // must see the updated residual (a backend that keeps a converted copy of a mat-mul input has to
+                    // drop it when something writes the tensor, here the sum that may be folded into the mat-mul).
+                    ggml_tensor * b   = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, n);
+                    ggml_tensor * res = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, m, n);
+                    ggml_tensor * wa  = ggml_new_tensor_2d(ctx_weights, type_a, m, 64);
+                    ggml_tensor * wb  = ggml_new_tensor_2d(ctx_weights, type_a, m, 64);
+                    ggml_tensor * u   = ggml_add(ctx, ggml_mul_mat(ctx, wa, res), ggml_mul_mat(ctx, wb, res));
+                    ggml_tensor * sum = ggml_add_inplace(ctx, res, ggml_mul_mat(ctx, a, b));
+                    ggml_tensor * v   = ggml_add(ctx, ggml_mul_mat(ctx, wa, res), ggml_mul_mat(ctx, wb, res));
+                    // nothing but the node order says that v reads the residual after the sum was added to it
+                    expand_order = { u, sum, v };
+                    out = ggml_add(ctx, u, v);
+                } break;
+        }
+        ggml_set_name(out, "out");
+
+        return out;
+    }
+
+    void expand_graph(ggml_cgraph * gf) override {
+        for (ggml_tensor * t : expand_order) {
+            ggml_build_forward_expand(gf, t);
+        }
     }
 };
 
@@ -11480,6 +11691,36 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
                     GGML_TYPE_F32, {d_conv - 1 + 64, d_inner, 4, 1}, {d_conv, d_inner, 1, 1}, fuse_bias));
             }
         }
+    }
+
+    // conv input of a delta-net layer (concat -> ssm_conv -> silu, state update through views of the concat):
+    // below / at / above the batch size from which the HIP backend skips the channel-major concat (256), which then
+    // works on chunks of 32 to 256 tokens depending on n_t (a last chunk of one token, chunk lengths 32, 96 and 256
+    // with tails that are not a multiple of 4), several sequences, both kinds of state views, and a second concat
+    // between the conv input and the conv
+    for (int64_t n_t : {64, 255, 256, 257, 300, 1030, 4102}) {
+        test_cases.emplace_back(new test_ssm_conv_concat_silu(n_t, 128, 1));
+        test_cases.emplace_back(new test_ssm_conv_concat_silu(n_t, 256, 3));
+        test_cases.emplace_back(new test_ssm_conv_concat_silu(n_t, 128, 2, 2));
+    }
+    test_cases.emplace_back(new test_ssm_conv_concat_silu(300, 128, 2, 0, true));
+
+    // large-batch patterns around a weight mat-mul (cuBLAS fp16 GEMM on the HIP backend): swiglu -> mat-mul,
+    // mat-mul -> in-place residual add, both, and rms_norm * weight feeding several mat-muls (>= 2^20 elements)
+    // (Q4_0 keeps its own mat-mul kernels there and must be left alone)
+    for (ggml_type type_a : {GGML_TYPE_F16, GGML_TYPE_IQ3_S, GGML_TYPE_Q4_0}) {
+        for (int64_t n : {255, 256, 512}) {
+            for (gemm_fusion_pattern pattern : {GEMM_FUSION_GLU, GEMM_FUSION_ADD, GEMM_FUSION_ADD_RESHAPE, GEMM_FUSION_GLU_ADD}) {
+                if (pattern == GEMM_FUSION_ADD_RESHAPE && n % 2 != 0) {
+                    continue;
+                }
+                test_cases.emplace_back(new test_gemm_fusion(type_a, 384, n, 1024, pattern));
+            }
+        }
+        test_cases.emplace_back(new test_gemm_fusion(type_a, 96,   256, 5120, GEMM_FUSION_NORM_SHARED));
+        test_cases.emplace_back(new test_gemm_fusion(type_a, 96,   256, 5120, GEMM_FUSION_NORM_SHARED_ADD));
+        test_cases.emplace_back(new test_gemm_fusion(type_a, 96,   512, 2048, GEMM_FUSION_NORM_SHARED)); // copy made by the first mat-mul
+        test_cases.emplace_back(new test_gemm_fusion(type_a, 4096, 256, 512,  GEMM_FUSION_RES_REUSED));
     }
 
     test_cases.emplace_back(new test_ssm_scan(GGML_TYPE_F32, 16, 1, 1024, 1, 32, 4)); // Mamba-1

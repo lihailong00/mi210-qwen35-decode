@@ -1453,6 +1453,9 @@ struct ggml_cuda_stream_context {
     }
 };
 
+// shared f16/bf16 copies of GEMM inputs and the fusion counters: defined in ggml-cuda.cu
+struct ggml_cuda_f16_share_state;
+
 struct ggml_backend_cuda_context {
     int device;
     std::string name;
@@ -1576,6 +1579,15 @@ struct ggml_backend_cuda_context {
     ggml_cuda_pool & pool() {
         return pool(device);
     }
+
+    // conv-input fusion (HIP prefill): the CONCAT node whose channel-major output is not materialized because
+    // the SSM_CONV + SILU that consumes it reads the concat sources directly (see ssm-conv.cu), and the first
+    // column of that output which other nodes still read through views
+    const ggml_tensor * conv_fuse_concat = nullptr;
+    int64_t             conv_fuse_col0   = 0;
+
+    // owned: created on first use (ggml_cuda_f16_share_get) and freed by the destructor
+    ggml_cuda_f16_share_state * f16_share = nullptr;
 };
 
 struct ggml_cuda_mm_fusion_args_host {

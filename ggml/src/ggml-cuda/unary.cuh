@@ -81,6 +81,14 @@ void ggml_cuda_op_geglu(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
 
 void ggml_cuda_op_swiglu(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
 
+#if defined(GGML_USE_HIP)
+// SwiGLU of separate f32 gate/up tensors written as f16 to dst_f16 (ggml_nelements(glu) values) instead of glu->data:
+// the values are bit-identical to the f32 -> f16 conversion of the ggml_cuda_op_swiglu result. Used when the only
+// consumer is a GEMM that converts its input to f16 anyway. Returns false (nothing launched) if the shape/alignment
+// is not supported.
+bool ggml_cuda_op_swiglu_f16(ggml_backend_cuda_context & ctx, const ggml_tensor * glu, void * dst_f16);
+#endif // defined(GGML_USE_HIP)
+
 void ggml_cuda_op_swiglu_oai(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
 
 void ggml_cuda_op_swiglu_clamp(ggml_backend_cuda_context & ctx, ggml_tensor * dst);

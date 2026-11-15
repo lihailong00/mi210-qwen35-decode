@@ -157,6 +157,29 @@ llama_model_qwen35::graph::graph(const llama_model & model, const llm_graph_para
     ggml_tensor * inp_pos     = build_inp_pos();
     ggml_tensor * inp_out_ids = build_inp_out_ids();
 
+    // With a large batch the residual is the first ADD operand, so that ggml-alloc computes the sum in place on the
+    // residual and the backend can fold the add into the preceding GEMM (beta = 1, see ggml_cuda_match_gemm_add).
+    // Small batches keep the original operand order: the single-token graph (buffer layout, fusions) is unchanged.
+    // The threshold is the batch size from which the backend fuses (the `mm->ne[1] < 256` check in
+    // ggml_cuda_match_gemm_add, ggml/src/ggml-cuda/ggml-cuda.cu): keep the two in sync.
+    //
+    // The two forms are different graphs for ggml-alloc, which applies a reservation by node and leaf index
+    // (ggml_gallocr_alloc_graph). The operand order changes the order in which ggml_build_forward_expand reaches the
+    // leafs: in every layer the ffn_down / ffn_gate weights trade places with the leafs below the attention output.
+    // Those are pre-allocated weights, which the allocator skips. In the last layer, however, get_rows(inpSA, out_ids)
+    // also moves across the tail of the attention block (5 node positions differ) and the graph input out_ids moves
+    // to another leaf index, so a reservation made for one form must not be applied to a graph of the other one.
+    // It is not: when the form changes between two multi-token graphs (e.g. a full ubatch followed by a rest of
+    // less than 256 tokens) the graph is reserved again, because
+    //  - ggml_backend_sched_alloc_splits compares the buffer type of every node and leaf index with the previous
+    //    graph, and out_ids (host buffer) trades its index with a weight (verified with -ngl 999, 40 and 0), and
+    //  - without any GPU device ggml_gallocr_needs_realloc finds a node source that has no allocation in the
+    //    reservation (verified with --device none).
+    // Both are consequences of the reordered last layer, not guarantees of the allocator: a user of a plain
+    // ggml_gallocr that keeps one reservation for both forms, or a change to the tail of this graph, has to make
+    // sure that the graph inputs keep their leaf index (e.g. by expanding them first) or that it reserves again.
+    const bool residual_first = n_tokens >= 256;
+
     // MTP/NextN layers are loaded as extra decoder blocks but not executed in the main pass.
     for (int il = 0; il < n_layer; ++il) {
         res->t_layer_inp[il] = inpL;
@@ -183,7 +206,7 @@ llama_model_qwen35::graph::graph(const llama_model & model, const llm_graph_para
         }
 
         // Residual connection
-        cur = ggml_add(ctx0, cur, inpSA);
+        cur = residual_first ? ggml_add(ctx0, inpSA, cur) : ggml_add(ctx0, cur, inpSA);
         cb(cur, "attn_residual", il);
 
         // Save the tensor before post-attention norm for residual connection
@@ -198,7 +221,7 @@ llama_model_qwen35::graph::graph(const llama_model & model, const llm_graph_para
         cb(cur, "ffn_out", il);
 
         // Residual connection for FFN - add to the tensor from before post_attention_layernorm
-        cur = ggml_add(ctx0, cur, ffn_residual);
+        cur = residual_first ? ggml_add(ctx0, ffn_residual, cur) : ggml_add(ctx0, cur, ffn_residual);
         cb(cur, "post_ffn", il);
 
         cur = build_cvec(cur, il);

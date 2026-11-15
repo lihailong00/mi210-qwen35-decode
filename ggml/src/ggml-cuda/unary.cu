@@ -402,6 +402,60 @@ void ggml_cuda_op_swiglu(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     ggml_cuda_op_unary_gated<op_silu>(ctx, dst);
 }
 
+#if defined(GGML_USE_HIP)
+// silu(x) * g for contiguous f32 x/g with f16 output, four elements per thread (16-byte loads, 8-byte store; on gfx90a
+// 8 or 16 elements per thread and other block sizes are not faster). Same per-element arithmetic as
+// unary_gated_op_kernel<op_silu, float> followed by the f32 -> f16 conversion of the GEMM input
+// (convert_unary_cont_vec4<float, half>), so the result is bit-identical to that pair of kernels.
+template <typename T> struct alignas(sizeof(T)*4) swiglu_vec4 { T v[4]; };
+
+static __global__ void swiglu_f32_f16_kernel(
+        const float * __restrict__ x, const float * __restrict__ g, half * __restrict__ dst, const int64_t k4) {
+    const int64_t i = int64_t(blockDim.x)*blockIdx.x + threadIdx.x;
+
+    if (i >= k4) {
+        return;
+    }
+
+    const swiglu_vec4<float> xv = ((const swiglu_vec4<float> *) x)[i];
+    const swiglu_vec4<float> gv = ((const swiglu_vec4<float> *) g)[i];
+
+    swiglu_vec4<half> yv;
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+        yv.v[j] = ggml_cuda_cast<half>(op_silu(xv.v[j]) * gv.v[j]);
+    }
+
+    ((swiglu_vec4<half> *) dst)[i] = yv;
+}
+
+bool ggml_cuda_op_swiglu_f16(ggml_backend_cuda_context & ctx, const ggml_tensor * glu, void * dst_f16) {
+    const ggml_tensor * src0 = glu->src[0];
+    const ggml_tensor * src1 = glu->src[1];
+
+    if (!src1 || ((const int32_t *) glu->op_params)[1] != 0 ||
+            src0->type != GGML_TYPE_F32 || src1->type != GGML_TYPE_F32 || glu->type != GGML_TYPE_F32 ||
+            !ggml_is_contiguous(src0) || !ggml_is_contiguous(src1) || !ggml_is_contiguous(glu) ||
+            !ggml_are_same_shape(src0, glu) || !ggml_are_same_shape(src1, glu)) {
+        return false;
+    }
+
+    const int64_t k = ggml_nelements(glu);
+    if (k % 4 != 0 ||
+            (uintptr_t) src0->data % alignof(swiglu_vec4<float>) != 0 ||
+            (uintptr_t) src1->data % alignof(swiglu_vec4<float>) != 0 ||
+            (uintptr_t) dst_f16    % alignof(swiglu_vec4<half>)  != 0) {
+        return false;
+    }
+
+    const int64_t k4         = k / 4;
+    const int64_t num_blocks = (k4 + CUDA_GLU_BLOCK_SIZE - 1) / CUDA_GLU_BLOCK_SIZE;
+    swiglu_f32_f16_kernel<<<num_blocks, CUDA_GLU_BLOCK_SIZE, 0, ctx.stream()>>>(
+        (const float *) src0->data, (const float *) src1->data, (half *) dst_f16, k4);
+    return true;
+}
+#endif // defined(GGML_USE_HIP)
+
 void ggml_cuda_op_geglu_erf(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     ggml_cuda_op_unary_gated<op_gelu_erf>(ctx, dst);
 }
