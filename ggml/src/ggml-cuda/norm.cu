@@ -524,11 +524,87 @@ static bool rms_norm_f32_dispatch(
 }
 #undef RMS_NORM_LAUNCH
 
+#if defined(GGML_USE_HIP)
+// Many short rows (ncols <= 128, e.g. the per-head L2 norms of q and k in the linear-attention layers): the vector
+// path of rms_norm_f32<32, 1, true> runs one 32-thread block per row, which leaves the CU short of waves for a
+// memory-bound op. Here a 256-thread block does 8 rows, one 32-lane group per row, with the arithmetic of that
+// kernel (same per-lane partial sums, same width-32 xor reduction, same scaling), so the results are bit-identical.
+// Rows are numbered like the outputs: r = (sample*nchannels + channel)*nrows + row. GGML_CUDA_RMS_NORM_ROWS=0
+// disables it.
+template <bool do_scale>
+static __global__ void __launch_bounds__(256) rms_norm_f32_rows32(
+        const float * __restrict__ x, float * __restrict__ dst, const int ncols, const uint32_t nrows, const uint32_t nchannels,
+        const uint32_t nrows_total, const int64_t stride_row, const int64_t stride_channel, const int64_t stride_sample,
+        const float eps, const float scale_out) {
+    const int      tid = threadIdx.x & 31;
+    const uint32_t r   = blockIdx.x * 8 + (threadIdx.x >> 5);
+    if (r >= nrows_total) {
+        return;   // the whole 32-lane group (the reduction never leaves it)
+    }
+    const uint32_t row     = r % nrows;
+    const uint32_t rc      = r / nrows;
+    const uint32_t channel = rc % nchannels;
+    const uint32_t sample  = rc / nchannels;
+    const float4 * x4   = (const float4 *) (x + sample*stride_sample + channel*stride_channel + row*stride_row);
+    float4       * dst4 = (float4 *) (dst + (int64_t) r*ncols);
+    const int ncols4 = ncols / 4;
+
+    float4 xs;
+    float  tmp = 0.0f;
+    if (tid < ncols4) {
+        xs = x4[tid];
+        tmp += xs.x*xs.x + xs.y*xs.y + xs.z*xs.z + xs.w*xs.w;
+    }
+    tmp = warp_reduce_sum(tmp);   // width 32 = block_reduce<SUM, 32>
+    const float scale = rsqrtf(tmp / ncols + eps);
+    if (tid < ncols4) {
+        float4 q = make_float4(scale*xs.x, scale*xs.y, scale*xs.z, scale*xs.w);
+        if constexpr (do_scale) {
+            q.x *= scale_out;
+            q.y *= scale_out;
+            q.z *= scale_out;
+            q.w *= scale_out;
+        }
+        dst4[tid] = q;
+    }
+}
+
+// returns true if it launched (large row counts only, so single-token graphs keep their kernels)
+template <bool do_scale>
+static bool rms_norm_f32_rows32_cuda(
+        const ggml_tensor * x_t, float * dst, const int ncols, const int nrows, const int nchannels, const int nsamples,
+        const int64_t stride_row, const int64_t stride_channel, const int64_t stride_sample, const float eps, cudaStream_t stream,
+        const float scale_out) {
+    static const bool enabled = [] {
+        const char * e = getenv("GGML_CUDA_RMS_NORM_ROWS");
+        return e == nullptr || atoi(e) != 0;
+    }();
+    const int64_t nrows_total = (int64_t) nrows * nchannels * nsamples;
+    // the same conditions as the vector path with 32 threads in rms_norm_f32_dispatch; at most (2^32 - 1) / 256 blocks
+    // (HIP rejects grids of 2^32 or more threads)
+    if (!enabled || ncols % 4 != 0 || ncols <= 0 || ncols / 4 > 32 || ((uintptr_t) dst & 15) != 0 || !ggml_cuda_is_aligned(x_t, 16) ||
+            nrows_total < 8192 || nrows_total > (int64_t) (UINT32_MAX / 256) * 8) {
+        return false;
+    }
+    const uint32_t nblocks = (uint32_t) ((nrows_total + 7) / 8);
+    rms_norm_f32_rows32<do_scale><<<nblocks, 256, 0, stream>>>((const float *) x_t->data, dst, ncols, nrows, nchannels,
+        (uint32_t) nrows_total, stride_row, stride_channel, stride_sample, eps, scale_out);
+    CUDA_CHECK(cudaGetLastError());
+    return true;
+}
+#endif // defined(GGML_USE_HIP)
+
 template <bool do_scale = false>
 static void rms_norm_f32_cuda(
         const ggml_tensor * x_t, float * dst, const int ncols, const int nrows, const int nchannels, const int nsamples,
         const int64_t stride_row, const int64_t stride_channel, const int64_t stride_sample, const float eps, cudaStream_t stream,
         const float scale_out = 1.0f) {
+#if defined(GGML_USE_HIP)
+    if (rms_norm_f32_rows32_cuda<do_scale>(x_t, dst, ncols, nrows, nchannels, nsamples, stride_row, stride_channel, stride_sample,
+            eps, stream, scale_out)) {
+        return;
+    }
+#endif // defined(GGML_USE_HIP)
     const dim3 blocks_num(nrows, MIN(nchannels, UINT16_MAX), MIN(nsamples, UINT16_MAX));
     rms_norm_f32_dispatch</*do_multiply*/false, /*do_add*/false, do_scale>(
         blocks_num, x_t, dst, ncols, nchannels, nsamples, stride_row, stride_channel, stride_sample, eps,

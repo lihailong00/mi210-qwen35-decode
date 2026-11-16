@@ -4,6 +4,7 @@
 // The fp32 output is computed with exactly the same arithmetic as the regular kernels.
 #include "common.cuh"
 #include "unary.cuh"
+#include "convert.cuh"
 #include "mmvq-fused-host.cuh"
 
 #if defined(GGML_USE_HIP)
@@ -301,6 +302,43 @@ static __global__ void __launch_bounds__(32) rms_norm_gated_q8_kernel(const floa
     }
 }
 
+// Large-batch (prefill) variant: rows of 128, the f16 copy of silu(z) * (rms_norm(x) * w) only (the input of the
+// following f16 GEMM; the f32 result has no other consumer and is not written). One 32-lane group per row, 8 rows per
+// 256-thread block. Per row exactly the arithmetic of rms_norm_f32<32, 1, true, true> (same per-lane partial sums and
+// the same width-32 xor reduction), the UNARY(SILU)+MUL op and the f32 -> f16 conversion of the GEMM input, so the
+// f16 values are bit-identical to that sequence of three kernels. (Two or four rows per group are slower on gfx90a
+// and, once unrolled, let the compiler contract the sums of squares differently: not bit-identical.)
+struct alignas(8) gnorm_half4 { half v[4]; };
+
+static __global__ void __launch_bounds__(256) rms_norm_gated_f16_kernel(const float * __restrict__ x, const float * __restrict__ w,
+        const float * __restrict__ z, half * __restrict__ dst, const int64_t nrows, const int ncols, const float eps) {
+    const int     tid = threadIdx.x & 31;
+    const int64_t row = (int64_t) blockIdx.x * 8 + (threadIdx.x >> 5);
+    if (row >= nrows) {
+        return;   // the whole 32-lane group (the reduction never leaves it)
+    }
+    const float4 xs = ((const float4 *) x)[row*32 + tid];
+    const float4 zv = ((const float4 *) z)[row*32 + tid];
+    const float4 m  = ((const float4 *) w)[tid];
+
+    float tmp = 0.0f;
+    tmp += xs.x*xs.x + xs.y*xs.y + xs.z*xs.z + xs.w*xs.w;
+    tmp = warp_reduce_sum(tmp);   // width 32 = block_reduce<SUM, 32>
+    const float scale = rsqrtf(tmp / ncols + eps);
+
+    float4 r = make_float4(scale*xs.x, scale*xs.y, scale*xs.z, scale*xs.w);
+    r.x *= m.x;
+    r.y *= m.y;
+    r.z *= m.z;
+    r.w *= m.w;
+    gnorm_half4 h;
+    h.v[0] = ggml_cuda_cast<half>(ggml_cuda_op_silu_single(zv.x) * r.x);
+    h.v[1] = ggml_cuda_cast<half>(ggml_cuda_op_silu_single(zv.y) * r.y);
+    h.v[2] = ggml_cuda_cast<half>(ggml_cuda_op_silu_single(zv.z) * r.z);
+    h.v[3] = ggml_cuda_cast<half>(ggml_cuda_op_silu_single(zv.w) * r.w);
+    ((gnorm_half4 *) dst)[row*32 + tid] = h;
+}
+
 // dst = op(x) * g with x read through a strided view (row length ne0, row strides s1/s2 in floats), + q8_1 of dst;
 // same arithmetic as CONT + gated_q8_kernel
 template <int OP>
@@ -455,6 +493,25 @@ void ggml_cuda_rms_norm_gated_q8(ggml_backend_cuda_context & ctx, const ggml_ten
     CUDA_CHECK(cudaGetLastError());
 }
 
+bool ggml_cuda_rms_norm_gated_f16_supported(const ggml_tensor * x, const ggml_tensor * w, const ggml_tensor * z, const ggml_tensor * dst) {
+    if (ggml_cuda_info().devices[ggml_cuda_get_device()].warp_size != 64) {
+        return false;
+    }
+    auto ok = [](const ggml_tensor * t) {
+        return t->type == GGML_TYPE_F32 && ggml_is_contiguous(t) && t->ne[0] == 128 && ((uintptr_t) t->data) % 16 == 0;
+    };
+    return ok(x) && ok(w) && ok(z) && ok(dst) && ggml_nelements(w) == 128 && ggml_are_same_shape(x, dst) &&
+           ggml_nelements(z) == ggml_nelements(dst) && ggml_nrows(dst) <= (int64_t) (UINT32_MAX / 256) * 8;   // grid below 2^32 threads
+}
+
+void ggml_cuda_rms_norm_gated_f16(ggml_backend_cuda_context & ctx, const ggml_tensor * x, const ggml_tensor * w, float eps,
+        const ggml_tensor * z, const ggml_tensor * dst, half * dst16) {
+    const int64_t nrows = ggml_nrows(dst);
+    rms_norm_gated_f16_kernel<<<(nrows + 7) / 8, 256, 0, ctx.stream()>>>((const float *) x->data, (const float *) w->data,
+            (const float *) z->data, dst16, nrows, 128, eps);
+    CUDA_CHECK(cudaGetLastError());
+}
+
 static bool gated_q8_launch(ggml_backend_cuda_context & ctx, const ggml_tensor * x, const ggml_tensor * g, ggml_tensor * dst, const int op) {
     if (!q8p_enabled() || ggml_cuda_info().devices[ctx.device].warp_size != 64) {
         return false;
@@ -558,6 +615,9 @@ bool ggml_cuda_unary_mul_q8(ggml_backend_cuda_context & ctx, ggml_tensor * unary
 bool ggml_cuda_rms_norm_mul_q8(ggml_backend_cuda_context &, const ggml_tensor *, ggml_tensor *) { return false; }
 bool ggml_cuda_rms_norm_gated_q8_supported(const ggml_tensor *, const ggml_tensor *, const ggml_tensor *, const ggml_tensor *) { return false; }
 void ggml_cuda_rms_norm_gated_q8(ggml_backend_cuda_context &, const ggml_tensor *, const ggml_tensor *, float, const ggml_tensor *, ggml_tensor *) {}
+bool ggml_cuda_rms_norm_gated_f16_supported(const ggml_tensor *, const ggml_tensor *, const ggml_tensor *, const ggml_tensor *) { return false; }
+void ggml_cuda_rms_norm_gated_f16(ggml_backend_cuda_context &, const ggml_tensor *, const ggml_tensor *, float, const ggml_tensor *,
+        const ggml_tensor *, half *) {}
 bool ggml_cuda_swiglu_q8(ggml_backend_cuda_context &, ggml_tensor *) { return false; }
 bool ggml_cuda_unary_mul_q8(ggml_backend_cuda_context &, ggml_tensor *, ggml_tensor *) { return false; }
 bool ggml_cuda_cont_unary_mul_q8(ggml_backend_cuda_context &, const ggml_tensor *, ggml_tensor *, ggml_tensor *) { return false; }

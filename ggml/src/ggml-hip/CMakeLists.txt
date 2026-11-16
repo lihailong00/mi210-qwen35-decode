@@ -133,6 +133,19 @@ else()
     set_source_files_properties(${GGML_SOURCES_ROCM} PROPERTIES LANGUAGE HIP)
 endif()
 
+# the two-pass DeltaNet kernel keeps its MFMA accumulators in VGPRs (no AGPR copies around its VALU work);
+# compilers that do not know the option build it without
+if (CXX_IS_HIPCC)
+    include(CheckCXXCompilerFlag)
+    check_cxx_compiler_flag("-mllvm -amdgpu-mfma-vgpr-form" GGML_HIP_HAVE_MFMA_VGPR_FORM)
+else()
+    include(CheckCompilerFlag)
+    check_compiler_flag(HIP "-mllvm -amdgpu-mfma-vgpr-form" GGML_HIP_HAVE_MFMA_VGPR_FORM)
+endif()
+if (GGML_HIP_HAVE_MFMA_VGPR_FORM)
+    set_source_files_properties(../ggml-cuda/gated-delta-net-wy.cu PROPERTIES COMPILE_OPTIONS "-mllvm;-amdgpu-mfma-vgpr-form")
+endif()
+
 if (GGML_STATIC)
     message(FATAL_ERROR "Static linking not supported for HIP/ROCm")
 endif()

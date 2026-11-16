@@ -832,6 +832,7 @@ struct ggml_cuda_f16_share_state {
     uint64_t            n_swiglu_f16     = 0;
     uint64_t            n_swiglu_f16_add = 0;
     uint64_t            n_conv_fuse      = 0;
+    uint64_t            n_gnorm_f16      = 0;
     std::unordered_map<const ggml_tensor *, std::pair<int, int>> uses; // MUL_MAT consumers: f16, bf16
     ggml_cuda_f16_share_entry entries[GGML_CUDA_F16_SHARE_ENTRIES];
     std::vector<void *> retired; // outgrown buffers that captured graphs may still reference
@@ -895,10 +896,11 @@ static void ggml_cuda_f16_share_release(ggml_backend_cuda_context * ctx) {
         // not through GGML_LOG_*: it was asked for explicitly, and tools that install a null log callback
         // (llama-bench without -v) would drop it.
         fprintf(stderr, "fusion stats: f16_share %llu reused, %llu converted, %llu produced; gemm_add %llu; swiglu_f16 %llu; "
-                "swiglu_f16_add %llu; conv_fuse %llu\n",
+                "swiglu_f16_add %llu; conv_fuse %llu; gnorm_f16 %llu\n",
                 (unsigned long long) st->n_reused, (unsigned long long) st->n_converted, (unsigned long long) st->n_produced,
                 (unsigned long long) st->n_gemm_add, (unsigned long long) st->n_swiglu_f16,
-                (unsigned long long) st->n_swiglu_f16_add, (unsigned long long) st->n_conv_fuse);
+                (unsigned long long) st->n_swiglu_f16_add, (unsigned long long) st->n_conv_fuse,
+                (unsigned long long) st->n_gnorm_f16);
     }
     for (auto & e : st->entries) {
         if (e.buf != nullptr) {
@@ -5366,6 +5368,176 @@ static int ggml_cuda_bf16_epi_chain(const ggml_cgraph * cgraph, const int k, con
     return 0;
 }
 
+static int ggml_cuda_match_gemm_add(ggml_backend_cuda_context * cuda_ctx, const ggml_cgraph * cgraph, const int i);
+
+// Ops-only match of the chain of ggml_cuda_try_fuse_gated_norm starting at node i (for graph_optimize):
+//   RMS_NORM -> MUL -> [views] -> MUL_MAT -> [views] -> UNARY(SILU)(view of the MUL_MAT) -> MUL(the MUL, the SILU)
+// Returns the index of the MUL_MAT (and in *igm that of the final MUL), or -1.
+static int ggml_cuda_gated_norm_z_gemm(const ggml_cgraph * cgraph, const int i, int * igm) {
+    const int n = cgraph->n_nodes;
+    if (i + 4 >= n) {
+        return -1;
+    }
+    const ggml_tensor * norm = cgraph->nodes[i];
+    const ggml_tensor * mul  = cgraph->nodes[i + 1];
+    if (norm->op != GGML_OP_RMS_NORM || mul->op != GGML_OP_MUL || (mul->src[0] != norm && mul->src[1] != norm)) {
+        return -1;
+    }
+    int j = i + 2;
+    while (j < n && ggml_cuda_is_view_or_noop(cgraph->nodes[j])) {
+        j++;
+    }
+    if (j >= n || cgraph->nodes[j]->op != GGML_OP_MUL_MAT) {
+        return -1;
+    }
+    const int imm = j++;
+    while (j < n && ggml_cuda_is_view_or_noop(cgraph->nodes[j])) {
+        j++;
+    }
+    if (j + 1 >= n) {
+        return -1;
+    }
+    const ggml_tensor * un = cgraph->nodes[j];
+    const ggml_tensor * gm = cgraph->nodes[j + 1];
+    if (un->op != GGML_OP_UNARY || ggml_get_unary_op(un) != GGML_UNARY_OP_SILU || gm->op != GGML_OP_MUL ||
+            !((gm->src[0] == mul && gm->src[1] == un) || (gm->src[0] == un && gm->src[1] == mul))) {
+        return -1;
+    }
+    const ggml_tensor * z = un->src[0];
+    while (z->view_src) {
+        z = z->view_src;
+    }
+    *igm = j + 1;
+    return z == cgraph->nodes[imm] ? imm : -1;
+}
+
+// Ops-only: the MUL_MAT that reads the gated norm output gm = nodes[igm] through a chain of views of it (the ssm_out
+// GEMM of ggml_cuda_try_fuse_gated_norm_f16), or nullptr.
+static const ggml_tensor * ggml_cuda_gated_norm_out_gemm(const ggml_cgraph * cgraph, const int igm) {
+    const ggml_tensor * gm   = cgraph->nodes[igm];
+    const ggml_tensor * last = gm;
+    int k = igm + 1;
+    for (; k < cgraph->n_nodes && ggml_cuda_is_view_or_noop(cgraph->nodes[k]); ++k) {
+        if (cgraph->nodes[k]->view_src != gm || cgraph->nodes[k]->src[0] != last) {
+            return nullptr;
+        }
+        last = cgraph->nodes[k];
+    }
+    if (k >= cgraph->n_nodes || cgraph->nodes[k]->op != GGML_OP_MUL_MAT || cgraph->nodes[k]->src[1] != last ||
+            cgraph->nodes[k]->src[0] == nullptr) {
+        return nullptr;
+    }
+    return cgraph->nodes[k];
+}
+
+// Large-batch form of the gated output norm below (prefill): the chain is followed by
+//   [views of gm] -> MUL_MAT(ssm_out, gm) [-> ADD(residual) folded into the GEMM, ggml_cuda_match_gemm_add]
+// and the ssm_out MUL_MAT is an f16 cuBLAS GEMM. Then the z GEMM runs first, one kernel writes the f16 GEMM input
+// silu(z) * (rms_norm(x) * w) straight into a pool buffer (bit-identical to the rms_norm * w, silu * mul and f32 -> f16
+// conversion kernels it replaces; the f32 nodes are never written), and the ssm_out GEMM reads it: 26 bytes moved per
+// element in three passes become 10 in one. graph_optimize keeps x alive until the z GEMM where this can fire (see
+// there), so the GEMM output does not overlap x (checked below as well). GGML_CUDA_GNORM_F16=0 disables it (and that
+// allocation dependency).
+// k0: index of the first node after gm. Returns the nodes to skip (counted from i), or 0 if not applicable.
+static int ggml_cuda_try_fuse_gated_norm_f16(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, const int i, const int k0,
+        ggml_tensor * mm, ggml_tensor * un, const ggml_tensor * x, const ggml_tensor * w, const ggml_tensor * z, ggml_tensor * gm) {
+    static const bool enabled = ggml_cuda_env_int("GGML_CUDA_GNORM_F16", 1) != 0;
+    const int n = cgraph->n_nodes;
+    // single-token graphs (decode) keep the q8_1 form below; graph_optimize adds no allocation dependency for them
+    if (!enabled || mm->ne[1] <= 1 || ggml_nrows(gm) < 2) {
+        return 0;
+    }
+    // gm -> [views of gm, one consumer each] -> MUL_MAT(W, view)
+    const ggml_tensor * last = gm;
+    int k = k0;
+    for (; k < n && ggml_cuda_is_view_or_noop(cgraph->nodes[k]); ++k) {
+        const ggml_tensor * v = cgraph->nodes[k];
+        if (v->view_src != gm || v->src[0] != last || (v->flags & GGML_TENSOR_FLAG_OUTPUT) || ggml_node_get_use_count(cgraph, k) != 1) {
+            return 0;
+        }
+        last = v;
+    }
+    if (k >= n) {
+        return 0;
+    }
+    ggml_tensor * mm2 = cgraph->nodes[k];
+    if (mm2->op != GGML_OP_MUL_MAT || mm2->src[1] != last || mm2->src[0] == nullptr || mm2->src[0] == last ||
+            !(mm2->flags & GGML_TENSOR_FLAG_COMPUTE) || (gm->flags & GGML_TENSOR_FLAG_OUTPUT) || !ggml_node_has_n_uses(cgraph, k0 - 1, 1) ||
+            !ggml_is_contiguous(last) || last->data != gm->data || ggml_nelements(last) != ggml_nelements(gm) ||
+            mm2->ne[2] != 1 || mm2->ne[3] != 1 || mm2->src[0]->ne[2] != 1 || mm2->src[0]->ne[3] != 1 || !ggml_is_contiguous(mm2) ||
+            ggml_cuda_mul_mat_cublas_gemm_type(*cuda_ctx, mm2) != GGML_TYPE_F16 ||
+            !ggml_cuda_rms_norm_gated_f16_supported(x, w, z, gm)) {
+        return 0;
+    }
+    // memory: the early z GEMM must not overwrite x (gm is never written, so it may alias anything)
+    const char * x0 = (const char *) x->data, * x1 = x0 + ggml_nbytes(x);
+    const char * m0 = (const char *) mm->data, * m1 = m0 + ggml_nbytes(mm);
+    if (x0 < m1 && m0 < x1) {
+        return 0;
+    }
+    const int jadd = ggml_cuda_match_gemm_add(cuda_ctx, cgraph, k);
+
+    // The z GEMM is a MUL_MAT run ahead of the nodes between i and it, which are never executed (they write nothing),
+    // so for the shared f16 copies it is like the first node of a group: drop the entries its output overlaps, then
+    // it may look its input up (the f16 copy of the norm written by the rms_norm that precedes the layer).
+    ggml_cuda_f16_share_state * st = ggml_cuda_f16_share_get(cuda_ctx);
+    if (st->n_valid != 0) {
+        ggml_cuda_f16_share_invalidate(st, mm, false);
+    }
+    {
+        ggml_cuda_f16_share_allow_lookup allow_lookup(cuda_ctx);
+        if (!ggml_cuda_compute_forward(*cuda_ctx, mm)) {
+            GGML_ABORT("%s: z GEMM %s failed", __func__, mm->name);
+        }
+    }
+    float eps;
+    memcpy(&eps, cgraph->nodes[i]->op_params, sizeof(float));
+    ggml_cuda_pool_alloc<half> gm_f16(cuda_ctx->pool(), ggml_nelements(gm));
+    ggml_cuda_rms_norm_gated_f16(*cuda_ctx, x, w, eps, z, gm, gm_f16.get());
+    st->n_gnorm_f16++;
+    static const bool verify = getenv("GGML_CUDA_GNORM_F16_VERIFY") != nullptr;
+    if (verify && !ggml_cuda_f16_share_capturing(cuda_ctx->stream())) {
+        // debug: the f16 values of the unfused chain (the rms_norm * w and silu * mul kernels on shadow nodes that
+        // write a scratch buffer), converted like the GEMM input, compared bitwise
+        const int64_t ne = ggml_nelements(gm);
+        ggml_cuda_pool_alloc<float> ref32(cuda_ctx->pool(), ne);
+        ggml_cuda_pool_alloc<half>  ref16(cuda_ctx->pool(), ne);
+        ggml_tensor * norm = cgraph->nodes[i];
+        ggml_tensor * mul  = cgraph->nodes[i + 1];
+        ggml_tensor n2 = *norm, m2 = *mul, u2 = *un, g2 = *gm;
+        m2.data = ref32.get();
+        g2.data = ref32.get();
+        for (int s = 0; s < GGML_MAX_SRC; ++s) {
+            m2.src[s] = m2.src[s] == norm ? &n2 : m2.src[s];
+            g2.src[s] = g2.src[s] == mul ? &m2 : g2.src[s] == un ? &u2 : g2.src[s];
+        }
+        ggml_cuda_op_rms_norm_fused(*cuda_ctx, &n2, &m2, false);
+        ggml_cuda_op_unary_mul(*cuda_ctx, &u2, &g2);
+        ggml_get_to_fp16_cuda(GGML_TYPE_F32)(ref32.get(), ref16.get(), ne, cuda_ctx->stream());
+        std::vector<uint16_t> a(ne), b(ne);
+        CUDA_CHECK(cudaStreamSynchronize(cuda_ctx->stream()));
+        CUDA_CHECK(cudaMemcpy(a.data(), ref16.get(), ne*sizeof(uint16_t), cudaMemcpyDeviceToHost));
+        CUDA_CHECK(cudaMemcpy(b.data(), gm_f16.get(), ne*sizeof(uint16_t), cudaMemcpyDeviceToHost));
+        int64_t ndiff = 0, first = -1;
+        for (int64_t e = 0; e < ne; ++e) {
+            if (a[e] != b[e]) {
+                first = first < 0 ? e : first;
+                ndiff++;
+            }
+        }
+        fprintf(stderr, "gnorm_f16 verify %s: %lld of %lld differ (first %lld)\n", gm->name, (long long) ndiff, (long long) ne, (long long) first);
+    }
+    if (jadd > 0) {
+        st->n_gemm_add++;
+        ggml_tensor acc = *mm2;
+        acc.data = cgraph->nodes[jadd]->data;
+        ggml_cuda_mul_mat_cublas(*cuda_ctx, mm2->src[0], last, &acc, gm_f16.get(), /*accumulate =*/ true);
+        return jadd - i;
+    }
+    ggml_cuda_mul_mat_cublas(*cuda_ctx, mm2->src[0], last, mm2, gm_f16.get());
+    return k - i;
+}
+
 // Linear-attention gated output norm:
 //   RMS_NORM(x) -> MUL(w) -> [views] -> MUL_MAT (z GEMV) -> [views] -> UNARY(SILU)(z) -> MUL(normed, silu(z))
 // The z GEMV does not depend on the norm, so it is computed first; then one kernel computes
@@ -5423,15 +5595,21 @@ static int ggml_cuda_try_fuse_gated_norm(ggml_backend_cuda_context * cuda_ctx, g
         return 0;
     }
     const ggml_tensor * x = norm->src[0];
-    if (!ggml_cuda_rms_norm_gated_q8_supported(x, w, z, gm)) {
-        return 0;
-    }
-    // memory: the early z GEMV must not overwrite x; dst may alias x / z only exactly (elementwise in place)
     auto overlap = [](const ggml_tensor * a, const ggml_tensor * b) {
         const char * a0 = (const char *) a->data, * a1 = a0 + ggml_nbytes(a);
         const char * b0 = (const char *) b->data, * b1 = b0 + ggml_nbytes(b);
         return a0 < b1 && b0 < a1;
     };
+    {
+        const int nodes_to_skip = ggml_cuda_try_fuse_gated_norm_f16(cuda_ctx, cgraph, i, j + 2, mm, un, x, w, z, gm);
+        if (nodes_to_skip > 0) {
+            return nodes_to_skip;
+        }
+    }
+    if (!ggml_cuda_rms_norm_gated_q8_supported(x, w, z, gm)) {
+        return 0;
+    }
+    // memory: the early z GEMV must not overwrite x; dst may alias x / z only exactly (elementwise in place)
     if (overlap(mm, x) || (overlap(gm, x) && gm->data != x->data) || (overlap(gm, z) && gm->data != z->data)) {
         return 0;
     }
@@ -7292,6 +7470,27 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
                 break;
             }
         }
+#if defined(GGML_USE_HIP)
+        // The gated output norm (ggml_cuda_try_fuse_gated_norm) runs the z GEMM ahead of the rms_norm that reads x;
+        // keep x alive until that GEMM so that the allocator cannot place the GEMM output on it. Only where the f16
+        // form can fire (several tokens and an ssm_out MUL_MAT that runs as an f16 cuBLAS GEMM): decode and small
+        // batches (MTP verify) keep their allocation, and the fusion checks the overlap at run time anyway.
+        if (ggml_cuda_env_int("GGML_CUDA_GNORM_F16", 1) != 0) {
+            for (int i = 0; i + 1 < cgraph->n_nodes; ++i) {
+                int igm = -1;
+                const int imm = ggml_cuda_gated_norm_z_gemm(cgraph, i, &igm);
+                if (imm <= 0 || cgraph->nodes[imm]->ne[1] <= 1) {
+                    continue;
+                }
+                const ggml_tensor * mm2 = ggml_cuda_gated_norm_out_gemm(cgraph, igm);
+                // (the route looks at the weight's buffer; activations are not allocated yet)
+                if (mm2 != nullptr && mm2->src[0]->buffer != nullptr &&
+                        ggml_cuda_mul_mat_cublas_gemm_type(*cuda_ctx, mm2) == GGML_TYPE_F16) {
+                    params->add_alloc_dep(params->user_data, cgraph->nodes[i]->src[0], cgraph->nodes[imm]);
+                }
+            }
+        }
+#endif // defined(GGML_USE_HIP)
         for (int i = 0; i < cgraph->n_nodes; ++i) {
             // Keep the inputs of the fused gate/up/GLU MMQ kernel alive until the GLU so that they cannot alias its output (under op offload the weights are buffer copies).
             if (i + 2 < cgraph->n_nodes && cgraph->nodes[i + 2]->op == GGML_OP_GLU) {

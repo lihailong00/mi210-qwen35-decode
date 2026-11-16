@@ -34,6 +34,12 @@ bool ggml_cuda_cont_unary_mul_q8(ggml_backend_cuda_context & ctx, const ggml_ten
 bool ggml_cuda_rms_norm_gated_q8_supported(const ggml_tensor * x, const ggml_tensor * w, const ggml_tensor * z, const ggml_tensor * dst);
 void ggml_cuda_rms_norm_gated_q8(ggml_backend_cuda_context & ctx, const ggml_tensor * x, const ggml_tensor * w, float eps,
         const ggml_tensor * z, ggml_tensor * dst);
+// Large-batch variant of the same op for an f16 GEMM consumer (HIP wave64 only): writes only the f16 values of dst
+// (bit-identical to rms_norm_f32<32, 1, true, true> + UNARY(SILU)+MUL + the f32 -> f16 conversion) into dst16;
+// dst->data is neither read nor written.
+bool ggml_cuda_rms_norm_gated_f16_supported(const ggml_tensor * x, const ggml_tensor * w, const ggml_tensor * z, const ggml_tensor * dst);
+void ggml_cuda_rms_norm_gated_f16(ggml_backend_cuda_context & ctx, const ggml_tensor * x, const ggml_tensor * w, float eps,
+        const ggml_tensor * z, const ggml_tensor * dst, half * dst16);
 
 // Single-token BF16 thin GEMV with an elementwise epilogue (fused graph chains, see ggml-cuda.cu):
 //   epi 0: dst = dot (+ bias)

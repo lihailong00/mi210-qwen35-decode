@@ -34,3 +34,4 @@ struct ggml_cuda_gdn_mma_args {
 
 bool ggml_cuda_gdn_mma_launch(int device, const ggml_cuda_gdn_mma_args & args, cudaStream_t stream);
 bool ggml_cuda_gdn_mfma_launch(int device, const ggml_cuda_gdn_mma_args & args, cudaStream_t stream);
+bool ggml_cuda_gdn_wy_launch(ggml_backend_cuda_context & ctx, const ggml_cuda_gdn_mma_args & args, cudaStream_t stream);
