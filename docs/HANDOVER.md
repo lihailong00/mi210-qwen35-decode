@@ -15,7 +15,7 @@
 | decode tg128，上下文 0 | 45.63 token/s | 80.33 token/s | +76.0% |
 | decode tg128，上下文 8192 | 44.23 token/s | 74.57 token/s | +68.6% |
 | decode tg128，上下文 32768 | 40.65 token/s | 64.43 token/s | +58.5% |
-| prefill pp8192 | 1220 token/s | 2000 token/s | +64%（第十三节的各项 prefill 修正；只做 decode 优化时为 1245） |
+| prefill pp8192 | 1220 token/s | 2075 token/s | +70%（第十三节的各项 prefill 修正；只做 decode 优化时为 1245） |
 | llama-server 单请求（-np 1） | 45.6 token/s | 79.1 token/s | +73% |
 | 每 token kernel 启动数 | 1933 | 601 | −69% |
 | 显存峰值（llama-bench） | 24.1 GB | 28.1–31.9 GB | +4–8 GB |
@@ -489,7 +489,7 @@ docker exec mi210-opt bash -lc "PAR=12 /lab/build-wt.sh /lab/wt-mybranch /lab/wt
 | 物理上限：50.5 GFLOP 以 171 TFLOPS 计算（零数据峰值；真实数据受功耗上限限制，见第 6 小节） | 约 3390 |
 | 物理上限（真实数据，约 150 TFLOPS） | 约 2980 |
 | GEMM 全部用最优库 kernel（hipBLASLt 平均约 150 TFLOPS），其余开销为零 | 约 3000 |
-| 当前版本（pp8192） | 2000 |
+| 当前版本（pp8192） | 2075 |
 
 修正前，rocprofv3 测得每 token 0.804 ms：GEMM 0.577 ms（权重先反量化为 f16，再走 rocBLAS，平均只有 84 TFLOPS），非 GEMM 0.227 ms（逐 token 递推的 DeltaNet kernel 0.065，flash attention 0.047、只有 34 TFLOPS，反量化 0.031，其余小算子约 0.08）。
 
@@ -643,9 +643,41 @@ flash attention 之后，pp8192 每 token 562 µs 里 GEMM 和注意力以外的
   - 逐形状的 GEMM 选核对 5120×6144 这个形状不稳定，约 40% 的进程会选到稳态慢 11% 的 kernel（突发计时里两者相同），pp8192 因此呈双峰，相差约 0.8%。
   - 2D 权重 × 3D（广播）src1 的批量 cuBLAS 路径在同一进程先跑过其它图之后会出现 GPU 访存错误，与本改动无关，未修。
 
-### 11. 剩余 prefill 方向
+### 11. DeltaNet 第二轮（两段式 WY 递推 + 波分工的串行 kernel，以及相邻小算子）
 
-- 非 GEMM 部分：DeltaNet kernel 第二轮（约 +2%）；还剩 6144 宽的单消费者 f32→f16 转换（约 1.8 µs/token）和约 0.9 TB/s 的流式 kernel 离带宽上限的差距。反量化离带宽下限（约 45 ms/批次）还差约 20 ms，主要影响短 prompt。
+第三轮的分块 kernel（`gdn_mfma_kernel`）每次调用 2.4 ms（pp8192 每 token 28 µs）。四个方向并行做原型、各由两个独立 agent 复核，其中三个有效，合并后又整体复核两轮。
+
+- **两段式（WY）递推**，新文件 `gated-delta-net-wy.cu`。
+  - `gdn_wy_prep_kernel` 完全并行（每个序列 × key head × 16 token 分块一个 wave）：算出块内的 T = (I + A)^-1（fp64 前代）、P 和各个门控向量。
+  - `gdn_wy_kernel` 是串行部分，每个分块只剩和状态相关的 delta、输出和状态更新三组 MFMA。
+  - 一次调用从 2406 µs 降到 175 + 720 µs。
+- **串行 kernel 按波分工。** 8 个 wave：4 个只做 MFMA（每个 SIMD 一个，各持 128×16 的状态切片），4 个负责把下一分块的 K、Q、K^T 和 prep 的结果搬进双缓冲的 LDS。gfx90a 上实测：同一个 wave 在相关的 MFMA 之间插入普通指令不会被隐藏（MFMA 一步从 32.8 周期涨到 8 条普通指令时的 48.8），而同一 SIMD 上另一个只做普通指令的 wave 可以完全重叠。这一项比 4 波版本快约 25%（876 → 660 µs，独立测试）。
+- **门控的数值。** 块内的衰减指数 s_tj 按“恰好覆盖的那些 gate 的和”来算（对第 j 列从 u = j+1 累加到 t，加到块尾就是 G_C/G_j），不用两个大前缀相减；低于 -1e30 的 gate（包括 -inf）按 -1e30 处理，相当于精确的重置。指数本身不截断，所以正的 gate 和 NaN 与其它 kernel 行为一致。对 fp64 参考（77 种形状和门控模式、最长 64K token、模型实际数据）：输出 / 末状态 NMSE 约 5e-14 / 1e-14（原分块 kernel 8e-14 / 4e-14），模型数据 5e-13（原 6.6e-13）；1/16 的 gate 为 -30 到 -inf 时仍然有限且精度不变（原分块 kernel 最差 0.26，-inf 时 NaN）；只有“几乎平行的 key、beta = 1、无衰减”这种病态情形是原分块 kernel 误差的 1.2 倍。
+- **相邻小算子。**
+  - 输出的 gated RMS norm（rms_norm·w → silu(z)·normed → 转 f16）合成一个 `rms_norm_gated_f16_kernel`，直接写 ssm_out GEMM 的 f16 输入；为此 graph_optimize 在多 token 且融合能触发时让 x 存活到 z 的 GEMM 之后。
+  - q/k 的 L2 norm 改成每 256 线程 block 处理 8 行（`rms_norm_f32_rows32`，≥ 8192 行才用，按位相同）。
+  - 这两项与原路径按位相同。
+- **试过不划算的方向**：更细的 value 切分和按序列分段的并行扫描（一个 CU 同时跑两个 block 只有 1.33 倍吞吐，多出来的工作抵不过）；完整的 FLA 三段式（每个分块的状态要写出读回，流量比整个 kernel 还大）。
+- **开关**（设 0 关闭）：`GGML_CUDA_GDN_WY`（回到原分块 kernel）、`GGML_CUDA_GNORM_F16`、`GGML_CUDA_RMS_NORM_ROWS`；`GGML_CUDA_GDN_MFMA=0` 仍然关掉所有分块路径。新 kernel 用到的编译器内建函数和 `-mllvm -amdgpu-mfma-vgpr-form` 选项都先检测，旧编译器上自动退回原 kernel。
+
+结果（同一构建交替运行 4 轮，ub 4096；“之前”为上一版主线构建）：
+
+| 测试 | 之前（token/s） | 之后（token/s） | 变化 |
+|---|---|---|---|
+| pp512 | 1220 | 1255 | +2.9% |
+| pp2048 | 1951 | 2024 | +3.7% |
+| pp8192 | 1988 | 2075 | +4.4% |
+| pp8192（`GGML_CUDA_GEMM_TUNE=0`） | 1938 | 2015 | +4.0% |
+| decode（深度 0） | 80.0 | 80.2 | 不变（噪声内） |
+
+- 每 token 的 GPU 时间：DeltaNet 递推 28.3 → 10.4 µs，相邻小算子约 -5 µs；归因（固定选核）为递推 +2.7%、gated norm +1.0%、L2 norm +0.1%。
+- 正确性：关掉新路径时与上一版按位相同（md5，固定选核）；打开时对参考的 KLD 0.000001、top-1 100%，c=8192 perplexity 3.5637 不变；decode 以及 2–4 token 批次的 kernel 名称和调用次数与上一版相同。
+- 测试：`test-backend-ops` 新增 GATED_DELTA_NET 用例（分块边界、多序列、rq3 > 1、置换布局）和 20 个 GATED_DELTA_NET_ADV 对抗门控用例，以及 rows32 和 gated norm 的用例；另有 126 个 fp64 对照的对抗性场景（包括正 gate、NaN、±inf、跨块的大 gate）全部通过。
+- 原分块 kernel（关掉 `GGML_CUDA_GDN_WY` 时使用）对极大的负 gate 仍然会失真或出 NaN，这里没有改它。
+
+### 12. 剩余 prefill 方向
+
+- 非 GEMM 部分：DeltaNet 串行 kernel 离 MFMA 下限还有约 1.3 倍、prep kernel 受 LDS 限制只有每 SIMD 2 个 wave（合计约 +0.5%）；还剩 6144 宽的单消费者 f32→f16 转换（约 1.8 µs/token）和约 0.9 TB/s 的流式 kernel 离带宽上限的差距。反量化离带宽下限（约 45 ms/批次）还差约 20 ms，主要影响短 prompt。
 - GEMM 部分已接近库 kernel 在功耗上限下的水平，剩下的是自写 GEMM 和修掉 5120×6144 形状的选核不稳定（约 +0.3% 的期望值，并消除双峰）。
 
 微基准源码在 `mi210-tools/peak-bench/`：`peak_bench.hip`（带宽、MFMA、方阵 GEMM）、`bound_bench.hip`（逐张量读取 graph、实际形状 GEMM 全候选扫描）、`gemm_sweep.hip`（不同 token 数下的选核对比）、`mfma_rand.hip`（零数据与随机数据下的 MFMA 峰值，显示功耗上限的影响）。编译：`hipcc -O3 --offload-arch=gfx90a -std=c++17 <file> -lrocblas`。
@@ -680,6 +712,8 @@ flash attention 之后，pp8192 每 token 562 µs 里 GEMM 和注意力以外的
 | `GGML_CUDA_CONV_FUSE` / `GGML_CUDA_SWIGLU_F16` / `GGML_CUDA_GEMM_ADD_FUSION` | 开 | prefill 小算子融合：卷积输入 / SwiGLU 直接写 f16 / 残差加法并入 GEMM |
 | `GGML_CUDA_F16_SHARE` / `GGML_CUDA_RMS_NORM_F16` | 开 | GEMM 输入的 f16 副本共享 / rms\_norm 顺带写出 f16 副本 |
 | `GGML_CUDA_FUSION_STATS`、`GGML_CUDA_F16_SHARE_VERIFY`、`GGML_CUDA_CONV_FUSE_CHUNK` | 关 | 融合计数 / 复用时按位复核 / 覆盖卷积分块长度 |
+| `GGML_CUDA_GDN_MFMA` / `GGML_CUDA_GDN_WY` | 开 | prefill DeltaNet 分块路径（0 回到逐 token kernel）/ 两段式 WY 递推（0 回到单 kernel 分块版） |
+| `GGML_CUDA_GNORM_F16` / `GGML_CUDA_RMS_NORM_ROWS` | 开 | DeltaNet 输出 gated norm 直接写 f16 / q·k L2 norm 的多行 kernel |
 | `GGML_SCHED_SYNC_UPLOADS` / `GGML_CUDA_NO_UPLOAD_BATCH` | 关 | 设 1 回到同步上传 / 不合并小上传 |
 | `GGML_CUDA_ATTN_PREP_VERIFY`、`GGML_GDN_DECODE_Q8_SELFTEST`、`GGML_MMVQ_MIX_EMPTY*` 等 | 关 | 调试与标定用 |
 | `CODEX_IQ3_PREPACK` / `CODEX_IQ3_XXS_PREPACK` | 需设 1 | 保留版补丁的开关；所有测量都在 =1 下进行 |
