@@ -15,7 +15,7 @@
 | decode tg128，上下文 0 | 45.63 token/s | 80.33 token/s | +76.0% |
 | decode tg128，上下文 8192 | 44.23 token/s | 74.57 token/s | +68.6% |
 | decode tg128，上下文 32768 | 40.65 token/s | 64.43 token/s | +58.5% |
-| prefill pp8192 | 1220 token/s | 2075 token/s | +70%（第十三节的各项 prefill 修正；只做 decode 优化时为 1245） |
+| prefill pp8192 | 1220 token/s | 2125 token/s | +74%（第十三节的各项 prefill 修正；只做 decode 优化时为 1245） |
 | llama-server 单请求（-np 1） | 45.6 token/s | 79.1 token/s | +73% |
 | 每 token kernel 启动数 | 1933 | 601 | −69% |
 | 显存峰值（llama-bench） | 24.1 GB | 28.1–31.9 GB | +4–8 GB |
@@ -489,7 +489,7 @@ docker exec mi210-opt bash -lc "PAR=12 /lab/build-wt.sh /lab/wt-mybranch /lab/wt
 | 物理上限：50.5 GFLOP 以 171 TFLOPS 计算（零数据峰值；真实数据受功耗上限限制，见第 6 小节） | 约 3390 |
 | 物理上限（真实数据，约 150 TFLOPS） | 约 2980 |
 | GEMM 全部用最优库 kernel（hipBLASLt 平均约 150 TFLOPS），其余开销为零 | 约 3000 |
-| 当前版本（pp8192） | 2075 |
+| 当前版本（pp8192） | 2125 |
 
 修正前，rocprofv3 测得每 token 0.804 ms：GEMM 0.577 ms（权重先反量化为 f16，再走 rocBLAS，平均只有 84 TFLOPS），非 GEMM 0.227 ms（逐 token 递推的 DeltaNet kernel 0.065，flash attention 0.047、只有 34 TFLOPS，反量化 0.031，其余小算子约 0.08）。
 
@@ -675,10 +675,49 @@ flash attention 之后，pp8192 每 token 562 µs 里 GEMM 和注意力以外的
 - 测试：`test-backend-ops` 新增 GATED_DELTA_NET 用例（分块边界、多序列、rq3 > 1、置换布局）和 20 个 GATED_DELTA_NET_ADV 对抗门控用例，以及 rows32 和 gated norm 的用例；另有 126 个 fp64 对照的对抗性场景（包括正 gate、NaN、±inf、跨块的大 gate）全部通过。
 - 原分块 kernel（关掉 `GGML_CUDA_GDN_WY` 时使用）对极大的负 gate 仍然会失真或出 NaN，这里没有改它。
 
-### 12. 剩余 prefill 方向
+### 12. GEMM 选核第二轮（固定 kernel 表 + FFN gate/up 合并）
+
+GEMM 占 pp8192 每 token 约 410 µs（共 519 µs）。四个方向并行做原型、各由两个独立 agent 复核；有效的两项合并后又经过两轮整体复核（三个和两个独立 agent），第一轮发现的问题全部修掉后才合入。
+
+- **自写 GEMM 不划算。** hipBLASLt 的 kernel 每个时钟已达到纯 MFMA 速率的 92–95%；在 300 W 功耗上限下，最好的主循环约 128 TFLOPS，库在模型的实际形状上已经是 125–131 TFLOPS。原型自写 kernel 慢 29–61%。hipBLASLt 自己的 API 也没有比 rocBLAS solution index 更快的 kernel（LT 的 index = rocBLAS index − 1）。
+- **空间在选核。** 库的默认选择比最好的有效 solution 慢 3–41%，n = 512 的 K 很大、beta = 1 的形状最差；旧的逐形状选核只在 n ≥ 2048 时运行，而且 5120×6144 beta=1 在约 40% 的进程里选到稳态慢 11% 的 kernel（突发计时里两者相同）。
+- **固定 kernel 表（`ggml-cuda.cu` 的 `ggml_cuda_hip_gemm_pins`）。** 对模型的 8 个 f16 GEMM 形状，在 n = 512/724/1024/1448/2048/3000/4096 上做了全候选的稳态扫描（随机数据、背靠背重复），按精确的（m、k、n、beta）记下赢家，共 56 项，另加 6 项合并 gate/up 的形状。
+  - 表项直接使用，不调用 `rocblas_gemm_ex_get_solutions`：这个查询每个形状约 73 ms，进程里第一次约 590 ms，原型的冷启动变慢（512 token 的首个请求慢 0.8 s）全部来自它。库不接受的 index 在 rocBLAS 里约 6 µs 就返回失败、不写 C（40 个 index × 3 个形状实测），这时该形状退回库默认并缓存。
+  - 只在这台机器的组合上使用：rocBLAS 版本串完全等于 `5.2.0.dabb6df2b9`、加载的 hipBLASLt 为 `libhipblaslt.so.1.2.70201`、设备名为 “AMD Instinct MI210” 且 104 个 CU。其它情况完全走旧的选核（包括它的有效性查询），也不合并。
+  - 表外的 n ≥ 2048 仍按旧的 n 档位做稳态计时，但不调用有效性查询，候选为旧的 10 个加上同形状在相邻表 n 上的表项（每个形状约 60 次调用）；n > 4096 用轻量计时（约 31 次调用）。表外的 n < 2048 用库默认，与之前相同。缓存的键包含设备号。
+- **FFN gate/up 合并（`ggml_cuda_try_fuse_gate_up`）。** 两份权重反量化到同一块 f16 缓冲，一个 m = 2×17408 的 GEMM 同时算出 gate 和 up，带步长的 SwiGLU kernel（`swiglu_f32_f16_strided`）直接写 ffn_down 的 f16 输入，ffn_down 保留残差加法的 beta = 1 融合。
+  - 只在表里有合并形状的 n 上合并。是否合并按模型内实测决定（同一构建、单一 n 的进程、轮流运行，每组 8–20 个进程，合并组的每个进程都要快于不合并组的每个进程）：512 +0.55%、724 +1.0%、1024 +0.2%、2048 +0.76%、3000 +0.27%、4096 +0.32% 合并；1448 慢 0.5%，不合并。只测 GEMM 本身的成对计时在 1448 上给出了相反的结论（功耗上限下的频率行为），所以不用它做决定。
+  - 如果库在运行时拒绝了合并形状的 index，该 n 不再合并（只有固定 kernel 时合并才划算）。
+  - 代价：内存池多保留约 0.7 GB 显存（ub 4096 实测 +714 MiB）。
+- **试过不划算的方向**：在第二个 stream 上提前反量化下一个权重。原型只在 512–2048 token 上有 +2.5%，而且会提前转换图里稍后才写入的张量（本模型不会触发，但有复现用例）；修好之后叠加在前两项上，pp512 反而慢 4.9%（功耗上限：GEMM 被反量化挤占的时间等于它隐藏的时间），所以没有合入。
+- **开关**：`GGML_CUDA_GEMM_TABLE=0` 精确回到旧的选核；`GGML_CUDA_GATE_UP_MERGE=0` 关闭合并（=2 在所有尺寸上强制合并，测试用）；`GGML_CUDA_GEMM_TUNE=0` 关闭所有选核（包括合并）。
+
+结果（单一尺寸的进程，与上一版主线构建交替运行，每组 6–14 个进程，ub 4096）：
+
+| 测试 | 之前（token/s） | 之后（token/s） | 变化 |
+|---|---|---|---|
+| pp512 | 1262 | 1612 | +27.8% |
+| pp1024 | 1712 | 1883 | +10.0% |
+| pp1448 | 1701 | 1932 | +13.5% |
+| pp2048 | 2023 | 2074 | +2.5% |
+| pp2500 | 2024 | 2071 | +2.3% |
+| pp4096 | 2083 | 2136 | +2.5% |
+| pp8192 | 2074 | 2125 | +2.5% |
+| pp16384 | 2008 | 2058 | +2.5% |
+| pp8192（ub 512） | 1238 | 1583 | +27.9% |
+| pp8192（ub 8192） | 2069 | 2084 | +0.7% |
+| decode tg128 | 79.9 | 79.8 | 不变（噪声内） |
+
+- pp8192 不再呈双峰（8 个进程相差 0.4%）；上一版的 pp2500、pp3000 也是双峰，表里的“之前”是平均值。
+- 新进程的首个请求在所有测过的尺寸上都比上一版快：pp512 734 vs 823 ms，pp1448 1193 vs 1264 ms，pp2500 2627 vs 3039 ms，pp4096 2322 vs 4031 ms，ub 8192 的 pp6000 4384 vs 5310 ms。
+- 正确性：所有表项和合并形状对 fp32 参考逐一检查（紧凑和带填充的布局、beta 0/1），结果确定、不碰填充区；故障注入（错误的 rocBLAS/hipBLASLt 版本、其它设备名或 CU 数、拒绝 index、调用失败）下结果都正确，守卫不通过时行为与上一版相同。固定选核（`GGML_CUDA_GEMM_TUNE=0`）时，新开关全关以及默认设置的 logits 与上一版 md5 相同；默认设置对参考的 KLD 0.000001。
+- 测试：`test-backend-ops` 新增真实 FFN 形状的合并用例、强制合并用例，以及一个真正走到 beta = 1 GEMM 的残差加法用例。
+- 遗留：约 1/94 个默认设置的进程在 pp2048 上慢 0.3%（仍快于不合并和上一版的所有进程），在 profiler 下没有复现，原因未知。表项的 index 在运行时失败一次，该形状在本进程里就固定用库默认，不再重新计时（与旧选核相同）；故障注入下每隔一次调用失败时 pp2048 比上一版慢 5%，实际安装因为版本守卫不会遇到。表和合并决定只适用于这张卡、300 W 上限和这个模型的形状。
+
+### 13. 剩余 prefill 方向
 
 - 非 GEMM 部分：DeltaNet 串行 kernel 离 MFMA 下限还有约 1.3 倍、prep kernel 受 LDS 限制只有每 SIMD 2 个 wave（合计约 +0.5%）；还剩 6144 宽的单消费者 f32→f16 转换（约 1.8 µs/token）和约 0.9 TB/s 的流式 kernel 离带宽上限的差距。反量化离带宽下限（约 45 ms/批次）还差约 20 ms，主要影响短 prompt。
-- GEMM 部分已接近库 kernel 在功耗上限下的水平，剩下的是自写 GEMM 和修掉 5120×6144 形状的选核不稳定（约 +0.3% 的期望值，并消除双峰）。
+- GEMM 部分已接近库 kernel 在功耗上限下的水平（第 12 小节），选核也已固定；剩下的是反量化（约 16 µs/token）和 GEMM 之间的重叠，在功耗上限下基本不划算。
 
 微基准源码在 `mi210-tools/peak-bench/`：`peak_bench.hip`（带宽、MFMA、方阵 GEMM）、`bound_bench.hip`（逐张量读取 graph、实际形状 GEMM 全候选扫描）、`gemm_sweep.hip`（不同 token 数下的选核对比）、`mfma_rand.hip`（零数据与随机数据下的 MFMA 峰值，显示功耗上限的影响）。编译：`hipcc -O3 --offload-arch=gfx90a -std=c++17 <file> -lrocblas`。
 
@@ -714,6 +753,8 @@ flash attention 之后，pp8192 每 token 562 µs 里 GEMM 和注意力以外的
 | `GGML_CUDA_FUSION_STATS`、`GGML_CUDA_F16_SHARE_VERIFY`、`GGML_CUDA_CONV_FUSE_CHUNK` | 关 | 融合计数 / 复用时按位复核 / 覆盖卷积分块长度 |
 | `GGML_CUDA_GDN_MFMA` / `GGML_CUDA_GDN_WY` | 开 | prefill DeltaNet 分块路径（0 回到逐 token kernel）/ 两段式 WY 递推（0 回到单 kernel 分块版） |
 | `GGML_CUDA_GNORM_F16` / `GGML_CUDA_RMS_NORM_ROWS` | 开 | DeltaNet 输出 gated norm 直接写 f16 / q·k L2 norm 的多行 kernel |
+| `GGML_CUDA_GEMM_TUNE` / `GGML_CUDA_GEMM_TABLE` | 开 | prefill GEMM 选核（0 用库默认，logits 确定）/ 固定 kernel 表（0 回到逐形状计时） |
+| `GGML_CUDA_GATE_UP_MERGE` | 开 | FFN gate/up 合成一个 GEMM（只在表里有的 n 上；2 为测试用的强制合并） |
 | `GGML_SCHED_SYNC_UPLOADS` / `GGML_CUDA_NO_UPLOAD_BATCH` | 关 | 设 1 回到同步上传 / 不合并小上传 |
 | `GGML_CUDA_ATTN_PREP_VERIFY`、`GGML_GDN_DECODE_Q8_SELFTEST`、`GGML_MMVQ_MIX_EMPTY*` 等 | 关 | 调试与标定用 |
 | `CODEX_IQ3_PREPACK` / `CODEX_IQ3_XXS_PREPACK` | 需设 1 | 保留版补丁的开关；所有测量都在 =1 下进行 |
