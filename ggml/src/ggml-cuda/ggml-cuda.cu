@@ -11,7 +11,13 @@
 #include <rocblas/rocblas.h>
 #include <chrono>
 #include <map>
+#include <set>
 #include <tuple>
+#include <climits>
+#include <cstring>
+#if defined(__linux__)
+#include <link.h>
+#endif // defined(__linux__)
 #endif // defined(GGML_USE_HIP)
 #include "ggml-cuda/acc.cuh"
 #include "ggml-cuda/add-id.cuh"
@@ -833,6 +839,8 @@ struct ggml_cuda_f16_share_state {
     uint64_t            n_swiglu_f16_add = 0;
     uint64_t            n_conv_fuse      = 0;
     uint64_t            n_gnorm_f16      = 0;
+    uint64_t            n_gate_up        = 0;
+    uint64_t            n_gate_up_add    = 0;
     std::unordered_map<const ggml_tensor *, std::pair<int, int>> uses; // MUL_MAT consumers: f16, bf16
     ggml_cuda_f16_share_entry entries[GGML_CUDA_F16_SHARE_ENTRIES];
     std::vector<void *> retired; // outgrown buffers that captured graphs may still reference
@@ -896,11 +904,12 @@ static void ggml_cuda_f16_share_release(ggml_backend_cuda_context * ctx) {
         // not through GGML_LOG_*: it was asked for explicitly, and tools that install a null log callback
         // (llama-bench without -v) would drop it.
         fprintf(stderr, "fusion stats: f16_share %llu reused, %llu converted, %llu produced; gemm_add %llu; swiglu_f16 %llu; "
-                "swiglu_f16_add %llu; conv_fuse %llu; gnorm_f16 %llu\n",
+                "swiglu_f16_add %llu; conv_fuse %llu; gnorm_f16 %llu; gate_up %llu; gate_up_add %llu\n",
                 (unsigned long long) st->n_reused, (unsigned long long) st->n_converted, (unsigned long long) st->n_produced,
                 (unsigned long long) st->n_gemm_add, (unsigned long long) st->n_swiglu_f16,
                 (unsigned long long) st->n_swiglu_f16_add, (unsigned long long) st->n_conv_fuse,
-                (unsigned long long) st->n_gnorm_f16);
+                (unsigned long long) st->n_gnorm_f16, (unsigned long long) st->n_gate_up,
+                (unsigned long long) st->n_gate_up_add);
     }
     for (auto & e : st->entries) {
         if (e.buf != nullptr) {
@@ -2231,16 +2240,203 @@ struct batched_mul_mat_traits<GGML_TYPE_F16> {
 // Different kernels differ in fp32 summation order only.
 // With beta != 0 (GEMM accumulating onto C, see ggml_cuda_try_fuse_gemm_add) the shape is tuned separately and the
 // timing runs write to a scratch C, so the caller's C is accumulated onto exactly once.
-static bool ggml_cuda_hip_gemm_tuned(cublasHandle_t handle, cudaStream_t stream, int cc,
-        const int m, const int n, const int k,
-        const void * alpha, const void * a, const int lda, const void * b, const int ldb,
-        const void * beta, void * c, const int ldc) {
+//
+// Pinned table (default; GGML_CUDA_GEMM_TABLE=0 restores the timing-only selection above): short 2-call timing bursts
+// do not rank the kernels by their steady-state speed (one 5120x6144 shape picked a kernel that is 11% slower in
+// steady state in ~40% of processes, making prefill speed bimodal), and the tuner did not run below n = 2048, where the
+// library default is up to 45% slower than the best kernel. The table holds the best solution, measured in steady
+// state (random data, 20 back-to-back calls x 3 alternating rounds, all valid solutions) on MI210 with
+// ROCm 7.2.1 / rocBLAS 5.2.0, for the dense prefill shapes of a 5120-wide hybrid model (llama.cpp arch qwen35, 27B), at
+// n = 512, 724, 1024, 1448, 2048, 3000 and 4096, with beta 0 and 1. An entry is used only for exactly that n (the
+// kernel ranking changes with n: a kernel that is best at n = 724 can be 50-60% slower than the default at n = 850),
+// and only if the library accepts the index for the problem.
+// The table (and the FFN gate/up merge, which it controls) is used only on an MI210 with exactly the rocBLAS and
+// hipBLASLt builds it was measured with (ggml_cuda_hip_gemm_table_ok); anywhere else the selection is exactly the
+// legacy tuner above, as with GGML_CUDA_GEMM_TABLE=0.
+// A table entry is used without asking the library for its valid solutions (that query costs ~73 ms per shape, see
+// below); an index the library rejects falls back to the default. For any other GEMM, n < 2048 keeps the library
+// default (as without the table) and n >= 2048 keeps the n bucket of the legacy tuner, but is timed in steady state
+// with a small candidate set (the legacy list and the table solutions of the same shape at the neighbouring table n),
+// see below.
+struct ggml_cuda_hip_gemm_pin {
+    int     m, k, beta, n;
+    int32_t sol; // 0: the library default is the fastest
+};
+
+static const ggml_cuda_hip_gemm_pin ggml_cuda_hip_gemm_pins[] = {
+    // m      k      beta n         solution
+    { 17408,  5120, 0,  512, 107923 }, {  5120, 17408, 1,  512, 107769 }, { 10240,  5120, 0,  512, 108290 },
+    {  5120,  6144, 1,  512, 108339 }, {  6144,  5120, 0,  512, 107777 }, {  1024,  5120, 0,  512, 107747 },
+    { 12288,  5120, 0,  512, 107529 }, {  5120,  6144, 0,  512, 107769 },
+    { 17408,  5120, 0,  724, 107689 }, {  5120, 17408, 1,  724, 108147 }, { 10240,  5120, 0,  724, 107959 },
+    {  5120,  6144, 1,  724, 107880 }, {  6144,  5120, 0,  724, 107959 }, {  1024,  5120, 0,  724, 107746 },
+    { 12288,  5120, 0,  724, 108045 }, {  5120,  6144, 0,  724, 107880 },
+    { 17408,  5120, 0, 1024, 107923 }, {  5120, 17408, 1, 1024, 107526 }, { 10240,  5120, 0, 1024, 108290 },
+    {  5120,  6144, 1, 1024, 107886 }, {  6144,  5120, 0, 1024, 107529 }, {  1024,  5120, 0, 1024,      0 },
+    { 12288,  5120, 0, 1024, 108109 }, {  5120,  6144, 0, 1024, 108344 },
+    { 17408,  5120, 0, 1448, 107926 }, {  5120, 17408, 1, 1448, 107889 }, { 10240,  5120, 0, 1448, 108247 },
+    {  5120,  6144, 1, 1448, 107959 }, {  6144,  5120, 0, 1448, 108247 }, {  1024,  5120, 0, 1448,      0 },
+    { 12288,  5120, 0, 1448, 108247 }, {  5120,  6144, 0, 1448, 107889 },
+    { 17408,  5120, 0, 2048, 107821 }, {  5120, 17408, 1, 2048, 107812 }, { 10240,  5120, 0, 2048, 108043 },
+    {  5120,  6144, 1, 2048, 107812 }, {  6144,  5120, 0, 2048, 107817 }, {  1024,  5120, 0, 2048, 107940 },
+    { 12288,  5120, 0, 2048, 108210 }, {  5120,  6144, 0, 2048, 107812 },
+    { 17408,  5120, 0, 3000, 108210 }, {  5120, 17408, 1, 3000, 107870 }, { 10240,  5120, 0, 3000, 108045 },
+    {  5120,  6144, 1, 3000, 108210 }, {  6144,  5120, 0, 3000, 108210 }, {  1024,  5120, 0, 3000, 107909 },
+    { 12288,  5120, 0, 3000, 107817 }, {  5120,  6144, 0, 3000, 107870 },
+    { 17408,  5120, 0, 4096, 108091 }, {  5120, 17408, 1, 4096, 107812 }, { 10240,  5120, 0, 4096, 107812 },
+    {  5120,  6144, 1, 4096, 107812 }, {  6144,  5120, 0, 4096, 107817 }, {  1024,  5120, 0, 4096, 108161 },
+    { 12288,  5120, 0, 4096, 107817 }, {  5120,  6144, 0, 4096, 107812 },
+    // merged FFN gate+up (m = 2*17408), see ggml_cuda_hip_gemm_merge_ok: only at the n where the whole model ran faster
+    // with the merge than without it (llama-bench, a single prompt size per process, 8-22 processes per arm in rotated
+    // order, every merged process faster than every unmerged one): prompt speed n = 512 +0.5%, 724 +1.0%,
+    // 1024 +0.2%, 2048 +0.8%, 3000 +0.3%, 4096 +0.3%. Not merged at n = 1448: -0.5% in the model (a GEMM-only paired
+    // benchmark had predicted -0.4% time for the merged GEMM; under the 300 W cap the model's GEMMs run at other
+    // clocks). With the merge the pool keeps a buffer of 2*n_ff*n floats and a second dequantized f16 weight
+    // (~0.7 GB more VRAM at n = 4096); GGML_CUDA_GATE_UP_MERGE=0 turns the merge off (the table entries above stay).
+    { 34816,  5120, 0,  512, 108091 }, { 34816,  5120, 0,  724, 107926 }, { 34816,  5120, 0, 1024, 108049 },
+    { 34816,  5120, 0, 2048, 108290 }, { 34816,  5120, 0, 3000, 107821 }, { 34816,  5120, 0, 4096, 107529 },
+};
+// What the table was measured with. The solution indices name kernels of hipBLASLt's kernel library (rocBLAS forwards
+// them), so both libraries must be exactly these builds: the full rocBLAS version string (with its commit hash) and
+// the file the loaded hipBLASLt library resolves to (its full package version). The rankings are those of an MI210
+// (gfx90a, 104 CUs, 300 W): other CDNA2 parts (an MI250/MI250X GCD) have other clocks, power limits and CU counts.
+static const char * ggml_cuda_hip_gemm_pins_rocblas  = "5.2.0.dabb6df2b9";
+static const char * ggml_cuda_hip_gemm_pins_hipblaslt = "libhipblaslt.so.1.2.70201";
+static const char * ggml_cuda_hip_gemm_pins_device    = "AMD Instinct MI210";
+static const int    ggml_cuda_hip_gemm_pins_cus       = 104;
+
+static bool ggml_cuda_hip_gemm_pins_libs_ok() {
+    static const bool ok = [] {
+        char ver[256] = {0};
+        if (rocblas_get_version_string(ver, sizeof(ver)) != rocblas_status_success ||
+                strcmp(ver, ggml_cuda_hip_gemm_pins_rocblas) != 0) {
+            return false;
+        }
+        bool found = false;
+#if defined(__linux__)
+        // the real file name of the loaded hipBLASLt library (libhipblaslt.so.1 -> libhipblaslt.so.1.<version>)
+        dl_iterate_phdr([](struct dl_phdr_info * info, size_t, void * data) -> int {
+            const char * name = info->dlpi_name;
+            if (name == nullptr || strstr(name, "libhipblaslt.so") == nullptr) {
+                return 0;
+            }
+            char path[PATH_MAX];
+            if (realpath(name, path) != nullptr) {
+                const char * base = strrchr(path, '/');
+                *(bool *) data = strcmp(base ? base + 1 : path, ggml_cuda_hip_gemm_pins_hipblaslt) == 0;
+            }
+            return 1;
+        }, &found);
+#endif // defined(__linux__)
+        return found;
+    }();
+    return ok;
+}
+
+static bool ggml_cuda_hip_gemm_pins_device_ok(const int device) {
+    static std::mutex mutex;
+    static int state[GGML_CUDA_MAX_DEVICES] = {}; // 0: unknown, 1: yes, 2: no
+    std::lock_guard<std::mutex> lock(mutex);
+    if (state[device] == 0) {
+        const auto & info = ggml_cuda_info().devices[device];
+        cudaDeviceProp prop;
+        const bool ok = GGML_CUDA_CC_IS_CDNA2(info.cc) && info.nsm == ggml_cuda_hip_gemm_pins_cus &&
+            cudaGetDeviceProperties(&prop, info.physical_device) == cudaSuccess &&
+            strcmp(prop.name, ggml_cuda_hip_gemm_pins_device) == 0 && prop.multiProcessorCount == ggml_cuda_hip_gemm_pins_cus;
+        state[device] = ok ? 1 : 2;
+    }
+    return state[device] == 1;
+}
+
+// GGML_CUDA_GEMM_TABLE (default on), and the libraries and the device the table was measured with. Without it the
+// selection is exactly the legacy tuner (and the FFN gate/up GEMMs are not merged).
+static bool ggml_cuda_hip_gemm_table_ok(const int device) {
+    static const bool enabled = [] {
+        const char * e = getenv("GGML_CUDA_GEMM_TABLE");
+        return e == nullptr || atoi(e) != 0;
+    }();
+    return enabled && ggml_cuda_hip_gemm_pins_libs_ok() && ggml_cuda_hip_gemm_pins_device_ok(device);
+}
+
+// the table entry for exactly this problem, or nullptr (the caller checks ggml_cuda_hip_gemm_table_ok)
+static const ggml_cuda_hip_gemm_pin * ggml_cuda_hip_gemm_find_pin(const int m, const int k, const int n, const bool accumulate) {
+    for (const auto & p : ggml_cuda_hip_gemm_pins) {
+        if (p.m == m && p.k == k && p.n == n && p.beta == (accumulate ? 1 : 0)) {
+            return &p;
+        }
+    }
+    return nullptr;
+}
+
+// the table solutions of the same (m, k, beta) at the nearest table n below and above n (0 to 2 entries)
+static std::vector<int32_t> ggml_cuda_hip_gemm_near_pins(const int m, const int k, const int n, const bool accumulate) {
+    const ggml_cuda_hip_gemm_pin * lo = nullptr;
+    const ggml_cuda_hip_gemm_pin * hi = nullptr;
+    for (const auto & p : ggml_cuda_hip_gemm_pins) {
+        if (p.m != m || p.k != k || p.beta != (accumulate ? 1 : 0)) {
+            continue;
+        }
+        if (p.n <= n && (lo == nullptr || p.n > lo->n)) {
+            lo = &p;
+        }
+        if (p.n >= n && (hi == nullptr || p.n < hi->n)) {
+            hi = &p;
+        }
+    }
+    std::vector<int32_t> res;
+    for (const ggml_cuda_hip_gemm_pin * p : { lo, hi }) {
+        if (p != nullptr) {
+            res.push_back(p->sol);
+        }
+    }
+    return res;
+}
+
+// GGML_CUDA_GEMM_TUNE (default on) and the hipBLASLt backend of rocBLAS
+static bool ggml_cuda_hip_gemm_tune_enabled() {
     static const bool enabled = [] {
         const char * e = getenv("GGML_CUDA_GEMM_TUNE");
         const char * l = getenv("ROCBLAS_USE_HIPBLASLT");
         return (e == nullptr || atoi(e) != 0) && l != nullptr && atoi(l) == 1;
     }();
-    if (!enabled || !GGML_CUDA_CC_IS_CDNA2(cc) || n < 2048 || (int64_t) m*k < (1 << 22)) {
+    return enabled;
+}
+
+// Merged FFN gate/up GEMM (ggml_cuda_try_fuse_gate_up): the table decides per n. The merged shape (m = 2*n_ff,
+// beta 0) has a table entry exactly at the n where the whole model ran faster with the merge than without it (see the
+// table). Anything else (another n, another model, other libraries or another device, the table or the tuner off)
+// keeps the two separate GEMMs.
+// Pinned (device, m, k, n, beta) problems whose solution index the library rejected at run time. The merge is only a
+// win with its pinned kernel, so a rejected merged pin turns the merge off for that n (the separate GEMMs are used).
+static std::mutex ggml_cuda_hip_gemm_rejected_mutex;
+static std::set<std::tuple<int, int, int, int, bool>> ggml_cuda_hip_gemm_rejected;
+
+static bool ggml_cuda_hip_gemm_merge_ok(const int device, const int m_merged, const int n, const int k) {
+    if (!ggml_cuda_hip_gemm_tune_enabled() || !ggml_cuda_hip_gemm_table_ok(device) ||
+            ggml_cuda_hip_gemm_find_pin(m_merged, k, n, false) == nullptr) {
+        return false;
+    }
+    std::lock_guard<std::mutex> lock(ggml_cuda_hip_gemm_rejected_mutex);
+    return ggml_cuda_hip_gemm_rejected.count(std::make_tuple(device, m_merged, k, n, false)) == 0;
+}
+
+static bool ggml_cuda_hip_gemm_tuned(cublasHandle_t handle, cudaStream_t stream, int cc,
+        const int m, const int n, const int k,
+        const void * alpha, const void * a, const int lda, const void * b, const int ldb,
+        const void * beta, void * c, const int ldc) {
+    const bool enabled = ggml_cuda_hip_gemm_tune_enabled();
+    if (!enabled || !GGML_CUDA_CC_IS_CDNA2(cc) || (int64_t) m*k < (1 << 22)) {
+        return false;
+    }
+    const int  device    = ggml_cuda_get_device();
+    const bool use_table = ggml_cuda_hip_gemm_table_ok(device);
+
+    const bool accumulate = *(const float *) beta != 0.0f;
+
+    // table entry for exactly this problem (or none)
+    const ggml_cuda_hip_gemm_pin * pin = use_table ? ggml_cuda_hip_gemm_find_pin(m, k, n, accumulate) : nullptr;
+    if (pin == nullptr && n < 2048) {
+        // as without the table: the library default
         return false;
     }
 
@@ -2253,11 +2449,10 @@ static bool ggml_cuda_hip_gemm_tuned(cublasHandle_t handle, cudaStream_t stream,
             rocblas_datatype_f32_r, algo, sol, 0) == rocblas_status_success;
     };
 
-    const bool accumulate = *(const float *) beta != 0.0f;
-
     static std::mutex mutex;
-    static std::map<std::tuple<int, int, int>, int32_t> cache;
-    const auto key = std::make_tuple(m, k, (n >= 4096 ? 1 : 0) | (accumulate ? 2 : 0));
+    static std::map<std::tuple<int, int, int, int>, int32_t> cache;
+    // per device; a table entry is cached per exact n (key 4*n), everything else per legacy n bucket (keys 0-3)
+    const auto key = std::make_tuple(device, m, k, (pin != nullptr ? 4*n : (n >= 4096 ? 1 : 0)) | (accumulate ? 2 : 0));
 
     int32_t sol = 0;
     bool    known;
@@ -2270,11 +2465,22 @@ static bool ggml_cuda_hip_gemm_tuned(cublasHandle_t handle, cudaStream_t stream,
         }
     }
 
-    if (!known) {
-        static const int32_t candidates[] = { 107806, 107812, 107817, 107825, 108043, 108049, 108091, 108169, 108210, 108434 };
+    if (!known && pin != nullptr) {
+        // no validity query for a pinned entry: rocblas_gemm_ex_get_solutions costs ~73 ms per shape (it checks
+        // every kernel of the library), which made the first request of a process 0.8 s slower at n = 512. An index
+        // the library does not accept for the problem fails in rocblas_gemm_ex before any kernel is launched (C is
+        // not written), the shape then falls back to the library default below.
+        sol = pin->sol;
+        GGML_LOG_DEBUG("%s: m=%d n=%d k=%d beta=%d -> pinned solution %d\n", __func__, m, n, k, accumulate ? 1 : 0, (int) sol);
+        std::lock_guard<std::mutex> lock(mutex);
+        cache[key] = sol;
+        known = true;
+    }
 
+    static const int32_t candidates[] = { 107806, 107812, 107817, 107825, 108043, 108049, 108091, 108169, 108210, 108434 };
+    std::vector<rocblas_int> valid;
+    if (!known && !use_table) {
         rocblas_int n_valid = 0;
-        std::vector<rocblas_int> valid;
         if (rocblas_gemm_ex_get_solutions(h, rocblas_operation_transpose, rocblas_operation_none, m, n, k, alpha,
                 a, rocblas_datatype_f16_r, lda, b, rocblas_datatype_f16_r, ldb, beta,
                 c, rocblas_datatype_f32_r, ldc, c, rocblas_datatype_f32_r, ldc,
@@ -2287,7 +2493,9 @@ static bool ggml_cuda_hip_gemm_tuned(cublasHandle_t handle, cudaStream_t stream,
                 valid.clear();
             }
         }
+    }
 
+    if (!known) {
         // beta != 0: time on a scratch C (its values do not matter, they only have to stay finite)
         void * c_time = c;
         void * c_tmp  = nullptr;
@@ -2314,9 +2522,83 @@ static bool ggml_cuda_hip_gemm_tuned(cublasHandle_t handle, cudaStream_t stream,
             return std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
         };
 
+        // n_warm untimed calls, then n_rep timed back-to-back calls; seconds per call
+        const auto time_steady = [&](int32_t s, int n_warm, int n_rep) -> double {
+            const rocblas_gemm_algo algo = s == 0 ? rocblas_gemm_algo_standard : rocblas_gemm_algo_solution_index;
+            for (int i = 0; i < n_warm; ++i) {
+                if (!run(algo, s, c_time)) {
+                    return -1.0;
+                }
+            }
+            CUDA_CHECK(cudaStreamSynchronize(stream));
+            const auto t0 = std::chrono::steady_clock::now();
+            bool ok = true;
+            for (int i = 0; i < n_rep && ok; ++i) {
+                ok = run(algo, s, c_time); // (a rejected index fails here without n_warm)
+            }
+            CUDA_CHECK(cudaStreamSynchronize(stream));
+            return ok ? std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count() / n_rep : -1.0;
+        };
+
         const double t_default = can_time ? time_it(rocblas_gemm_algo_standard, 0) : -1.0;
         double       t_best    = t_default;
-        if (t_default > 0.0) {
+        if (use_table && t_default > 0.0) {
+            // candidates: the legacy list plus the table solutions of the same (m, k, beta) at the nearest table n
+            // below and above (10-12; no validity query, an index the library rejects fails its first call).
+            // n <= 4096: pre-screen each with 1 warmup + 2 calls, then time the two fastest and the default in two
+            // rounds (in alternating order) of 1 warmup + 3 back-to-back calls each: 3 + 3 per candidate + 24, ~60-63
+            // calls per shape, about twice the calls of the legacy tuner (33). That costs more per shape (e.g.
+            // ~225 ms for 17408x5120 at n = 2500, legacy ~119 ms + ~73 ms for its validity query), but the first
+            // request is still not slower than with the legacy tuner, whose first validity query alone costs ~590 ms.
+            // n > 4096 (calls of several ms each, where 60 calls per shape would make the first request slower than
+            // the legacy tuner): no warmup calls, 2 calls per candidate and one round of 2 calls for the two fastest
+            // and the default, 3 + 2 per candidate + 6, ~31 calls per shape (calls are long enough for 2 back-to-back
+            // calls to rank the kernels; the first call of a solution index costs no extra time).
+            const bool light   = n > 4096;
+            const int  n_warm  = light ? 0 : 1;
+            const int  n_round = light ? 1 : 2;
+            const int  n_rep   = light ? 2 : 3;
+            std::vector<int32_t> pool(std::begin(candidates), std::end(candidates));
+            for (const int32_t s : ggml_cuda_hip_gemm_near_pins(m, k, n, accumulate)) {
+                if (s != 0 && std::find(pool.begin(), pool.end(), s) == pool.end()) {
+                    pool.push_back(s);
+                }
+            }
+            std::vector<std::pair<double, int32_t>> pre;
+            for (const int32_t cand : pool) {
+                const double t = time_steady(cand, n_warm, 2);
+                if (t > 0.0) {
+                    pre.emplace_back(t, cand);
+                }
+            }
+            std::sort(pre.begin(), pre.end());
+            std::vector<int32_t> fin = { 0 };
+            for (size_t i = 0; i < pre.size() && i < 2; ++i) {
+                fin.push_back(pre[i].second);
+            }
+            std::vector<double> tsum(fin.size(), 0.0);
+            for (int r = 0; r < n_round; ++r) {
+                for (size_t j = 0; j < fin.size(); ++j) {
+                    const size_t i = r == 0 ? j : fin.size() - 1 - j;
+                    const double t = time_steady(fin[i], n_warm, n_rep);
+                    tsum[i] = (t > 0.0 && tsum[i] >= 0.0) ? tsum[i] + t : -1.0;
+                }
+            }
+            sol    = 0;
+            t_best = tsum[0] > 0.0 ? tsum[0] : 1e30;
+            const double t_def = t_best;
+            for (size_t i = 1; i < fin.size(); ++i) {
+                if (tsum[i] > 0.0 && tsum[i] < t_best) {
+                    t_best = tsum[i];
+                    sol    = fin[i];
+                }
+            }
+            if (t_best > 0.98*t_def) {
+                sol = 0;
+            }
+            // as the sum of two per-call times, so the log line below prints ms per call as for the legacy path
+            t_best *= 2.0 / n_round;
+        } else if (t_default > 0.0) {
             for (const int32_t cand : candidates) {
                 if (std::find(valid.begin(), valid.end(), cand) == valid.end()) {
                     continue;
@@ -2350,8 +2632,15 @@ static bool ggml_cuda_hip_gemm_tuned(cublasHandle_t handle, cudaStream_t stream,
     // The caller now runs the default GEMM on the same C. With beta != 0 that is only correct if the failed call
     // wrote nothing to C. Assumption: rocblas_gemm_ex rejects a solution index / argument set before it launches
     // a kernel, so a failure leaves C untouched (a call that failed after accumulating would be added twice).
-    std::lock_guard<std::mutex> lock(mutex);
-    cache[key] = 0;
+    // As in the legacy tuner, one failure sends the shape to the library default for the rest of the process.
+    {
+        std::lock_guard<std::mutex> lock(mutex);
+        cache[key] = 0;
+    }
+    if (pin != nullptr) {
+        std::lock_guard<std::mutex> lock(ggml_cuda_hip_gemm_rejected_mutex);
+        ggml_cuda_hip_gemm_rejected.insert(std::make_tuple(device, m, k, n, accumulate));
+    }
     return false;
 }
 #endif // defined(GGML_USE_HIP)
@@ -6110,6 +6399,137 @@ static int ggml_cuda_try_fuse_swiglu_f16(ggml_backend_cuda_context * cuda_ctx, g
     ggml_cuda_mul_mat_cublas(*cuda_ctx, mm->src[0], glu, mm, glu_f16.get());
     return 1;
 }
+
+// FFN gate/up of a prefill ubatch: MUL_MAT(w_gate, x), MUL_MAT(w_up, x) (either order), GLU(SWIGLU, gate, up),
+// MUL_MAT(w_down, glu) [, ADD of the residual folded into it, ggml_cuda_match_gemm_add], all f16 cuBLAS GEMMs with
+// fp32 output on CDNA. The two weights are dequantized into one f16 buffer (gate rows, then up rows) and multiplied in
+// ONE GEMM of m = 2*n_ff into a pool buffer, so each token's column holds its n_ff gate values followed by its n_ff up
+// values; the strided SwiGLU kernel reads it and writes the f16 input of the down GEMM (as in
+// ggml_cuda_try_fuse_swiglu_f16). Used only at the n where the GEMM table has an entry for the merged shape, i.e.
+// where the model was measured faster with the merge (ggml_cuda_hip_gemm_merge_ok): one launch with fewer partial
+// waves, and a better hipBLASLt kernel for the merged shape. Costs a pool buffer of 2*n_ff*n floats plus a second
+// dequantized weight while the GEMM runs; the pool keeps that memory, see the VRAM note at the GEMM table.
+// Numerics: the same f16 weights (same dequantization kernels), the same f16 activation (the shared copy or the same
+// conversion), fp32 accumulation in a different kernel (summation order only), the same SwiGLU arithmetic and f16
+// rounding. gate->data, up->data and glu->data are neither written nor read.
+// GGML_CUDA_GATE_UP_MERGE=0 disables it, =2 merges at every size; it also needs the f16 SwiGLU path (off with
+// GGML_CUDA_SWIGLU_F16=0).
+// Returns the number of nodes to skip.
+static int ggml_cuda_try_fuse_gate_up(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, const int i) {
+    static const int  mode    = ggml_cuda_env_int("GGML_CUDA_GATE_UP_MERGE", 1);
+    static const bool enabled = mode != 0 && ggml_cuda_env_int("GGML_CUDA_SWIGLU_F16", 1) != 0;
+    if (!enabled || i + 3 >= cgraph->n_nodes) {
+        return 0;
+    }
+    ggml_tensor * mm0 = cgraph->nodes[i];
+    ggml_tensor * mm1 = cgraph->nodes[i + 1];
+    ggml_tensor * glu = cgraph->nodes[i + 2];
+    ggml_tensor * mm  = cgraph->nodes[i + 3];
+    if (mm0->op != GGML_OP_MUL_MAT || mm1->op != GGML_OP_MUL_MAT || glu->op != GGML_OP_GLU || mm->op != GGML_OP_MUL_MAT ||
+            ggml_get_glu_op(glu) != GGML_GLU_OP_SWIGLU || ggml_get_op_params_i32(glu, 1) != 0 || glu->src[1] == nullptr) {
+        return 0;
+    }
+    const ggml_tensor * gate = glu->src[0];
+    const ggml_tensor * up   = glu->src[1];
+    if (!((gate == mm0 && up == mm1) || (gate == mm1 && up == mm0))) {
+        return 0;
+    }
+    const ggml_tensor * x  = mm0->src[1];
+    const ggml_tensor * wg = gate->src[0];
+    const ggml_tensor * wu = up->src[0];
+    if (x == nullptr || mm1->src[1] != x || wg == x || wu == x ||
+            x->type != GGML_TYPE_F32 || !ggml_is_contiguous(x) || x->ne[2] != 1 || x->ne[3] != 1) {
+        return 0;
+    }
+    const int64_t K = wg->ne[0];
+    const int64_t M = wg->ne[1];
+    const int64_t N = x->ne[1];
+    const int     cc = ggml_cuda_info().devices[cuda_ctx->device].cc;
+    for (const ggml_tensor * w : { wg, wu }) {
+        // as the contiguous dequantization of ggml_cuda_mul_mat_cublas_impl
+        if (w->ne[0] != K || w->ne[1] != M || w->ne[2] != 1 || w->ne[3] != 1 || !ggml_is_quantized(w->type) ||
+                !ggml_is_contiguously_allocated(w) || ggml_get_to_fp16_cuda(w->type) == nullptr ||
+                w->buffer == nullptr || ggml_backend_buffer_get_usage(w->buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE) {
+            return 0;
+        }
+    }
+    for (const ggml_tensor * t : { gate, up }) {
+        // one f16 GEMM writing fp32 straight into the output (CDNA), the path the unfused MUL_MAT takes
+        if (t->ne[0] != M || t->ne[1] != N || ggml_cuda_mul_mat_cublas_gemm_type(*cuda_ctx, t) != GGML_TYPE_F16 ||
+                !ggml_cuda_mul_mat_cublas_can_accumulate(cc, t->src[0], x, t)) {
+            return 0;
+        }
+    }
+    if (glu->type != GGML_TYPE_F32 || !ggml_are_same_shape(glu, gate) || !ggml_is_contiguous(glu) ||
+            mm->src[1] != glu || mm->src[0] == glu || mm->ne[2] != 1 || mm->ne[3] != 1 ||
+            mm->src[0]->ne[2] != 1 || mm->src[0]->ne[3] != 1 || !ggml_is_contiguous(mm) ||
+            ggml_cuda_mul_mat_cublas_gemm_type(*cuda_ctx, mm) != GGML_TYPE_F16) {
+        return 0;
+    }
+    // limits of the strided SwiGLU kernel (one row per grid y) and of the int GEMM arguments
+    if (M % 4 != 0 || N < 1 || N > 65535 || 2*M > INT_MAX || K > INT_MAX) {
+        return 0;
+    }
+    // only where the merged GEMM is measured to be faster than the two separate ones (a static per-n decision);
+    // GGML_CUDA_GATE_UP_MERGE=2 merges at any size (for testing the fused path on small shapes)
+    if (mode != 2 && !ggml_cuda_hip_gemm_merge_ok(cuda_ctx->device, (int) (2*M), (int) N, (int) K)) {
+        return 0;
+    }
+    // gate, up and glu: no consumers outside the group, not graph outputs
+    if (!ggml_can_fuse_subgraph(cgraph, i, { GGML_OP_MUL_MAT, GGML_OP_MUL_MAT, GGML_OP_GLU, GGML_OP_MUL_MAT }, { i + 3 })) {
+        return 0;
+    }
+    const int j = ggml_cuda_match_gemm_add(cuda_ctx, cgraph, i + 3);
+
+    cudaStream_t stream = cuda_ctx->stream();
+    ggml_cuda_pool_alloc<half>  glu_f16(cuda_ctx->pool(), M*N);
+    {
+        ggml_cuda_pool_alloc<float> gate_up(cuda_ctx->pool(), 2*M*N);
+        {
+            // the first MUL_MAT is the first node of the group: its input may come from the shared f16 copies as usual
+            ggml_cuda_f16_share_allow_lookup allow_lookup(cuda_ctx);
+
+            ggml_cuda_pool_alloc<half> w_f16(cuda_ctx->pool(), 2*M*K);
+            ggml_get_to_fp16_cuda(wg->type)(wg->data, w_f16.get(),       M*K, stream);
+            ggml_get_to_fp16_cuda(wu->type)(wu->data, w_f16.get() + M*K, M*K, stream);
+
+            ggml_cuda_pool_alloc<half> x_alloc(cuda_ctx->pool());
+            const void * x_f16 = ggml_cuda_f16_share_lookup(*cuda_ctx, x, GGML_TYPE_F16);
+            if (x_f16 == nullptr) {
+                x_alloc.alloc(ggml_nelements(x));
+                ggml_get_to_fp16_cuda(GGML_TYPE_F32)(x->data, x_alloc.get(), ggml_nelements(x), stream);
+                x_f16 = x_alloc.get();
+            }
+
+            // the table solution for the merged shape (there is one unless GGML_CUDA_GATE_UP_MERGE=2)
+            const float alpha = 1.0f;
+            const float beta  = 0.0f;
+            cublasHandle_t handle = cuda_ctx->cublas_handle();
+            if (!ggml_cuda_hip_gemm_tuned(handle, stream, cc, (int) (2*M), (int) N, (int) K, &alpha, w_f16.get(), (int) K,
+                                          x_f16, (int) K, &beta, gate_up.get(), (int) (2*M))) {
+                CUBLAS_CHECK(cublasGemmEx(handle, CUBLAS_OP_T, CUBLAS_OP_N, (int) (2*M), (int) N, (int) K,
+                                          &alpha, w_f16.get(), CUDA_R_16F, (int) K,
+                                                  x_f16,       CUDA_R_16F, (int) K,
+                                          &beta,  gate_up.get(), CUDA_R_32F, (int) (2*M),
+                                          CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+            }
+        }
+        // pool buffers are cudaMalloc'd base pointers, so the alignment check cannot fail
+        GGML_ASSERT(ggml_cuda_swiglu_f16_strided(gate_up.get(), 2*M, M, M, N, glu_f16.get(), stream));
+    }
+
+    ggml_cuda_f16_share_state * st = ggml_cuda_f16_share_get(cuda_ctx);
+    if (j > 0) {
+        st->n_gate_up_add++;
+        ggml_tensor acc = *mm;
+        acc.data = cgraph->nodes[j]->data;
+        ggml_cuda_mul_mat_cublas(*cuda_ctx, mm->src[0], glu, &acc, glu_f16.get(), /*accumulate =*/ true);
+        return j - i;
+    }
+    st->n_gate_up++;
+    ggml_cuda_mul_mat_cublas(*cuda_ctx, mm->src[0], glu, mm, glu_f16.get());
+    return 3;
+}
 #endif // defined(GGML_USE_HIP)
 
 static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
@@ -6156,6 +6576,12 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     }
     if (node->op == GGML_OP_RMS_NORM && cuda_ctx->stream_context().concurrent_events.empty()) {
         const int nodes_to_skip = ggml_cuda_try_fuse_gated_norm(cuda_ctx, cgraph, i);
+        if (nodes_to_skip > 0) {
+            return nodes_to_skip;
+        }
+    }
+    if (node->op == GGML_OP_MUL_MAT && cuda_ctx->stream_context().concurrent_events.empty()) {
+        const int nodes_to_skip = ggml_cuda_try_fuse_gate_up(cuda_ctx, cgraph, i);
         if (nodes_to_skip > 0) {
             return nodes_to_skip;
         }

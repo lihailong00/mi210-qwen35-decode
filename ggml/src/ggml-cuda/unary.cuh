@@ -87,6 +87,13 @@ void ggml_cuda_op_swiglu(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
 // consumer is a GEMM that converts its input to f16 anyway. Returns false (nothing launched) if the shape/alignment
 // is not supported.
 bool ggml_cuda_op_swiglu_f16(ggml_backend_cuda_context & ctx, const ggml_tensor * glu, void * dst_f16);
+
+// The same SwiGLU (same per-element arithmetic, f16 output) for gate/up read from one f32 buffer in which row r of
+// the gate is at gate_up + r*ld and row r of the up projection at gate_up + r*ld + up_offs (the output of one GEMM over
+// the concatenated gate and up weights). dst_f16 is contiguous [nrows][ne0]. Returns false (nothing launched) if the
+// alignment is not supported (ne0, ld and up_offs must be multiples of 4, the pointers 16/8-byte aligned).
+bool ggml_cuda_swiglu_f16_strided(const float * gate_up, int64_t ld, int64_t up_offs, int64_t ne0, int64_t nrows,
+                                  void * dst_f16, cudaStream_t stream);
 #endif // defined(GGML_USE_HIP)
 
 void ggml_cuda_op_swiglu_oai(ggml_backend_cuda_context & ctx, ggml_tensor * dst);

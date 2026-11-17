@@ -454,6 +454,41 @@ bool ggml_cuda_op_swiglu_f16(ggml_backend_cuda_context & ctx, const ggml_tensor 
         (const float *) src0->data, (const float *) src1->data, (half *) dst_f16, k4);
     return true;
 }
+
+// one row per blockIdx.y, four elements per thread, arithmetic as in swiglu_f32_f16_kernel
+static __global__ void swiglu_f32_f16_strided_kernel(
+        const float * __restrict__ gate_up, half * __restrict__ dst, const int64_t ld, const int64_t up_offs, const int ne0_4) {
+    const int i4 = blockDim.x*blockIdx.x + threadIdx.x;
+    if (i4 >= ne0_4) {
+        return;
+    }
+    const int64_t row = blockIdx.y;
+    const float * x = gate_up + row*ld;
+
+    const swiglu_vec4<float> xv = ((const swiglu_vec4<float> *) x)[i4];
+    const swiglu_vec4<float> gv = ((const swiglu_vec4<float> *) (x + up_offs))[i4];
+
+    swiglu_vec4<half> yv;
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+        yv.v[j] = ggml_cuda_cast<half>(op_silu(xv.v[j]) * gv.v[j]);
+    }
+
+    ((swiglu_vec4<half> *) (dst + row*4*int64_t(ne0_4)))[i4] = yv;
+}
+
+bool ggml_cuda_swiglu_f16_strided(const float * gate_up, const int64_t ld, const int64_t up_offs, const int64_t ne0,
+                                  const int64_t nrows, void * dst_f16, cudaStream_t stream) {
+    if (ne0 % 4 != 0 || ld % 4 != 0 || up_offs % 4 != 0 || ne0 / 4 > INT_MAX || nrows > 65535 || nrows < 1 ||
+            (uintptr_t) gate_up % alignof(swiglu_vec4<float>) != 0 ||
+            (uintptr_t) dst_f16 % alignof(swiglu_vec4<half>)  != 0) {
+        return false;
+    }
+    const int  ne0_4 = (int) (ne0 / 4);
+    const dim3 grid((ne0_4 + CUDA_GLU_BLOCK_SIZE - 1) / CUDA_GLU_BLOCK_SIZE, (unsigned) nrows, 1);
+    swiglu_f32_f16_strided_kernel<<<grid, CUDA_GLU_BLOCK_SIZE, 0, stream>>>(gate_up, (half *) dst_f16, ld, up_offs, ne0_4);
+    return true;
+}
 #endif // defined(GGML_USE_HIP)
 
 void ggml_cuda_op_geglu_erf(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {

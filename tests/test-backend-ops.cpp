@@ -8186,6 +8186,16 @@ enum gemm_fusion_pattern {
     GEMM_FUSION_RES_REUSED,      // the same residual tensor is a mat-mul input before and after res += mm
     GEMM_FUSION_GATED_NORM,      // silu(z) * (rms_norm(x) * w) over heads of 128 (z another mat-mul) -> mul_mat
     GEMM_FUSION_GATED_NORM_ADD,  // as above -> res += mm
+    GEMM_FUSION_FFN,             // mul_mat(w_gate, x), mul_mat(w_up, x) -> swiglu -> mul_mat
+    GEMM_FUSION_FFN_ADD,         // as above -> res += mm
+    GEMM_FUSION_FFN_UP_FIRST,    // as GEMM_FUSION_FFN with the up mat-mul first in the graph
+    GEMM_FUSION_FFN_MIXED,       // as GEMM_FUSION_FFN_ADD with the up weight of another type (IQ3_S: IQ4_XS)
+    GEMM_FUSION_FFN_GATE_USED,   // as GEMM_FUSION_FFN, and the gate mat-mul result is also read by the output
+    GEMM_FUSION_FFN_ALIAS,       // as GEMM_FUSION_FFN, the residual added in place is the gate/up input itself
+    GEMM_FUSION_FFN_SHARED_BEFORE, // as GEMM_FUSION_FFN, another mat-mul of the same input before the pair
+    GEMM_FUSION_FFN_SHARED_AFTER,  // as GEMM_FUSION_FFN, another mat-mul of the same input after the down mat-mul
+    GEMM_FUSION_FFN_GEGLU,       // as GEMM_FUSION_FFN with GEGLU (must not be merged as SwiGLU)
+    GEMM_FUSION_FFN_GATE_OUT,    // as GEMM_FUSION_FFN, the gate mat-mul result is a graph output
 };
 
 static std::string var_to_str(gemm_fusion_pattern pattern) {
@@ -8199,6 +8209,16 @@ static std::string var_to_str(gemm_fusion_pattern pattern) {
         case GEMM_FUSION_RES_REUSED:      return "res-reused";
         case GEMM_FUSION_GATED_NORM:      return "gnorm-mm";
         case GEMM_FUSION_GATED_NORM_ADD:  return "gnorm-mm-add";
+        case GEMM_FUSION_FFN:             return "ffn";
+        case GEMM_FUSION_FFN_ADD:         return "ffn-add";
+        case GEMM_FUSION_FFN_UP_FIRST:    return "ffn-up-first";
+        case GEMM_FUSION_FFN_MIXED:       return "ffn-mixed-add";
+        case GEMM_FUSION_FFN_GATE_USED:   return "ffn-gate-used";
+        case GEMM_FUSION_FFN_ALIAS:       return "ffn-alias";
+        case GEMM_FUSION_FFN_SHARED_BEFORE: return "ffn-shared-before";
+        case GEMM_FUSION_FFN_SHARED_AFTER:  return "ffn-shared-after";
+        case GEMM_FUSION_FFN_GEGLU:       return "ffn-geglu";
+        case GEMM_FUSION_FFN_GATE_OUT:    return "ffn-gate-out";
     }
     return "unknown";
 }
@@ -8237,7 +8257,8 @@ struct test_gemm_fusion : public test_case {
     ggml_tensor * build_graph(ggml_context * ctx, ggml_context * ctx_weights) override {
         expand_order.clear();
 
-        ggml_tensor * a = ggml_new_tensor_2d(ctx_weights, type_a, k, m);
+        // (f16 if k is not a multiple of the block size of type_a)
+        ggml_tensor * a = ggml_new_tensor_2d(ctx_weights, k % ggml_blck_size(type_a) == 0 ? type_a : GGML_TYPE_F16, k, m);
         ggml_set_name(a, "a");
 
         ggml_tensor * out = nullptr;
@@ -8313,6 +8334,69 @@ struct test_gemm_fusion : public test_case {
                     if (pattern == GEMM_FUSION_GATED_NORM_ADD) {
                         ggml_tensor * res = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, m, n);
                         out = ggml_add_inplace(ctx, res, out);
+                    }
+                } break;
+            case GEMM_FUSION_FFN:
+            case GEMM_FUSION_FFN_ADD:
+            case GEMM_FUSION_FFN_UP_FIRST:
+            case GEMM_FUSION_FFN_MIXED:
+            case GEMM_FUSION_FFN_GATE_USED:
+                {
+                    // x [m, n] -> gate/up [k, n] -> down (a) -> [m, n]; a merged gate/up GEMM must give the same result
+                    const ggml_type type_up = pattern == GEMM_FUSION_FFN_MIXED && type_a == GGML_TYPE_IQ3_S ? GGML_TYPE_IQ4_XS : type_a;
+                    ggml_tensor * x  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, m, n);
+                    ggml_tensor * wg = ggml_new_tensor_2d(ctx_weights, type_a,  m, k);
+                    ggml_tensor * wu = ggml_new_tensor_2d(ctx_weights, type_up, m, k);
+                    ggml_tensor * gate;
+                    ggml_tensor * up;
+                    if (pattern == GEMM_FUSION_FFN_UP_FIRST) {
+                        up   = ggml_mul_mat(ctx, wu, x);
+                        gate = ggml_mul_mat(ctx, wg, x);
+                    } else {
+                        gate = ggml_mul_mat(ctx, wg, x);
+                        up   = ggml_mul_mat(ctx, wu, x);
+                    }
+                    out = ggml_mul_mat(ctx, a, ggml_swiglu_split(ctx, gate, up));
+                    if (pattern == GEMM_FUSION_FFN_ADD || pattern == GEMM_FUSION_FFN_MIXED) {
+                        ggml_tensor * res = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, m, n);
+                        out = ggml_add_inplace(ctx, res, out);
+                    }
+                    if (pattern == GEMM_FUSION_FFN_GATE_USED) {
+                        out = ggml_add(ctx, out, ggml_sum_rows(ctx, gate)); // [1, n] broadcast over the rows
+                    }
+                } break;
+            case GEMM_FUSION_FFN_ALIAS:
+            case GEMM_FUSION_FFN_SHARED_BEFORE:
+            case GEMM_FUSION_FFN_SHARED_AFTER:
+            case GEMM_FUSION_FFN_GEGLU:
+            case GEMM_FUSION_FFN_GATE_OUT:
+                {
+                    ggml_tensor * x  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, m, n);
+                    ggml_tensor * wg = ggml_new_tensor_2d(ctx_weights, type_a, m, k);
+                    ggml_tensor * wu = ggml_new_tensor_2d(ctx_weights, type_a, m, k);
+                    ggml_tensor * x3 = nullptr;
+                    if (pattern == GEMM_FUSION_FFN_SHARED_BEFORE) {
+                        ggml_tensor * a3 = ggml_new_tensor_2d(ctx_weights, type_a, m, m);
+                        x3 = ggml_mul_mat(ctx, a3, x);
+                        expand_order.push_back(x3);
+                    }
+                    ggml_tensor * gate = ggml_mul_mat(ctx, wg, x);
+                    ggml_tensor * up   = ggml_mul_mat(ctx, wu, x);
+                    if (pattern == GEMM_FUSION_FFN_GATE_OUT) {
+                        ggml_set_output(gate);
+                        expand_order.push_back(gate);
+                    }
+                    ggml_tensor * g = pattern == GEMM_FUSION_FFN_GEGLU ? ggml_geglu_split(ctx, gate, up) : ggml_swiglu_split(ctx, gate, up);
+                    out = ggml_mul_mat(ctx, a, g);
+                    if (pattern == GEMM_FUSION_FFN_ALIAS) {
+                        out = ggml_add_inplace(ctx, x, out);
+                    }
+                    if (pattern == GEMM_FUSION_FFN_SHARED_BEFORE) {
+                        out = ggml_add(ctx, out, x3);
+                    }
+                    if (pattern == GEMM_FUSION_FFN_SHARED_AFTER) {
+                        ggml_tensor * a3 = ggml_new_tensor_2d(ctx_weights, type_a, m, m);
+                        out = ggml_add(ctx, out, ggml_mul_mat(ctx, a3, x));
                     }
                 } break;
         }
@@ -11795,7 +11879,31 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_gemm_fusion(type_a, 384, n, 1024, GEMM_FUSION_GATED_NORM));
             test_cases.emplace_back(new test_gemm_fusion(type_a, 384, n, 1024, GEMM_FUSION_GATED_NORM_ADD));
         }
+        // FFN gate/up/down (the gate/up mat-muls may be merged into one GEMM)
+        for (int64_t n : {255, 256, 512}) {
+            for (gemm_fusion_pattern pattern : {GEMM_FUSION_FFN, GEMM_FUSION_FFN_ADD, GEMM_FUSION_FFN_UP_FIRST,
+                                                GEMM_FUSION_FFN_MIXED, GEMM_FUSION_FFN_GATE_USED}) {
+                test_cases.emplace_back(new test_gemm_fusion(type_a, 512, n, 1024, pattern));
+            }
+        }
     }
+    // FFN gate/up merge (HIP): the backend merges only at the batch sizes its GEMM table selects for the real model
+    // shape (below); GGML_CUDA_GATE_UP_MERGE=2 merges at every size and runs these on the merged path: graph patterns
+    // that must not be merged (or must still give the same result), n_ff not a multiple of 4 / 256, and merged
+    // GEMMs with m*k >= 2^22 at n >= 2048 (steady-state kernel selection, both n buckets)
+    for (gemm_fusion_pattern p : {GEMM_FUSION_FFN_ALIAS, GEMM_FUSION_FFN_SHARED_BEFORE, GEMM_FUSION_FFN_SHARED_AFTER,
+                                  GEMM_FUSION_FFN_GEGLU, GEMM_FUSION_FFN_GATE_OUT}) {
+        test_cases.emplace_back(new test_gemm_fusion(GGML_TYPE_IQ3_S, 2048, 256, 1024, p));
+    }
+    for (int64_t k : {1026, 1028, 1100}) {
+        test_cases.emplace_back(new test_gemm_fusion(GGML_TYPE_IQ3_S, 512, 300, k, GEMM_FUSION_FFN_ADD));
+    }
+    for (int64_t n : {2047, 2048, 4100}) {
+        test_cases.emplace_back(new test_gemm_fusion(GGML_TYPE_IQ3_S, 2048, n, 1024, GEMM_FUSION_FFN_ADD));
+        test_cases.emplace_back(new test_gemm_fusion(GGML_TYPE_IQ3_S, 2048, n, 1024, GEMM_FUSION_FFN_MIXED));
+    }
+    // the real shape (n_embd 5120, n_ff 17408) at a table size with a merged entry
+    test_cases.emplace_back(new test_gemm_fusion(GGML_TYPE_IQ3_S, 5120, 724, 17408, GEMM_FUSION_FFN_MIXED));
 
     test_cases.emplace_back(new test_ssm_scan(GGML_TYPE_F32, 16, 1, 1024, 1, 32, 4)); // Mamba-1
     test_cases.emplace_back(new test_ssm_scan(GGML_TYPE_F32, 96, 64, 128, 8, 1, 1)); // Nemotron-3-Puzzle decode (scan path, unused warp in last block)
@@ -11974,6 +12082,18 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32, 31, 509, 2051, {1, 1}, {1, 1}));
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32, 32, 509, 2112, {1, 1}, {1, 1}));
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 32, 509, 2112, {1, 1}, {1, 1}));
+
+    // large-batch GEMMs that reach the per-shape hipBLASLt kernel selection on CDNA2 (m*k >= 2^22), at table sizes of
+    // the pinned kernels (n = 512, 724, 2048, 3000, 4096) and next to them (library default below n = 2048, steady-state
+    // timing above, both n buckets and the reduced timing above n = 4096), beta 0
+    for (int64_t n : {511, 512, 513, 724, 2047, 2048, 2049, 3000, 3001, 4095, 4096, 4097, 6000}) {
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_K, GGML_TYPE_F32, 1024, n, 5120, {1, 1}, {1, 1}));
+    }
+    // beta 1: a weight mat-mul whose result is added in place onto a residual, which the HIP backend folds into the
+    // GEMM (ggml_cuda_match_gemm_add, the residual add of the model: 5120x6144 is a table shape with beta 1)
+    for (int64_t n : {511, 512, 2048, 2049, 3000, 4096, 4097, 6000}) {
+        test_cases.emplace_back(new test_gemm_fusion(GGML_TYPE_Q4_K, 5120, n, 6144, GEMM_FUSION_ADD));
+    }
 
     // few src1 rows (speculative verify): odd m, a single K block, long K, every tile width, broadcast batches
     for (int64_t n : {2, 3, 5, 8, 9, 13, 16}) {
