@@ -14,7 +14,7 @@
 
 prefill 的提升来自两处：让 rocBLAS 在 CDNA2 上默认使用 hipBLASLt 后端（rocBLAS 自带选核对 ffn_down 形状只跑到 47 TFLOPS），更快的权重反量化启动方式、逐形状的 GEMM 选核（后来改为按精确形状和 token 数固定的 kernel 表，并把 FFN 的 gate 与 up 合成一个 GEMM），为 wave64 重写、后来又拆成并行预处理加波分工串行两段的 fp32 MFMA DeltaNet kernel，flash attention 的装载预取和 GQA 6 分发修正，以及四项小算子融合（卷积输入、SwiGLU 直接写 f16、f16 副本共享、残差加法并入 GEMM）；本机实测的 decode / prefill 上限约 124 / 2980 token/s（prefill 受 300 W 功耗上限限制），见交接文档第十三节。
 
-原定目标 90 token/s 未达到：逐节点复核显示，在同一 GGUF、不损失精度、不用 MTP 的约束下 decode 现实可达约 84–86 token/s（交接文档第十三节第 14 小节），因此没有继续；越过 90 要靠 MTP / 投机解码。原因分析、全部优化细节、失败的尝试和后续方向见 [docs/HANDOVER.md](docs/HANDOVER.md)。
+原定目标 90 token/s 未达到：逐节点复核显示，在同一 GGUF、不损失精度、不用 MTP 的约束下 decode 现实可达约 84–86 token/s（交接文档第十三节第 14 小节），因此没有继续；越过 90 要靠 MTP / 投机解码：用模型自带的 MTP 头（`llama-server --spec-type draft-mtp --spec-draft-n-max 3`），配合新的多 token 验证 kernel，单请求 decode 约 99 token/s（JSON 类输出约 125），见交接文档第十三节第 15 小节。原因分析、全部优化细节、失败的尝试和后续方向见 [docs/HANDOVER.md](docs/HANDOVER.md)。
 
 ## 分支与标签
 

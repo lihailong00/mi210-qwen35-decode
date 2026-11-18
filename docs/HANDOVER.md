@@ -756,6 +756,32 @@ GEMM 占 pp8192 每 token 约 410 µs（共 519 µs）。四个方向并行做�
 
 合计中值约 0.7 ms（约 84–85 token/s），乐观端约 1.15 ms，到不了 90 所需的 1.34 ms。已排除、不要重试：限制 GEMV 网格到约 2 块/CU、logits 拷贝与 LM head 重叠、去掉上传后的同步、兄弟 GEMV 合并、AnyOrder launch、双流图、跨 kernel 的 L2 预取，以及第八节的全部条目。
 
+### 15. MTP 投机解码：多 token 验证的 GEMV kernel
+
+llama.cpp 已支持本模型自带的 MTP 头（`llama-server --spec-type draft-mtp --spec-draft-n-max K`）。直接打开时 decode 反而变慢：K=3 只有 56.6 token/s（不开为 78.7）。草稿接受率其实很高（K=3 时每轮产出：写代码 3.51 个 token、JSON 3.78、写故事 2.18），慢在验证：主模型一次处理 K+1 个 token 时，第五节的所有 decode GEMV 都只在 ne11 == 1 时启用，2–8 个 token 退回 llama.cpp 原来的 mul_mat_vec_q，只有 0.2–0.4 TB/s，一步 4 个 token 要 49 ms（1 个 token 14 ms）。
+
+- **N 列 kernel。** 每个 decode 模块各加一套模板 kernel，列数 N 为编译期参数（实例化 2–6），权重读一次供 N 个 token 使用：IQ3_S/IQ3_XXS（单个、残差、SwiGLU 含 S/XXS 混合、qkv+z 多任务）、IQ4_XS/Q4_K（含 LM head 和 1024 行的 K/V）、低比特（IQ2_S/XS/XXS、Q2_K、IQ1_M，普通和残差）、IQ3+IQ4 混合配对。单 token kernel 不变。
+- **逐列与单 token 按位相同。** 每列用与 N=1 相同的 q8 激活和相同的逐行求和树，结果与把这一列单独送进单 token 路径逐位相同；`test-backend-ops` 和模型内（`GGML_MMVQ_NC_VERIFY`）共检查上千次调用，0 个不一致。
+- **融合在 2–NC_MAX 个 token 时也生效**：MUL_MAT+ADD、gate/up SwiGLU、qkv+z 多任务、混合配对；qwen35 在这些尺寸下调整 qkv/z 的顺序，让配对能形成。
+- **q8 激活缓存修正。** 缓存现在也服务 N 列调用；任何节点或融合组写入某个缓存条目的源字节时，该条目会被丢弃。这顺带修好了一个原有问题：N=1 时非矩阵乘的原地写入之后，缓存里可能是过期的激活。新增回归用例 res-inplace / res-reused。
+- **开关**：`GGML_MMVQ_NC=0` 精确回到原来的 kernel 和输出；`GGML_MMVQ_NC_MAX`（默认 4，最大 6）是最大批次；`GGML_MMVQ_NC_IQ3` / `_IQ4K` / `_LOWBIT` / `_MIX=0` 分别关掉一类。
+- 2–4 个 token 的短 prompt 分块也会走新 kernel，因此不开 MTP 时部分 prompt 的贪心输出会与之前不同（每列与单 token 结果一致，更接近逐 token 计算）；需要与之前逐字节相同时设 `GGML_MMVQ_NC=0`。
+
+结果（llama-server，4 个 prompt 各 384 token，贪心，token/s）：
+
+| 草稿数 K | 之前 | 之后 | 写代码 | 写故事 | JSON |
+|---|---|---|---|---|---|
+| 0（不开 MTP） | 79.1 | 79.5 | 79.5 | 79.5 | 79.4 |
+| 1 | 51.2 | 88.8 | 92.0 | 81.4 | 94.5 |
+| 2 | 54.9 | 99.1 | 109.7 | 80.5 | 115.5 |
+| 3 | 56.4 | 99.0 | 115.2 | 73.6 | 124.7 |
+
+- 验证一步（模型内逐节点计时）：N=2 36.8 → 21.4 ms，N=3 43.9 → 24.3，N=4 49.2 → 27.5。K=4、5 需要 `GGML_MMVQ_NC_MAX=6`（94.2、87.3 token/s），不如 K=2–3。
+- 单 token decode、prefill 和 N=1 的 logits 不变。
+- **还没做到的**：
+  - 开 MTP 时写代码和写故事的输出仍与不开时不同（JSON、翻译相同）。第一个出现差异的是 DeltaNet 层里 BF16 的 ssm_alpha/ssm_beta 小矩阵乘，之后是 DeltaNet 递推、gated norm 和带 gate 的 flash attention：这些在 N=1 时走融合 kernel，N>1 时走通用图。
+  - N=4 的 GEMV 是单 token 的 1.5–2.4 倍（目标 1.3 倍）：多列时这些 kernel 受普通指令吞吐限制；混合配对已在 NC=4 用 int8 MFMA，其余类可照此改写。
+
 ## 附录：开关、文件、分支
 
 代码在服务器仓库 `/data/tools/mi210-opt/src`，最终版本为标签 `mi210-final`；相对保留版改动 39 个文件、+12,493/−79 行、86 个提交，完整补丁为 `deliver/mi210-final-vs-retained.patch`。
@@ -790,6 +816,8 @@ GEMM 占 pp8192 每 token 约 410 µs（共 519 µs）。四个方向并行做�
 | `GGML_CUDA_GNORM_F16` / `GGML_CUDA_RMS_NORM_ROWS` | 开 | DeltaNet 输出 gated norm 直接写 f16 / q·k L2 norm 的多行 kernel |
 | `GGML_CUDA_GEMM_TUNE` / `GGML_CUDA_GEMM_TABLE` | 开 | prefill GEMM 选核（0 用库默认，logits 确定）/ 固定 kernel 表（0 回到逐形状计时） |
 | `GGML_CUDA_GATE_UP_MERGE` | 开 | FFN gate/up 合成一个 GEMM（只在表里有的 n 上；2 为测试用的强制合并） |
+| `GGML_MMVQ_NC` / `GGML_MMVQ_NC_MAX` | 开 / 4 | 2–NC_MAX 个 token 时用 N 列 decode GEMV（MTP 验证）/ 最大列数（≤ 6） |
+| `GGML_MMVQ_NC_IQ3` / `_IQ4K` / `_LOWBIT` / `_MIX` | 开 | 分别关掉一类 N 列 kernel |
 | `GGML_SCHED_SYNC_UPLOADS` / `GGML_CUDA_NO_UPLOAD_BATCH` | 关 | 设 1 回到同步上传 / 不合并小上传 |
 | `GGML_CUDA_ATTN_PREP_VERIFY`、`GGML_GDN_DECODE_Q8_SELFTEST`、`GGML_MMVQ_MIX_EMPTY*` 等 | 关 | 调试与标定用 |
 | `CODEX_IQ3_PREPACK` / `CODEX_IQ3_XXS_PREPACK` | 需设 1 | 保留版补丁的开关；所有测量都在 =1 下进行 |
