@@ -764,7 +764,7 @@ llama.cpp 已支持本模型自带的 MTP 头（`llama-server --spec-type draft-
 - **逐列与单 token 按位相同。** 每列用与 N=1 相同的 q8 激活和相同的逐行求和树，结果与把这一列单独送进单 token 路径逐位相同；`test-backend-ops` 和模型内（`GGML_MMVQ_NC_VERIFY`）共检查上千次调用，0 个不一致。
 - **融合在 2–NC_MAX 个 token 时也生效**：MUL_MAT+ADD、gate/up SwiGLU、qkv+z 多任务、混合配对；qwen35 在这些尺寸下调整 qkv/z 的顺序，让配对能形成。
 - **q8 激活缓存修正。** 缓存现在也服务 N 列调用；任何节点或融合组写入某个缓存条目的源字节时，该条目会被丢弃。这顺带修好了一个原有问题：N=1 时非矩阵乘的原地写入之后，缓存里可能是过期的激活。新增回归用例 res-inplace / res-reused。
-- **开关**：`GGML_MMVQ_NC=0` 精确回到原来的 kernel 和输出；`GGML_MMVQ_NC_MAX`（默认 4，最大 6）是最大批次；`GGML_MMVQ_NC_IQ3` / `_IQ4K` / `_LOWBIT` / `_MIX=0` 分别关掉一类。
+- **开关**：`GGML_MMVQ_NC=0` 精确回到原来的 kernel 和输出；`GGML_MMVQ_NC_MAX`（本节时默认 4、最大 6，第 16 小节起默认和最大都是 16）是最大批次；`GGML_MMVQ_NC_IQ3` / `_IQ4K` / `_LOWBIT` / `_MIX=0` 分别关掉一类。
 - 2–4 个 token 的短 prompt 分块也会走新 kernel，因此不开 MTP 时部分 prompt 的贪心输出会与之前不同（每列与单 token 结果一致，更接近逐 token 计算）；需要与之前逐字节相同时设 `GGML_MMVQ_NC=0`。
 
 结果（llama-server，4 个 prompt 各 384 token，贪心，token/s）：
@@ -781,6 +781,59 @@ llama.cpp 已支持本模型自带的 MTP 头（`llama-server --spec-type draft-
 - **还没做到的**：
   - 开 MTP 时写代码和写故事的输出仍与不开时不同（JSON、翻译相同）。第一个出现差异的是 DeltaNet 层里 BF16 的 ssm_alpha/ssm_beta 小矩阵乘，之后是 DeltaNet 递推、gated norm 和带 gate 的 flash attention：这些在 N=1 时走融合 kernel，N>1 时走通用图。
   - N=4 的 GEMV 是单 token 的 1.5–2.4 倍（目标 1.3 倍）：多列时这些 kernel 受普通指令吞吐限制；混合配对已在 NC=4 用 int8 MFMA，其余类可照此改写。
+
+### 16. MTP 第二轮：int8 MFMA 的 N 列 GEMV、逐 token 精确的 DeltaNet 与注意力
+
+第 15 小节之后，验证一步仍然贵：4 个 token 要 24 ms（模型内逐节点合计，单 token 12.5 ms）。其中 GEMV 是单 token 的 1.5–2.4 倍，DeltaNet 的非矩阵乘部分在 N>1 时走通用图，约 4.9 ms（N=1 的融合 kernel 只要 0.64 ms）。8 个 token 以上退回原来的 mul_mat_vec_q / MMQ，一步 57–67 ms，所以更大的 K 和 n-gram 草稿都不划算。另外开 MTP 时写代码、写故事的输出与不开时不同。
+
+这一轮分六部分，每列（每个 token）的结果都与单 token 路径逐位相同：
+
+- **四类 GEMV 改用 int8 MFMA**（`v_mfma_i32_4x4x4i8`），N 最大 16。整数部分用 MFMA 算出与 N=1 dp4a 链相同的 int32，浮点部分（缩放、逐行求和树、残差、SwiGLU、q8）照搬 N=1 的运算顺序：
+  - IQ3_S/IQ3_XXS：单个、残差、SwiGLU、qkv+z 多任务、K 分段的 ffn_down，N=4–16；
+  - IQ4_XS/Q4_K：含 N 行的 LM head 和小行数的 K/V，N=3–16；
+  - 低比特 IQ2_S/XS/XXS、Q2_K、IQ1_M：N=3–16；
+  - IQ3+IQ4 混合配对：N=4–16；
+  - N 较小时保留第 15 小节的 dp4a 版本（那里更快）。
+- **DeltaNet（O1）**：一个序列 1–16 个 token 都走两个融合 launch（PREP、OUT），包括 BF16 的 ssm_alpha/beta、卷积窗口、递推和 MTP 回滚用的快照槽。
+- **注意力（O2）**：一次 launch 处理 2–16 个 query 的 fattn-dec，带 gate 和 q8 输出；KV 超过 1024 时每个 query 走单 token 的通用调用，保证逐位相同。norm、SwiGLU 的 q8 产出也支持 N 行。
+- **N > 8 被拒绝时的退路**：某个张量不被 N 列 kernel 接受时回到原来的 MMQ（不再触发 mul_mat_vec_q 最多 8 列的断言）。
+- **开 MTP 时的 prompt 预填充**：llama.cpp 在 n_rs_seq > 0 时用逐 token 递推代替分块 WY kernel，最后几位与不开 MTP 不同，这是第一个分歧点。现在递推只负责写快照，输出由与不开 MTP 相同的分块 kernel 重算（`GGML_CUDA_GDN_KEEP_RS_EXACT`）。
+- `GGML_MMVQ_NC_MAX` 默认改为 16：N 超过它就回到不精确的 MMQ。
+
+结果：
+
+验证一步（模型内逐节点合计，ms）：
+
+| N | 之前 | 现在 |
+|---|---|---|
+| 1 | 12.50 | 12.49 |
+| 2 | 18.90 | 14.66 |
+| 4 | 23.99 | 17.19 |
+| 8 | 67.29 | 23.56 |
+| 16 | 57.24 | 37.25 |
+
+llama-server，5 个 prompt（写代码、写故事、JSON 各 384 token，改代码 502，复述 153），贪心，token/s：
+
+| 配置 | 写代码 | 写故事 | JSON | 改代码 | 复述 | 总体 |
+|---|---|---|---|---|---|---|
+| 不开投机 | 79.3 | 79.3 | 79.2 | 76.6 | 79.4 | 78.5 |
+| 之前 MTP K=3 | 115.2 | 73.6 | 125.9 | 131.1 | 116.2 | 107.9 |
+| MTP K=1 | 114.2 | 99.0 | 117.1 | 115.7 | 115.0 | 111.6 |
+| MTP K=2 | 135.2 | 99.1 | 143.1 | 143.6 | 137.8 | 129.0 |
+| **MTP K=3** | **153.6** | **97.2** | **167.4** | **171.2** | **157.1** | **142.8** |
+| MTP K=4 / 5 / 7 | | | | 171.8 / 188.4 / 206.4 | | 127.9 / 128.2 / 125.1 |
+| ngram-simple（n 12, m 15） | 78.8 | 78.1 | 79.5 | 137.7 | 162.1 | 94.1 |
+| MTP K=3 + ngram-simple | 154.0 | 97.4 | 150.6 | 179.7 | 200.9 | 144.1 |
+
+- **推荐** `--spec-type draft-mtp --spec-draft-n-max 3`。K=3 每秒 44.8 轮（之前 33.6）。K ≥ 4 时每轮变贵的幅度超过多猜中的 token，只有改代码这类高接受率的内容更快。以复制、改写为主的负载可再加 `--spec-type ngram-simple`。
+- **所有投机配置的输出都与不开投机逐字节相同**，5 个 prompt 全部一致。
+- **没有退步**：单 token decode、pp512/2048/8192 与之前相同（在噪声内），N=1 logits 不变。
+- **不开投机时，写代码和写故事的输出与第 15 小节版本不同**：prompt 末尾 2–16 个 token 的分块现在走逐 token 精确的路径。把所有新开关设为关（见附录）可逐位回到之前的版本。
+- **还没做到的**：
+  - N=16 一步 37 ms，目标约 21 ms。各类 GEMV 的 N=4 / N=16 相对 N=1：IQ3 1.47 / 3.06，IQ4 1.28 / 2.82，低比特 1.58 / 4.56，混合配对 1.37 / 3.09。
+  - KV 超过 1024 时精确注意力每层每轮多约 0.2 ms（`GGML_CUDA_FA_DEC_NQ_LONG=0` 用精度换速度）。
+  - 开 MTP 时 prompt 预填充多跑一次递推，比不开 MTP 慢；写快照的分块 kernel 可以去掉这部分。
+  - N 列注意力假设一个 KV cache 只有一个序列（`-np 1`）。
 
 ## 附录：开关、文件、分支
 
@@ -816,8 +869,15 @@ llama.cpp 已支持本模型自带的 MTP 头（`llama-server --spec-type draft-
 | `GGML_CUDA_GNORM_F16` / `GGML_CUDA_RMS_NORM_ROWS` | 开 | DeltaNet 输出 gated norm 直接写 f16 / q·k L2 norm 的多行 kernel |
 | `GGML_CUDA_GEMM_TUNE` / `GGML_CUDA_GEMM_TABLE` | 开 | prefill GEMM 选核（0 用库默认，logits 确定）/ 固定 kernel 表（0 回到逐形状计时） |
 | `GGML_CUDA_GATE_UP_MERGE` | 开 | FFN gate/up 合成一个 GEMM（只在表里有的 n 上；2 为测试用的强制合并） |
-| `GGML_MMVQ_NC` / `GGML_MMVQ_NC_MAX` | 开 / 4 | 2–NC_MAX 个 token 时用 N 列 decode GEMV（MTP 验证）/ 最大列数（≤ 6） |
+| `GGML_MMVQ_NC` / `GGML_MMVQ_NC_MAX` | 开 / 16 | 2–NC_MAX 个 token 时用 N 列 decode GEMV（MTP 验证）/ 最大列数（2–16；超过它回到不精确的 MMQ） |
 | `GGML_MMVQ_NC_IQ3` / `_IQ4K` / `_LOWBIT` / `_MIX` | 开 | 分别关掉一类 N 列 kernel |
+| `GGML_MMVQ_NC_IQ3_MFMA` / `_IQ4K_MFMA` / `_LOWBIT_MFMA` / `_MIX_MFMA` | 开 | 各类 N 列 kernel 的 int8 MFMA 版（0 回到 dp4a 版，最多 6 列） |
+| `LLAMA_GDN_FUSED_DECODE_N` | 16 | 1–N 个 token 时 DeltaNet 走融合 PREP/OUT（0 回到通用图） |
+| `GGML_CUDA_FA_DEC_NQ` / `GGML_CUDA_FA_DEC_NQ_LONG` | 开 | N 个 query 的 fattn-dec（带 gate、q8）/ KV > 1024 时逐 query 精确（0 更快但不逐位相同） |
+| `GGML_Q8P_NC` | 开 | norm、SwiGLU 等为 N 行直接产出 q8 |
+| `GGML_CUDA_GDN_KEEP_RS_EXACT` | 开 | 开 MTP 时 prompt 预填充的输出与不开 MTP 逐位相同（0 回到逐 token 递推） |
+| `GGML_MMVQ_NC_IQ4K_SN_MAX` / `_IQ4K_DOWN_MAX` / `_LB_Q2K_MAX` | 16 | 个别形状超过该列数改走 MMQ（更快但不精确） |
+| `GGML_MMVQ_NC_VERIFY`、`GGML_GDN_DECODE_N_VERIFY`、`GGML_CUDA_FA_DEC_NQ_VERIFY`、`GGML_Q8P_NC_VERIFY` | 关 | 逐列与单 token 路径逐位比较（调试用） |
 | `GGML_SCHED_SYNC_UPLOADS` / `GGML_CUDA_NO_UPLOAD_BATCH` | 关 | 设 1 回到同步上传 / 不合并小上传 |
 | `GGML_CUDA_ATTN_PREP_VERIFY`、`GGML_GDN_DECODE_Q8_SELFTEST`、`GGML_MMVQ_MIX_EMPTY*` 等 | 关 | 调试与标定用 |
 | `CODEX_IQ3_PREPACK` / `CODEX_IQ3_XXS_PREPACK` | 需设 1 | 保留版补丁的开关；所有测量都在 =1 下进行 |
