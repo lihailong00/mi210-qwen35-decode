@@ -5773,6 +5773,7 @@ static int ggml_cuda_try_fuse_gated_norm_f16(ggml_backend_cuda_context * cuda_ct
     if (st->n_valid != 0) {
         ggml_cuda_f16_share_invalidate(st, mm, false);
     }
+    ggml_cuda_mmvq_cache_invalidate(*cuda_ctx, mm, MMVQ_Q8_INV_AHEAD);
     {
         ggml_cuda_f16_share_allow_lookup allow_lookup(cuda_ctx);
         if (!ggml_cuda_compute_forward(*cuda_ctx, mm)) {
@@ -5902,6 +5903,8 @@ static int ggml_cuda_try_fuse_gated_norm(ggml_backend_cuda_context * cuda_ctx, g
     if (overlap(mm, x) || (overlap(gm, x) && gm->data != x->data) || (overlap(gm, z) && gm->data != z->data)) {
         return 0;
     }
+    // run ahead of the group's other nodes (which write nothing before the gated-norm kernel): as a first node
+    ggml_cuda_mmvq_cache_invalidate(*cuda_ctx, mm, MMVQ_Q8_INV_AHEAD);
     if (!ggml_cuda_compute_forward(*cuda_ctx, mm)) {
         GGML_ABORT("%s: z GEMV %s failed", __func__, mm->name);
     }
@@ -5935,12 +5938,16 @@ static int ggml_cuda_try_fuse_bf16_epi(ggml_backend_cuda_context * cuda_ctx, ggm
 static int ggml_cuda_try_fuse_mmvq_multi(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, const int i) {
     const ggml_tensor * node = cgraph->nodes[i];
     const ggml_tensor * src1 = node->src[1];
-    if (src1->type != GGML_TYPE_F32 || src1->ne[1] != 1 || src1->ne[2] != 1 || src1->ne[3] != 1 || !ggml_is_quantized(node->src[0]->type)) {
+    // MMVQ-NC A: also N-column groups (2 <= ne[1] <= nc_max, every output [rows, ne[1]])
+    const int64_t ncols = src1->ne[1];
+    if (src1->type != GGML_TYPE_F32 || ncols < 1 || (ncols > 1 && ncols > ggml_cuda_mmvq_nc_max()) || src1->ne[2] != 1 || src1->ne[3] != 1 ||
+            !ggml_is_quantized(node->src[0]->type)) {
         return 0;
     }
     auto is_gemv = [&](const ggml_tensor * t) {
         return t->op == GGML_OP_MUL_MAT && t->src[1] == src1 && (t->flags & GGML_TENSOR_FLAG_COMPUTE) &&
-               t->type == GGML_TYPE_F32 && ggml_is_contiguous(t) && ggml_nelements(t) == t->src[0]->ne[1] &&
+               t->type == GGML_TYPE_F32 && ggml_is_contiguous(t) &&
+               (ncols == 1 ? ggml_nelements(t) == t->src[0]->ne[1] : (t->ne[0] == t->src[0]->ne[1] && t->ne[1] == ncols)) &&
                t->src[0]->ne[0] == node->src[0]->ne[0];
     };
     if (!is_gemv(node)) {
@@ -6073,7 +6080,14 @@ static int ggml_cuda_try_mix_group(ggml_backend_cuda_context * cuda_ctx, ggml_cg
     if (nx < cgraph->n_nodes) {
         ggml_tensor * t = cgraph->nodes[nx];
         if (t->op == GGML_OP_MUL_MAT && t->src[1] == n0->src[1]) {
-            return 0;
+            // MMVQ-NC mix: with N > 1 activation columns a third mat-mul of another weight type (the linear-attention
+            // beta/alpha projections, BF16, fused away in the single-token graph) does not block the qkv + z pair
+            const ggml_type tt = t->src[0]->type;
+            const bool nc_other = n0->src[1]->ne[1] > 1 && tt != GGML_TYPE_IQ3_S && tt != GGML_TYPE_IQ3_XXS &&
+                tt != GGML_TYPE_IQ4_XS && tt != GGML_TYPE_Q4_K;
+            if (!nc_other) {
+                return 0;
+            }
         }
         // gate/up pair + its SWIGLU node in one launch (the GLU output and its q8_1 come from the pair kernel)
         if (t->op == GGML_OP_GLU && (t->flags & GGML_TENSOR_FLAG_COMPUTE) && t->src[0] && t->src[1] &&
@@ -7238,7 +7252,13 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                 break;
             }
 
-            if (ggml_cuda_should_fuse_mul_mat_vec_q(up)) {
+            // MMVQ-NC S: N-column gate/up, plain (not swapped) SWIGLU only: the NC kernels have no GEGLU / OAI / clamp
+            // epilogue. Only gate / glu_op are set, the GLU node is contiguous F32 and gate/up share src1: the invariant of
+            // ggml_cuda_mmvq_nc_fusion_ok (mmvq.cu), under which an NC slot takes the call (else ggml_cuda_mul_mat_vec_q aborts)
+            const bool nc_glu = ggml_get_glu_op(glu) == GGML_GLU_OP_SWIGLU && ggml_get_op_params_i32(glu, 1) == 0 &&
+                    glu->type == GGML_TYPE_F32 && ggml_is_contiguous(glu) && ids == nullptr && gate->src[1] == src1 &&
+                    ggml_cuda_mmvq_nc_fusion_ok(*cuda_ctx, up, gate->src[0], false);
+            if (ggml_cuda_should_fuse_mul_mat_vec_q(up) || nc_glu) {
                 ggml_cuda_mm_fusion_args_host fusion_data{};
                 fusion_data.gate      = gate->src[0];
                 fusion_data.glu_op    = ggml_get_glu_op(glu);
@@ -7418,7 +7438,14 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
             break;
         }
 
-        if (ggml_cuda_should_fuse_mul_mat_vec_q(mm_node)) {
+        // MMVQ-NC S: N-column residual add. Only x_bias is set and the residual and the ADD output are contiguous F32 of the
+        // MUL_MAT's shape: the invariant of ggml_cuda_mmvq_nc_fusion_ok (mmvq.cu), under which the NC slot whose _ok
+        // predicate made it true takes the call (ggml_cuda_mul_mat_vec_q aborts otherwise).
+        if (ggml_cuda_should_fuse_mul_mat_vec_q(mm_node) ||
+                (bias_op == GGML_OP_ADD && ids == nullptr && bias_tensor->type == GGML_TYPE_F32 && bias_node->type == GGML_TYPE_F32 &&
+                 ggml_is_contiguous(bias_tensor) && ggml_is_contiguous(bias_node) &&
+                 ggml_are_same_shape(bias_tensor, mm_node) && ggml_are_same_shape(bias_node, mm_node) &&
+                 ggml_cuda_mmvq_nc_fusion_ok(*cuda_ctx, mm_node, nullptr, true))) {
             ggml_cuda_mul_mat_vec_q(*cuda_ctx, src0, src1, ids, bias_node, &fusion_data);
             fused_mul_mat_vec = true;
             fused_node_count  = 2;
@@ -7658,6 +7685,8 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 if (f16_share->n_valid != 0) {
                     ggml_cuda_f16_share_invalidate(f16_share, node, false);
                 }
+                // the q8_1 activation cache of the GEMVs (mmvq.cu) follows the same rules
+                ggml_cuda_mmvq_cache_invalidate(*cuda_ctx, node, MMVQ_Q8_INV_NODE);
 
                 f16_share->in_fuse = true;
                 int nodes_to_skip = ggml_cuda_try_fuse(cuda_ctx, cgraph, i);
@@ -7670,6 +7699,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                             ggml_cuda_f16_share_invalidate(f16_share, cgraph->nodes[i + k], true);
                         }
                     }
+                    ggml_cuda_mmvq_cache_invalidate_group(*cuda_ctx, cgraph->nodes + i, nodes_to_skip + 1);
 #ifdef GGML_CUDA_DEBUG
                     const int last_fused = i + nodes_to_skip;
                     GGML_LOG_INFO("nodes_fused: %d, first: %s (%s), last: %s (%s)\n",

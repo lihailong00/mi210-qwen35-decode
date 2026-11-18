@@ -571,6 +571,36 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn_linear(
         return cur;
     }
 
+    // small batches (MTP verification): the qkv and z projections next to each other in the graph (otherwise z is only
+    // placed before its use in the gated norm), so a backend can run the two GEMVs on the same input as one launch
+    // Only for 2..GGML_MMVQ_NC_MAX tokens (never the single-token graph, never a batch the N-column GEMVs do not take,
+    // where the reorder would only split the gated-norm fusion) and only while the N-column GEMVs that run the pair are
+    // on: GGML_MMVQ_NC=0, or turning off one of the families of the pair (GGML_MMVQ_NC_MIX=0: mixed IQ3 + IQ4 pair,
+    // GGML_MMVQ_NC_IQ3=0 / GGML_MMVQ_IQ3=0: IQ3 incl. the same-type multi-job pair) keeps the previous node order exactly.
+    // Same parses as ggml_cuda_mmvq_nc_max() and the per-family switches of the HIP backend (mmvq-iq3.cu).
+    static const int nc_order_max = [] {
+        const char * e = getenv("GGML_MMVQ_NC");
+        while (e && (*e == ' ' || *e == '\t')) {
+            ++e;
+        }
+        if (e && (e[0] == '0' || e[0] == 'f' || e[0] == 'F' || e[0] == 'n' || e[0] == 'N')) {
+            return 0;
+        }
+        for (const char * name : { "GGML_MMVQ_NC_MIX", "GGML_MMVQ_NC_IQ3", "GGML_MMVQ_IQ3" }) {
+            const char * v = getenv(name);
+            if (v && v[0] == '0') {
+                return 0;
+            }
+        }
+        const char * m = getenv("GGML_MMVQ_NC_MAX");
+        const int n = m ? atoi(m) : 4;
+        return n < 2 ? 2 : (n > 6 ? 6 : n);
+    }();
+    if (ubatch.n_tokens >= 2 && (int) ubatch.n_tokens <= nc_order_max) {
+        ggml_build_forward_expand(gf, qkv_mixed);
+        ggml_build_forward_expand(gf, z);
+    }
+
     ggml_tensor * beta = build_lora_mm(model.layers[il].ssm_beta, cur, model.layers[il].ssm_beta_s);
     beta = ggml_reshape_4d(ctx0, beta, 1, num_v_heads, n_seq_tokens, n_seqs);
     cb(beta, "beta", il);

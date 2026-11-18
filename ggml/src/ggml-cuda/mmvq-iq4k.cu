@@ -11,8 +11,13 @@
 
 #if defined(GGML_USE_HIP)
 #include "iq4k-gemv.cuh"
+#include "iq4k-gemv-nc.cuh"   // MMVQ-NC B
+#include "mmvq.cuh"            // MMVQ-NC B
+#include <string>                 // MMVQ-NC B
+#include <vector>                 // MMVQ-NC B
 #include <cstdlib>
 #include <mutex>
+#include <atomic>
 #include <map>
 
 static bool iq4k_enabled() {
@@ -279,7 +284,256 @@ bool ggml_cuda_mmvq_iq4k(ggml_backend_cuda_context & ctx, const ggml_tensor * sr
     CUDA_CHECK(cudaGetLastError());
     return true;
 }
+
+// MMVQ-NC B begin ------------------------------------------------------------------------------------------------------
+// N-column (ne11 = 2..GGML_MMVQ_NC_MAX) IQ4_XS / Q4_K GEMVs (iq4k-gemv-nc.cuh): column j is bit-identical to the
+// single-token path on column j alone. Rows >= 2048: the iq4k SoA kernel on the same copy (plain, residual, same-type
+// SwiGLU gate/up); rows < 2048: the stock-structure small-N kernel (= gemv_sn / mul_mat_vec_q ncols_dst = 1).
+// GGML_MMVQ_NC_IQ4K=0 (or GGML_MMVQ_NC=0 / GGML_MMVQ_IQ4K=0) disables. GGML_MMVQ_NC_VERIFY=n: the first n NC launches are
+// recomputed column by column on the single-token path and compared bitwise (eager execution only).
+static bool iq4k_nc_enabled() {
+    static const bool enabled = [] {
+        const char * v = getenv("GGML_MMVQ_NC_IQ4K");
+        return iq4k_enabled() && ggml_cuda_mmvq_nc_enabled() && (v == nullptr || v[0] != '0');
+    }();
+    return enabled;
+}
+static std::atomic<int> & iq4k_nc_verify_left() {
+    static std::atomic<int> left{iq4k_env_int("GGML_MMVQ_NC_VERIFY", 0)};
+    return left;
+}
+
+// copy cache kind of the single-token launcher for cfg c (see ggml_cuda_mmvq_iq4k)
+static int iq4k_nc_kind(ggml_type type, const iq4k::cfg & c) {
+    const int il = (64/c.L)*c.R;
+    return c.rt ? 0x10000 + 0x100*(int) type + 0x10*(c.L/16) + (c.grid*c.NW)*0x40000 : 0x200 + 16*(int) type + il;
+}
+
+// rows < 2048 run on the small-N kernel, which has the structure of stock mul_mat_vec_q<type, 1> WITHOUT its small_k
+// variant; stock uses small_k for Q4_K at ncols_dst = 1 on GCN/CDNA when K/QK_K < nwarps*vdr*64/qi = 2*2*64/32 = 8
+// (IQ4_XS never: it is in the iq_slow list there), so such Q4_K shapes are left to the old path (MMVQ-NC fix)
+static bool iq4k_nc_sn_ok(const ggml_tensor * w) {
+    return w->ne[1] >= 2048 || w->type != GGML_TYPE_Q4_K || w->ne[0]/QK_K >= 8;
+}
+static bool iq4k_nc_weight_ok(const ggml_tensor * w) {
+    return (w->type == GGML_TYPE_IQ4_XS || w->type == GGML_TYPE_Q4_K) && w->ne[0] % QK_K == 0 && w->ne[0] <= 32768 &&
+        iq4k_nc_sn_ok(w) &&
+        ggml_is_matrix(w) && ggml_is_contiguous(w) && w->buffer &&
+        GGML_CUDA_CC_IS_CDNA2(ggml_cuda_info().devices[ggml_cuda_get_device()].cc);
+}
+
+// the single-token configuration of w (gate: the SwiGLU launcher) and the NC plan; false if no NC kernel applies
+static bool iq4k_nc_plan(const ggml_tensor * w, bool glu, int ncols, iq4k::cfg & c, iq4k::ncplan & p) {
+    const ggml_type type = w->type;
+    const int K = (int) w->ne[0], N = (int) w->ne[1];
+    const int ncu = iq4k_ncu();
+    c = glu ? iq4k::pick_cfg_glu(type, N, K, ncu) : iq4k_pick_cfg(type, N, K, ncu);
+    if (!iq4k::nc_cfg_ok(c, type, K, N) || !iq4k::nc_plan(type, c, K, N, ncols, p) || !iq4k::nc_mu_ok(p.mu)) {
+        return false;
+    }
+    // launch bounds of the NC kernel (iq4k::nc_lb): Q4_K SwiGLU with at most 12 waves per workgroup
+    if (c.NW*64 > (glu && type == GGML_TYPE_Q4_K ? 768 : 1024)) {
+        return false;
+    }
+    return !glu || p.mu == 0;
+}
+
+bool ggml_cuda_mmvq_iq4k_nc_route(int64_t ne11) {
+    return iq4k_nc_enabled() && ne11 >= 2 && ne11 <= ggml_cuda_mmvq_nc_max() && ne11 <= iq4k::NC_MAX_INST;
+}
+
+bool ggml_cuda_mmvq_iq4k_nc_ok(const ggml_tensor * w, const ggml_tensor * gate_w, bool residual, int ncols, bool capturing) {
+    if (!iq4k_nc_enabled() || ncols < 2 || ncols > ggml_cuda_mmvq_nc_max() || ncols > iq4k::NC_MAX_INST || !iq4k_nc_weight_ok(w)) {
+        return false;
+    }
+    if (w->ne[1] < 2048) {   // small-N kernel: no epilogue (the single-token path of these shapes is stock mmvq)
+        return !gate_w && !residual;
+    }
+    if (residual && gate_w) {
+        return false;
+    }
+    if (gate_w && (gate_w->type != w->type || !ggml_are_same_shape(gate_w, w) || !ggml_is_contiguous(gate_w))) {
+        return false;
+    }
+    iq4k::cfg c; iq4k::ncplan p;
+    if (!iq4k_nc_plan(w, gate_w != nullptr, ncols, c, p)) {
+        return false;
+    }
+    // the copies cannot be made during graph capture: a fusion is only promised for tensors whose copy exists (the
+    // unfused N-column call creates it in the eager warmup run). Verify mode outside capture: the launcher creates it.
+    if (iq4k_nc_verify_left().load() > 0 && !capturing) {
+        // (only weights the copy can be made for later: a WEIGHTS buffer, not a view; else the promise could not be kept)
+        const auto weights = [](const ggml_tensor * t) {
+            return t->buffer && !t->view_src && ggml_backend_buffer_get_usage(t->buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS;
+        };
+        return weights(w) && (!gate_w || weights(gate_w));
+    }
+    const int kind = iq4k_nc_kind(w->type, c);
+    return ggml_cuda_has_repacked(w, kind) && (!gate_w || ggml_cuda_has_repacked(gate_w, kind));
+}
+
+bool ggml_cuda_mmvq_iq4k_nc(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const block_q8_1 * y, int ncols, ggml_tensor * dst,
+        const ggml_cuda_mm_fusion_args_host * fusion) {
+    if (!iq4k_nc_enabled() || ncols < 2 || ncols > ggml_cuda_mmvq_nc_max() || ncols > iq4k::NC_MAX_INST || !iq4k_nc_weight_ok(src0)) {
+        return false;
+    }
+    if (dst->type != GGML_TYPE_F32 || !ggml_is_contiguous(dst) || dst->ne[0] != src0->ne[1] || dst->ne[1] != ncols ||
+            dst->ne[2] != 1 || dst->ne[3] != 1) {
+        return false;
+    }
+    const ggml_type type = src0->type;
+    const int K = (int) src0->ne[0], N = (int) src0->ne[1];
+    const int ys = (int) (GGML_PAD(K, MATRIX_ROW_PADDING)/QK8_1);   // q8_1 blocks per column (cache and pool layouts)
+    const ggml_tensor * gate = nullptr;
+    const ggml_tensor * res  = nullptr;
+    if (fusion) {
+        if (fusion->gate_bias || fusion->x_scale || fusion->gate_scale || fusion->shared_up) {
+            return false;
+        }
+        if (fusion->gate) {
+            if (fusion->glu_op != GGML_GLU_OP_SWIGLU || fusion->x_bias || fusion->gate->type != type ||
+                    !ggml_are_same_shape(fusion->gate, src0) || !ggml_is_contiguous(fusion->gate)) {
+                return false;
+            }
+            gate = fusion->gate;
+        }
+        if (fusion->x_bias) {
+            if (fusion->x_bias->type != GGML_TYPE_F32 || !ggml_are_same_shape(fusion->x_bias, dst) || !ggml_is_contiguous(fusion->x_bias)) {
+                return false;
+            }
+            res = fusion->x_bias;
+        }
+    }
+    const int device = ggml_cuda_get_device();
+    cudaStream_t stream = ctx.stream();
+    float * dst_d = (float *) dst->data;
+    const int dstr = (int) (dst->nb[1]/sizeof(float));
+    if (N < 2048) {
+        if (gate || res) {
+            return false;
+        }
+        if (!iq4k::launch_sn_nc(type, ncols, src0->data, y, ys, dst_d, dstr, K, N, stream)) {
+            return false;
+        }
+        CUDA_CHECK(cudaGetLastError());
+        return true;
+    }
+    iq4k::cfg c; iq4k::ncplan p;
+    if (!iq4k_nc_plan(src0, gate != nullptr, ncols, c, p)) {
+        return false;
+    }
+    const int kind = iq4k_nc_kind(type, c);
+    ggml_cuda_repack_fn fn = gate ? iq4k_repack_glu : iq4k_repack_single;
+    const void * up_soa = ggml_cuda_get_repacked(src0, device, stream, kind, ggml_nbytes(src0), fn);
+    const void * gate_soa = gate ? ggml_cuda_get_repacked(gate, device, stream, kind, ggml_nbytes(gate), fn) : nullptr;
+    if (!up_soa || (gate && !gate_soa)) {
+        return false;
+    }
+    const size_t nb = (size_t) N*(K/QK_K);
+    const iq4k::soa s  = iq4k::soa_make(type, up_soa, nb);
+    const iq4k::soa sg = gate ? iq4k::soa_make(type, gate_soa, nb) : s;
+    const float * res_d = res ? (const float *) res->data : nullptr;
+    const int rstr = res ? (int) (res->nb[1]/sizeof(float)) : 0;
+    bool ok;
+    if (type == GGML_TYPE_IQ4_XS) {
+        ok = gate ? iq4k::launch_nc<iq4k::iq4xs_t, true >(c, p, ncols, s, sg, y, ys, dst_d, dstr, nullptr, 0, K, N, stream) :
+                    iq4k::launch_nc<iq4k::iq4xs_t, false>(c, p, ncols, s, sg, y, ys, dst_d, dstr, res_d, rstr, K, N, stream);
+    } else {
+        ok = gate ? iq4k::launch_nc<iq4k::q4k_t, true >(c, p, ncols, s, sg, y, ys, dst_d, dstr, nullptr, 0, K, N, stream) :
+                    iq4k::launch_nc<iq4k::q4k_t, false>(c, p, ncols, s, sg, y, ys, dst_d, dstr, res_d, rstr, K, N, stream);
+    }
+    if (!ok) {
+        return false;
+    }
+    CUDA_CHECK(cudaGetLastError());
+    return true;
+}
+
+// ggml_cuda_mmvq_iq4k_nc + GGML_MMVQ_NC_VERIFY: the first n launches are recomputed column by column with the
+// single-token path (ggml_cuda_mul_mat_vec_q on one-column views; the residual is snapshotted first since the ADD may be
+// in place) and compared bitwise. Eager execution only (no check during graph capture).
+bool ggml_cuda_mmvq_iq4k_nc_checked(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1,
+        const block_q8_1 * y, int ncols, ggml_tensor * dst, const ggml_cuda_mm_fusion_args_host * fusion) {
+    std::atomic<int> & left = iq4k_nc_verify_left();
+    cudaStream_t stream = ctx.stream();
+    bool verify = left.load() > 0;
+    if (verify) {
+        hipStreamCaptureStatus status;
+        CUDA_CHECK(hipStreamIsCapturing(stream, &status));
+        verify = status == hipStreamCaptureStatusNone;
+    }
+    const ggml_tensor * xb = fusion ? fusion->x_bias : nullptr;
+    ggml_cuda_pool_alloc<char> snap(ctx.pool());
+    if (verify && xb) {
+        snap.alloc(ggml_nbytes(xb));
+        CUDA_CHECK(cudaMemcpyAsync(snap.get(), xb->data, ggml_nbytes(xb), cudaMemcpyDeviceToDevice, stream));
+    }
+    if (!ggml_cuda_mmvq_iq4k_nc(ctx, src0, y, ncols, dst, fusion)) {
+        return false;
+    }
+    if (!verify) {
+        return true;
+    }
+    --left;
+    const int64_t nrows = dst->ne[0];
+    ggml_cuda_pool_alloc<float> ref(ctx.pool(), nrows);
+    std::vector<float> a(nrows), b(nrows);
+    int64_t bad = 0, first = -1;
+    for (int64_t j = 0; j < ncols; ++j) {
+        ggml_tensor x1 = *src1;
+        x1.ne[1] = 1; x1.nb[2] = x1.nb[1]; x1.nb[3] = x1.nb[1];
+        x1.data = (char *) src1->data + j*src1->nb[1];
+        x1.view_src = nullptr; x1.view_offs = 0;
+        ggml_tensor d1 = *dst;
+        d1.ne[1] = 1; d1.nb[2] = d1.nb[1]; d1.nb[3] = d1.nb[1];
+        d1.data = ref.get();
+        d1.view_src = nullptr; d1.view_offs = 0;
+        ggml_tensor r1;
+        ggml_cuda_mm_fusion_args_host f1{};
+        if (fusion) {
+            f1 = *fusion;
+            if (xb) {
+                r1 = *xb;
+                r1.ne[1] = 1; r1.nb[2] = r1.nb[1]; r1.nb[3] = r1.nb[1];
+                r1.data = snap.get() + j*xb->nb[1];
+                r1.view_src = nullptr; r1.view_offs = 0;
+                f1.x_bias = &r1;
+            }
+        }
+        ggml_cuda_mul_mat_vec_q(ctx, src0, &x1, nullptr, &d1, fusion ? &f1 : nullptr);
+        CUDA_CHECK(cudaMemcpyAsync(a.data(), ref.get(), nrows*sizeof(float), cudaMemcpyDeviceToHost, stream));
+        CUDA_CHECK(cudaMemcpyAsync(b.data(), (const char *) dst->data + j*dst->nb[1], nrows*sizeof(float), cudaMemcpyDeviceToHost, stream));
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+        for (int64_t r = 0; r < nrows; ++r) {
+            if (memcmp(&a[r], &b[r], sizeof(float)) != 0) {
+                if (first < 0) {
+                    first = j*nrows + r;
+                }
+                ++bad;
+            }
+        }
+    }
+    const std::string where = bad ? " (first at col " + std::to_string(first/nrows) + " row " + std::to_string(first%nrows) + ")" : "";
+    fprintf(stderr, "MMVQ-NC verify iq4k %s %s [%lld x %lld] n=%d %s: %lld mismatches%s\n", ggml_type_name(src0->type), dst->name,
+        (long long) src0->ne[0], (long long) src0->ne[1], ncols,
+        fusion ? (fusion->gate ? "glu" : xb ? "residual" : "fused") : "plain", (long long) bad, where.c_str());
+    return true;
+}
+// MMVQ-NC B end --------------------------------------------------------------------------------------------------------
 #else
+// MMVQ-NC B
+bool ggml_cuda_mmvq_iq4k_nc_route(int64_t) {
+    return false;
+}
+bool ggml_cuda_mmvq_iq4k_nc_ok(const ggml_tensor *, const ggml_tensor *, bool, int, bool) {
+    return false;
+}
+bool ggml_cuda_mmvq_iq4k_nc(ggml_backend_cuda_context &, const ggml_tensor *, const block_q8_1 *, int, ggml_tensor *, const ggml_cuda_mm_fusion_args_host *) {
+    return false;
+}
+bool ggml_cuda_mmvq_iq4k_nc_checked(ggml_backend_cuda_context &, const ggml_tensor *, const ggml_tensor *, const block_q8_1 *, int, ggml_tensor *, const ggml_cuda_mm_fusion_args_host *) {
+    return false;
+}
 const void * ggml_cuda_mmvq_iq4k_soa_il4(const ggml_tensor *, int, cudaStream_t) {
     return nullptr;
 }

@@ -17,9 +17,13 @@
 #include "iq3gemv.cuh"
 #include "mixgemv.cuh"
 #include <map>
+#include <tuple>
+#include <vector>
 #include <mutex>
 #include <cstdlib>
 #include <climits>
+#include <atomic>          // MMVQ-NC mix (verify counter)
+#include "mmvq-iq3-nc.cuh" // MMVQ-NC A
 
 static constexpr int IQ3G_RG = 4;   // row interleave of the repacked copies (= rows per wave of every config below)
 
@@ -309,6 +313,15 @@ static int mixg_mode() {
 static bool mixg_is_iq3(const ggml_type t) { return t == GGML_TYPE_IQ3_S  || t == GGML_TYPE_IQ3_XXS; }
 static bool mixg_is_iq4(const ggml_type t) { return t == GGML_TYPE_IQ4_XS || t == GGML_TYPE_Q4_K; }
 
+// MMVQ-NC mix begin: switches of the N-column pair kernel (activation with 2..NC_MAX columns)
+// GGML_MMVQ_NC=0 / GGML_MMVQ_NC_MIX=0: off (N > 1 as before); GGML_MMVQ_NC_MAX: largest N (default 4, 2..6)
+// (the master switch and the column limit are the shared ones of mmvq.cu)
+static int mixg_nc_max() {
+    static const bool on = iq3g_env_on("GGML_MMVQ_NC_MIX");
+    return on ? std::max(1, ggml_cuda_mmvq_nc_max()) : 1;
+}
+// MMVQ-NC mix end
+
 bool ggml_cuda_mmvq_mix_member(const ggml_tensor * mm) {
     if (mixg_mode() == 0 || !iq3g_enabled() || mm->op != GGML_OP_MUL_MAT) {
         return false;
@@ -316,9 +329,11 @@ bool ggml_cuda_mmvq_mix_member(const ggml_tensor * mm) {
     const ggml_tensor * w = mm->src[0];
     const ggml_tensor * x = mm->src[1];
     const bool i3 = mixg_is_iq3(w->type), i4 = mixg_is_iq4(w->type);
+    const int64_t nc = x->ne[1];   // MMVQ-NC mix: 1, or 2..NC_MAX columns
     if ((!i3 && !i4) || x->type != GGML_TYPE_F32 || mm->type != GGML_TYPE_F32 || !ggml_is_contiguous(x) ||
-            x->ne[1] != 1 || x->ne[2] != 1 || x->ne[3] != 1 || x->ne[0] != w->ne[0] || !ggml_is_contiguous(mm) ||
-            ggml_nelements(mm) != w->ne[1]) {
+            nc < 1 || (nc > 1 && nc > mixg_nc_max()) ||
+            x->ne[2] != 1 || x->ne[3] != 1 || x->ne[0] != w->ne[0] || !ggml_is_contiguous(mm) ||
+            ggml_nelements(mm) != w->ne[1]*nc || mm->ne[0] != w->ne[1]) {
         return false;
     }
     const int64_t K = w->ne[0], N = w->ne[1];
@@ -408,6 +423,182 @@ static bool mixg_glu_enabled() {
     return enabled;
 }
 
+// MMVQ-NC mix begin: the pair on an activation of nc = 2..NC_MAX columns (mixgemv.cuh gemv_pair_nc), every column
+// bit-identical to the single-column pair launch on that column. Only the default "flowing" modes (GGML_MMVQ_MIX=1/2).
+template <class T3, class T4, int NC>
+static void mixg_launch_nc(const bool first3, const uint8_t * w3, float * d3, const int N3, const iq4k::soa & s4, float * d4,
+        const int N4, const block_q8_1 * y, const int K, const int ncu, hipStream_t stream) {
+    const size_t lds = mixg::lds_bytes_nc<T3, T4>(K, NC);
+    const int rot = (first3 ? N3/mixg::RG : N4/mixg::RG) % (ncu*mixg::NW);
+    if (first3) {
+        mixg::gemv_pair_nc<T3, T4, IQ3G_SM, true,  NC><<<ncu, dim3(64, mixg::NW), lds, stream>>>(w3, d3, N3, N3, s4, d4, N4, N4, y, K, rot);
+    } else {
+        mixg::gemv_pair_nc<T3, T4, IQ3G_SM, false, NC><<<ncu, dim3(64, mixg::NW), lds, stream>>>(w3, d3, N3, N3, s4, d4, N4, N4, y, K, rot);
+    }
+}
+template <class T3, class T4>
+static bool mixg_launch_nc_n(const int nc, const bool first3, const uint8_t * w3, float * d3, const int N3, const iq4k::soa & s4,
+        float * d4, const int N4, const block_q8_1 * y, const int K, const int ncu, hipStream_t stream) {
+    if (mixg::lds_bytes_nc<T3, T4>(K, nc) > 65536 || nc*(K/32) > 64*1024) {
+        return false;
+    }
+    switch (nc) {
+        case 2: mixg_launch_nc<T3, T4, 2>(first3, w3, d3, N3, s4, d4, N4, y, K, ncu, stream); return true;
+        case 3: mixg_launch_nc<T3, T4, 3>(first3, w3, d3, N3, s4, d4, N4, y, K, ncu, stream); return true;
+        case 4: mixg_launch_nc<T3, T4, 4>(first3, w3, d3, N3, s4, d4, N4, y, K, ncu, stream); return true;
+        case 5: mixg_launch_nc<T3, T4, 5>(first3, w3, d3, N3, s4, d4, N4, y, K, ncu, stream); return true;
+        case 6: mixg_launch_nc<T3, T4, 6>(first3, w3, d3, N3, s4, d4, N4, y, K, ncu, stream); return true;
+        default: return false;
+    }
+}
+static bool mixg_lds_nc_ok(const ggml_type t3, const ggml_type t4, const int K, const int nc) {
+    using namespace iq3g;
+    const size_t lds = t3 == GGML_TYPE_IQ3_S ? (t4 == GGML_TYPE_IQ4_XS ? mixg::lds_bytes_nc<iq3s_t,   iq4k::iq4xs_t>(K, nc) : mixg::lds_bytes_nc<iq3s_t,   iq4k::q4k_t>(K, nc))
+                                             : (t4 == GGML_TYPE_IQ4_XS ? mixg::lds_bytes_nc<iq3xxs_t, iq4k::iq4xs_t>(K, nc) : mixg::lds_bytes_nc<iq3xxs_t, iq4k::q4k_t>(K, nc));
+    return lds <= 65536;
+}
+static bool mixg_nc_dispatch(const int nc, const bool first3, const ggml_type t3, const ggml_type t4, const uint8_t * w3, float * d3,
+        const int N3, const iq4k::soa & s4, float * d4, const int N4, const block_q8_1 * y, const int K, const int ncu, hipStream_t stream) {
+    using namespace iq3g;
+    const bool s3 = t3 == GGML_TYPE_IQ3_S, x4 = t4 == GGML_TYPE_IQ4_XS;
+    if (s3 && x4) return mixg_launch_nc_n<iq3s_t,   iq4k::iq4xs_t>(nc, first3, w3, d3, N3, s4, d4, N4, y, K, ncu, stream);
+    if (s3)       return mixg_launch_nc_n<iq3s_t,   iq4k::q4k_t  >(nc, first3, w3, d3, N3, s4, d4, N4, y, K, ncu, stream);
+    if (x4)       return mixg_launch_nc_n<iq3xxs_t, iq4k::iq4xs_t>(nc, first3, w3, d3, N3, s4, d4, N4, y, K, ncu, stream);
+    return mixg_launch_nc_n<iq3xxs_t, iq4k::q4k_t>(nc, first3, w3, d3, N3, s4, d4, N4, y, K, ncu, stream);
+}
+// N=1 pair launch (the single-token path, flowing mode) on q8 column y1 into d3 / d4
+static void mixg_launch_1(const bool first3, const ggml_type t3, const ggml_type t4, const uint8_t * w3, float * d3, const int N3,
+        const iq4k::soa & s4, float * d4, const int N4, const block_q8_1 * y1, const int K, const int ncu, hipStream_t stream) {
+    using namespace iq3g;
+    const mixg::glu_args ga{};
+    const bool s3 = t3 == GGML_TYPE_IQ3_S, x4 = t4 == GGML_TYPE_IQ4_XS;
+    if (s3 && x4)       mixg_launch<iq3s_t,   iq4k::iq4xs_t>(first3, 0, w3, d3, N3, s4, d4, N4, y1, K, ncu, stream, ga);
+    else if (s3)        mixg_launch<iq3s_t,   iq4k::q4k_t  >(first3, 0, w3, d3, N3, s4, d4, N4, y1, K, ncu, stream, ga);
+    else if (x4)        mixg_launch<iq3xxs_t, iq4k::iq4xs_t>(first3, 0, w3, d3, N3, s4, d4, N4, y1, K, ncu, stream, ga);
+    else                mixg_launch<iq3xxs_t, iq4k::q4k_t  >(first3, 0, w3, d3, N3, s4, d4, N4, y1, K, ncu, stream, ga);
+}
+static bool mixg_nc(ggml_backend_cuda_context & ctx, ggml_tensor * m3, ggml_tensor * m4) {
+    const ggml_tensor * w3 = m3->src[0];
+    const ggml_tensor * w4 = m4->src[0];
+    const ggml_tensor * x  = m3->src[1];
+    const int nc = (int) x->ne[1];
+    const int K  = (int) w3->ne[0];
+    const int N3 = (int) w3->ne[1], N4 = (int) w4->ne[1];
+    const int mode = mixg_mode();
+    if (nc < 2 || nc > mixg_nc_max() || (mode != 1 && mode != 2) || mixg_na(w3, w4) != 0 ||
+            !mixg_lds_nc_ok(w3->type, w4->type, K, nc)) {
+        return false;
+    }
+    const int device = ggml_cuda_get_device();
+    hipStream_t stream = ctx.stream();
+    const int ncu = ggml_cuda_info().devices[device].nsm;
+    const uint8_t * soa3 = iq3g_get_soa(w3, device, stream);                 // nullptr during graph capture if not created yet
+    const void    * soa4 = ggml_cuda_mmvq_iq4k_soa_il4(w4, device, stream);
+    if (!soa3 || !soa4) {
+        return false;
+    }
+    const block_q8_1 * q8 = nullptr;
+    const int * sums = nullptr;
+    if (!ggml_cuda_mmvq_q8_cached_nc(ctx, x, &q8, &sums)) {
+        return false;
+    }
+    const iq4k::soa s4 = iq4k::soa_make(w4->type, soa4, (size_t) N4*(K/QK_K));
+    const bool first3 = mode != 2;
+    float * d3 = (float *) m3->data;
+    float * d4 = (float *) m4->data;
+    if (!mixg_nc_dispatch(nc, first3, w3->type, w4->type, soa3, d3, N3, s4, d4, N4, q8, K, ncu, stream)) {
+        return false;   // (not reached: the LDS check above is the only failure)
+    }
+    CUDA_CHECK(cudaGetLastError());
+    // GGML_MMVQ_NC_VERIFY=n: for the first n launches outside graph capture, run the single-column pair on every column
+    // and compare bitwise (debug)
+    static std::atomic<int> verify_left{[] { const char * v = getenv("GGML_MMVQ_NC_VERIFY"); return v ? atoi(v) : 0; }()};
+    if (verify_left.load() > 0) {
+        hipStreamCaptureStatus status;
+        CUDA_CHECK(hipStreamIsCapturing(stream, &status));
+        if (status == hipStreamCaptureStatusNone && verify_left.fetch_sub(1) > 0) {
+            ggml_cuda_pool_alloc<float> ref(ctx.pool(), (size_t) (N3 + N4)*nc);
+            for (int col = 0; col < nc; ++col) {
+                mixg_launch_1(first3, w3->type, w4->type, soa3, ref.get() + (size_t) col*N3, N3, s4,
+                        ref.get() + (size_t) nc*N3 + (size_t) col*N4, N4, q8 + (size_t) col*(K/QK8_1), K, ncu, stream);
+            }
+            std::vector<uint32_t> a((size_t) (N3 + N4)*nc), b((size_t) (N3 + N4)*nc);
+            CUDA_CHECK(cudaMemcpyAsync(a.data(), d3, (size_t) N3*nc*4, cudaMemcpyDeviceToHost, stream));
+            CUDA_CHECK(cudaMemcpyAsync(a.data() + (size_t) N3*nc, d4, (size_t) N4*nc*4, cudaMemcpyDeviceToHost, stream));
+            CUDA_CHECK(cudaMemcpyAsync(b.data(), ref.get(), (size_t) (N3 + N4)*nc*4, cudaMemcpyDeviceToHost, stream));
+            CUDA_CHECK(cudaStreamSynchronize(stream));
+            size_t bad = 0, bad3 = 0, badc[8] = {0};
+            double maxrel = 0.0;
+            for (size_t i = 0; i < a.size(); ++i) {
+                if (a[i] != b[i]) {
+                    bad++;
+                    const bool p3 = i < (size_t) N3*nc;
+                    bad3 += p3;
+                    const size_t col = p3 ? i / N3 : (i - (size_t) N3*nc) / N4;
+                    badc[col & 7]++;
+                    float fa, fb; memcpy(&fa, &a[i], 4); memcpy(&fb, &b[i], 4);
+                    maxrel = std::max(maxrel, (double) fabsf(fa - fb)/(fabsf(fb) + 1e-30));
+                    if (bad <= 4) {
+                        fprintf(stderr, "  mismatch %s col %zu row %zu: nc %.9g (0x%08x) ref %.9g (0x%08x)\n", p3 ? "iq3" : "iq4", col,
+                                p3 ? i % N3 : (i - (size_t) N3*nc) % N4, fa, a[i], fb, b[i]);
+                    }
+                }
+            }
+            fprintf(stderr, "[MMVQ_NC_VERIFY mix] %s(%d) + %s(%d) K=%d nc=%d first3=%d: %zu / %zu mismatches (iq3 part %zu; per column %zu %zu %zu %zu %zu %zu; max rel %.3g)\n",
+                    ggml_type_name(w3->type), N3, ggml_type_name(w4->type), N4, K, nc, (int) first3, bad, a.size(), bad3,
+                    badc[0], badc[1], badc[2], badc[3], badc[4], badc[5], maxrel);
+        }
+    }
+    // GGML_MMVQ_NC_BENCH=r (debug): outside graph capture, time r back-to-back launches of this pair at nc columns and
+    // of the single-column pair (per launch, us) once per distinct pair shape
+    static int bench_reps = [] { const char * v = getenv("GGML_MMVQ_NC_BENCH"); return v ? atoi(v) : 0; }();
+    if (bench_reps > 0) {
+        static std::map<std::tuple<int, int, int, int, int>, bool> seen;
+        const auto key = std::make_tuple((int) w3->type, (int) w4->type, N3, N4, nc);
+        hipStreamCaptureStatus status;
+        CUDA_CHECK(hipStreamIsCapturing(stream, &status));
+        if (status == hipStreamCaptureStatusNone && !seen[key]) {
+            seen[key] = true;
+            hipEvent_t e0, e1, e2;
+            CUDA_CHECK(hipEventCreate(&e0)); CUDA_CHECK(hipEventCreate(&e1)); CUDA_CHECK(hipEventCreate(&e2));
+            ggml_cuda_pool_alloc<float> scr(ctx.pool(), (size_t) (N3 + N4));
+            // (n3, n4) = (N3, N4): the pair; (N3, 0): IQ3 job only; (0, N4): IQ4 job only (same kernels, the other job empty)
+            auto timeit = [&](const int n3, const int n4, float & t_nc, float & t_1) {
+                for (int i = 0; i < 3; ++i) {
+                    mixg_nc_dispatch(nc, first3, w3->type, w4->type, soa3, d3, n3, s4, d4, n4, q8, K, ncu, stream);
+                }
+                CUDA_CHECK(hipEventRecord(e0, stream));
+                for (int i = 0; i < bench_reps; ++i) {
+                    mixg_nc_dispatch(nc, first3, w3->type, w4->type, soa3, d3, n3, s4, d4, n4, q8, K, ncu, stream);
+                }
+                CUDA_CHECK(hipEventRecord(e1, stream));
+                for (int i = 0; i < bench_reps; ++i) {
+                    mixg_launch_1(first3, w3->type, w4->type, soa3, scr.get(), n3, s4, scr.get() + N3, n4, q8, K, ncu, stream);
+                }
+                CUDA_CHECK(hipEventRecord(e2, stream));
+                CUDA_CHECK(hipEventSynchronize(e2));
+                CUDA_CHECK(hipEventElapsedTime(&t_nc, e0, e1));
+                CUDA_CHECK(hipEventElapsedTime(&t_1, e1, e2));
+                t_nc *= 1e3f/bench_reps; t_1 *= 1e3f/bench_reps;
+            };
+            float a_nc, a_1, b_nc, b_1, c_nc, c_1;
+            timeit(N3, N4, a_nc, a_1);
+            timeit(N3, 0, b_nc, b_1);
+            timeit(0, N4, c_nc, c_1);
+            mixg_nc_dispatch(nc, first3, w3->type, w4->type, soa3, d3, N3, s4, d4, N4, q8, K, ncu, stream);   // restore the outputs
+            const double bytes = (double) N3*(K/QK_K)*(w3->type == GGML_TYPE_IQ3_S ? 112.0 : 98.0) +
+                                 (double) N4*(K/QK_K)*(w4->type == GGML_TYPE_IQ4_XS ? 136.0 : 144.0);
+            fprintf(stderr, "[MMVQ_NC_BENCH mix] %s(%d) + %s(%d) K=%d nc=%d: %.2f us (N=1 pair %.2f, ratio %.2f, floor %.2f at 1.40 TB/s)"
+                    " | iq3 only %.2f vs %.2f (%.2f) | iq4 only %.2f vs %.2f (%.2f)\n",
+                    ggml_type_name(w3->type), N3, ggml_type_name(w4->type), N4, K, nc, a_nc, a_1, a_nc/a_1, bytes/1.40e6,
+                    b_nc, b_1, b_nc/b_1, c_nc, c_1, c_nc/c_1);
+            CUDA_CHECK(hipEventDestroy(e0)); CUDA_CHECK(hipEventDestroy(e1)); CUDA_CHECK(hipEventDestroy(e2));
+        }
+    }
+    return true;
+}
+// MMVQ-NC mix end
+
 bool ggml_cuda_mmvq_mix(ggml_backend_cuda_context & ctx, ggml_tensor * const * mm, const int n, ggml_tensor * glu) {
     if (n != 2 || !ggml_cuda_mmvq_mix_member(mm[0]) || !ggml_cuda_mmvq_mix_member(mm[1]) || mm[0]->src[1] != mm[1]->src[1]) {
         return false;
@@ -429,6 +620,9 @@ bool ggml_cuda_mmvq_mix(ggml_backend_cuda_context & ctx, ggml_tensor * const * m
     static const int cls = [] { const char * v = getenv("GGML_MMVQ_MIX_CLASS"); return v ? atoi(v) : 3; }();
     if (!(cls & (N3 == N4 ? 2 : 1))) {
         return false;
+    }
+    if (m3->src[1]->ne[1] > 1) {   // MMVQ-NC mix
+        return glu == nullptr && mixg_nc(ctx, m3, m4);
     }
     const int device = ggml_cuda_get_device();
     hipStream_t stream = ctx.stream();
@@ -516,6 +710,276 @@ bool ggml_cuda_mmvq_mix(ggml_backend_cuda_context & ctx, ggml_tensor * const * m
     CUDA_CHECK(cudaGetLastError());
     return true;
 }
+
+// ------------------------------------------------------------------------------------------------ MMVQ-NC A
+// N-column (2 <= ncols <= ggml_cuda_mmvq_nc_max()) IQ3 GEMVs for multi-token verification (iq3gemv-nc.cuh): per column
+// bit-identical to the single-token launchers above (ggml_cuda_mmvq_iq3 / _multi on that column alone), same SoA copies.
+// GGML_MMVQ_NC_IQ3=0 (or GGML_MMVQ_NC=0, GGML_MMVQ_IQ3=0) disables; GGML_MMVQ_IQ3_MULTI=0 also disables the multi-job form.
+// GGML_MMVQ_NC_VERIFY=n: the first n launches also run the single-token launcher on every column into scratch (before
+// the N-column launch, so in-place residuals are read unmodified) and print the number of bitwise mismatches.
+static bool iq3nc_enabled() {
+    static const bool enabled = iq3g_env_on("GGML_MMVQ_NC_IQ3");
+    return enabled && iq3g_enabled() && ggml_cuda_mmvq_nc_max() >= IQ3NC_MIN;
+}
+static bool iq3nc_ncols_ok(const int ncols) {
+    return ncols >= IQ3NC_MIN && ncols <= IQ3NC_MAX && ncols <= ggml_cuda_mmvq_nc_max();
+}
+static bool iq3nc_verify_take() {
+    static int left = [] { const char * v = getenv("GGML_MMVQ_NC_VERIFY"); return v ? atoi(v) : 0; }();
+    static std::mutex mtx;
+    std::lock_guard<std::mutex> lock(mtx);
+    if (left <= 0) {
+        return false;
+    }
+    --left;
+    return true;
+}
+static bool iq3nc_capturing(hipStream_t stream) {
+    hipStreamCaptureStatus status;
+    CUDA_CHECK(hipStreamIsCapturing(stream, &status));
+    return status != hipStreamCaptureStatusNone;
+}
+// compare ncols columns of rows floats (got: column stride gcs) bitwise with the reference (column stride rows)
+static void iq3nc_verify_report(const char * what, const float * got, const int gcs, const float * ref, const int rows, const int ncols,
+        hipStream_t stream) {
+    std::vector<uint32_t> g((size_t) rows*ncols), r((size_t) rows*ncols);
+    CUDA_CHECK(hipStreamSynchronize(stream));
+    for (int c = 0; c < ncols; ++c) {
+        CUDA_CHECK(cudaMemcpy(g.data() + (size_t) c*rows, got + (size_t) c*gcs, rows*sizeof(float), cudaMemcpyDeviceToHost));
+    }
+    CUDA_CHECK(cudaMemcpy(r.data(), ref, g.size()*sizeof(float), cudaMemcpyDeviceToHost));
+    size_t bad = 0;
+    for (size_t i = 0; i < g.size(); ++i) {
+        bad += g[i] != r[i];
+    }
+    fprintf(stderr, "[mmvq-nc iq3 verify] %s ncols=%d rows=%d mismatches=%zu/%zu\n", what, ncols, rows, bad, g.size());
+}
+
+bool ggml_cuda_mmvq_iq3_nc_ok(const ggml_tensor * w, const ggml_tensor * gate_w, const bool residual, const int ncols) {
+    if (!iq3nc_enabled() || !iq3nc_ncols_ok(ncols) || !iq3g_weight_ok(w) || !ggml_cuda_has_repacked(w, iq3g_kind(w))) {
+        return false;
+    }
+    if (gate_w) {
+        if (residual || !iq3g_weight_ok(gate_w) || !ggml_are_same_shape(gate_w, w) || !ggml_cuda_has_repacked(gate_w, iq3g_kind(gate_w))) {
+            return false;
+        }
+        // a mixed IQ3_S/IQ3_XXS pair only where the single-token path fuses it too (the reference of every column)
+        if (gate_w->type != w->type && !ggml_cuda_mmvq_iq3_fuse_mixed_ok(w, gate_w)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool ggml_cuda_mmvq_iq3_nc(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const block_q8_1 * y, const int ncols,
+        ggml_tensor * dst, const ggml_cuda_mm_fusion_args_host * fusion) {
+    if (!iq3nc_enabled() || !iq3nc_ncols_ok(ncols) || !iq3g_weight_ok(src0)) {
+        return false;
+    }
+    if (dst->type != GGML_TYPE_F32 || dst->nb[0] != sizeof(float) || dst->nb[1] % sizeof(float) != 0 || dst->ne[0] != src0->ne[1] ||
+            dst->ne[1] != ncols || dst->ne[2] != 1 || dst->ne[3] != 1) {
+        return false;
+    }
+    const ggml_tensor * gate = nullptr;
+    const ggml_tensor * res  = nullptr;
+    if (fusion) {
+        if (fusion->gate_bias || fusion->x_scale || fusion->gate_scale || fusion->shared_up) {
+            return false;
+        }
+        if (fusion->gate) {
+            if (fusion->glu_op != GGML_GLU_OP_SWIGLU || fusion->x_bias || !iq3g_weight_ok(fusion->gate) ||
+                    !ggml_are_same_shape(fusion->gate, src0)) {
+                return false;
+            }
+            if (fusion->gate->type != src0->type && !ggml_cuda_mmvq_iq3_fuse_mixed_ok(src0, fusion->gate)) {
+                return false;
+            }
+            gate = fusion->gate;
+        } else if (fusion->x_bias) {
+            res = fusion->x_bias;
+            if (res->type != GGML_TYPE_F32 || !ggml_are_same_shape(res, dst) || res->nb[0] != sizeof(float) || res->nb[1] % sizeof(float) != 0) {
+                return false;
+            }
+        }
+    }
+    const int device = ggml_cuda_get_device();
+    hipStream_t stream = ctx.stream();
+    // GGML_MMVQ_IQ3_SMALLN=1: the single-token path hands these small unfused singles to the codex packed kernel; decline
+    // them here too (same condition), so every column stays equal to the single-token result (stock path at N > 1)
+    if (!gate && !res && src0->ne[1] <= 1024 && iq3g_smalln_codex() && codex_iq3_get_packed(src0, device, stream) != nullptr) {
+        return false;
+    }
+    const uint8_t * wu = iq3g_get_soa(src0, device, stream);
+    const uint8_t * wg = gate ? iq3g_get_soa(gate, device, stream) : nullptr;
+    if (!wu || (gate && !wg)) {
+        return false;
+    }
+    iq3nc_single_args a{};
+    a.wa    = gate ? wg : wu;                  // GLU: TA = gate, TB = up (as the single-token launcher)
+    a.wb    = gate ? wu : nullptr;
+    a.ta    = gate ? gate->type : src0->type;
+    a.tb    = gate ? src0->type : GGML_TYPE_COUNT;
+    a.K     = (int) src0->ne[0];
+    a.N     = (int) src0->ne[1];
+    a.y     = y;
+    a.ycb   = (int) (GGML_PAD(src0->ne[0], MATRIX_ROW_PADDING)/QK8_1);
+    a.dst   = (float *) dst->data;
+    a.dcs   = (int) (dst->nb[1]/sizeof(float));
+    a.res   = res ? (const float *) res->data : nullptr;
+    a.rcs   = res ? (int) (res->nb[1]/sizeof(float)) : 0;
+    a.sm    = iq3g_sm(a.K);
+    a.ncols = ncols;
+    a.ncu   = ggml_cuda_info().devices[device].nsm;
+
+    const bool verify = iq3nc_verify_take() && !iq3nc_capturing(stream);
+    ggml_cuda_pool_alloc<float> ref(ctx.pool());
+    if (verify) {
+        using namespace iq3g;
+        ref.alloc((size_t) a.N*ncols);
+        for (int c = 0; c < ncols; ++c) {
+            const block_q8_1 * yc = y + (size_t) c*a.ycb;
+            float * rc = ref.get() + (size_t) c*a.N;
+            const float * resc = a.res ? a.res + (size_t) c*a.rcs : nullptr;
+            const bool sa = a.ta == GGML_TYPE_IQ3_S, sb = a.tb == GGML_TYPE_IQ3_S;
+            if (!gate) {
+                sa ? iq3g_launch_pf<iq3s_t, none_t>(a.wa, nullptr, yc, rc, a.K, a.N, resc, a.ncu, stream, a.sm)
+                   : iq3g_launch_pf<iq3xxs_t, none_t>(a.wa, nullptr, yc, rc, a.K, a.N, resc, a.ncu, stream, a.sm);
+            } else if (sa && sb) {
+                iq3g_launch_pf<iq3s_t,   iq3s_t  >(a.wa, a.wb, yc, rc, a.K, a.N, nullptr, a.ncu, stream, a.sm);
+            } else if (sa) {
+                iq3g_launch_pf<iq3s_t,   iq3xxs_t>(a.wa, a.wb, yc, rc, a.K, a.N, nullptr, a.ncu, stream, a.sm);
+            } else if (sb) {
+                iq3g_launch_pf<iq3xxs_t, iq3s_t  >(a.wa, a.wb, yc, rc, a.K, a.N, nullptr, a.ncu, stream, a.sm);
+            } else {
+                iq3g_launch_pf<iq3xxs_t, iq3xxs_t>(a.wa, a.wb, yc, rc, a.K, a.N, nullptr, a.ncu, stream, a.sm);
+            }
+        }
+    }
+    if (!iq3nc_launch_single(a, stream)) {
+        return false;
+    }
+    CUDA_CHECK(cudaGetLastError());
+    if (verify) {
+        char what[160];
+        snprintf(what, sizeof(what), "single %s%s%s K=%d%s", ggml_type_name(src0->type), gate ? " gate=" : "",
+                gate ? ggml_type_name(gate->type) : "", a.K, res ? " +res" : "");
+        iq3nc_verify_report(what, a.dst, a.dcs, ref.get(), a.N, ncols, stream);
+    }
+    return true;
+}
+
+bool ggml_cuda_mmvq_iq3_multi_nc_ok(const ggml_tensor * const * w, const int n, const int ncols) {
+    if (!iq3nc_enabled() || !iq3g_multi_enabled() || !iq3nc_ncols_ok(ncols) || n < 2 || n > iq3g::MJ_MAX) {
+        return false;
+    }
+    int64_t rows = 0;
+    for (int i = 0; i < n; ++i) {
+        if (!iq3g_weight_ok(w[i]) || w[i]->ne[0] != w[0]->ne[0]) {
+            return false;
+        }
+        rows += w[i]->ne[1];
+    }
+    return rows <= (1 << 24);
+}
+
+bool ggml_cuda_mmvq_iq3_multi_nc(ggml_backend_cuda_context & ctx, const ggml_tensor * const * w, ggml_tensor * const * dst, const int n,
+        const block_q8_1 * y, const int ncols) {
+    if (!ggml_cuda_mmvq_iq3_multi_nc_ok(w, n, ncols)) {
+        return false;
+    }
+    const int device = ggml_cuda_get_device();
+    hipStream_t stream = ctx.stream();
+    iq3nc_multi_args a{};
+    a.n     = n;
+    a.K     = (int) w[0]->ne[0];
+    a.y     = y;
+    a.ycb   = (int) (GGML_PAD(w[0]->ne[0], MATRIX_ROW_PADDING)/QK8_1);
+    a.sm    = iq3g_sm(a.K);
+    a.ncols = ncols;
+    a.ncu   = ggml_cuda_info().devices[device].nsm;
+    for (int i = 0; i < n; ++i) {
+        const ggml_tensor * d = dst[i];
+        if (d->type != GGML_TYPE_F32 || d->nb[0] != sizeof(float) || d->nb[1] % sizeof(float) != 0 || d->ne[0] != w[i]->ne[1] ||
+                d->ne[1] != ncols || d->ne[2] != 1 || d->ne[3] != 1) {
+            return false;
+        }
+        const uint8_t * soa = iq3g_get_soa(w[i], device, stream);   // nullptr during graph capture if not created yet
+        if (!soa) {
+            return false;
+        }
+        a.w[i]   = soa;
+        a.t[i]   = w[i]->type;
+        a.dst[i] = (float *) d->data;
+        a.dcs[i] = (int) (d->nb[1]/sizeof(float));
+        a.N[i]   = (int) w[i]->ne[1];
+    }
+    const bool verify = iq3nc_verify_take() && !iq3nc_capturing(stream);
+    ggml_cuda_pool_alloc<float> ref(ctx.pool());
+    int rows = 0;
+    for (int i = 0; i < n; ++i) {
+        rows += a.N[i];
+    }
+    if (verify) {
+        // the single-token multi-job launch (as ggml_cuda_mmvq_iq3_multi) on every column, outputs packed per column
+        ref.alloc((size_t) rows*ncols);
+        bool hs = false, hx = false;
+        for (int i = 0; i < n; ++i) {
+            hs |= a.t[i] == GGML_TYPE_IQ3_S;
+            hx |= a.t[i] == GGML_TYPE_IQ3_XXS;
+        }
+        const bool ord = iq3g_pf_mode() == 7;
+        for (int c = 0; c < ncols; ++c) {
+            iq3g::mj_args m{};
+            for (int j = 0; j < iq3g::MJ_MAX; ++j) {
+                m.job[j].ubeg = INT_MAX;
+            }
+            int ub = 0, ro = 0;
+            for (int i = 0; i < n; ++i) {
+                m.job[i].w    = a.w[i];
+                m.job[i].dst  = ref.get() + (size_t) c*rows + ro;
+                m.job[i].res  = nullptr;
+                m.job[i].nh   = (uint32_t) (a.N[i]*(a.K/128));
+                m.job[i].ubeg = ub;
+                m.job[i].tsel = (hs && hx && a.t[i] == GGML_TYPE_IQ3_XXS) ? 1 : 0;
+                m.job[i].U    = a.N[i]/IQ3G_RG;
+                ub += a.N[i]/IQ3G_RG;
+                ro += a.N[i];
+            }
+            m.njob = n;
+            m.utot = ub;
+            const block_q8_1 * yc = y + (size_t) c*a.ycb;
+            if (a.sm) {
+                if (ord) iq3g_launch_mj<IQ3G_SM, true>(hs, hx, yc, a.K, m, a.ncu, stream);
+                else     iq3g_launch_mj<IQ3G_SM, false>(hs, hx, yc, a.K, m, a.ncu, stream);
+            } else {
+                if (ord) iq3g_launch_mj<0, true>(hs, hx, yc, a.K, m, a.ncu, stream);
+                else     iq3g_launch_mj<0, false>(hs, hx, yc, a.K, m, a.ncu, stream);
+            }
+        }
+    }
+    if (!iq3nc_launch_multi(a, stream)) {
+        return false;
+    }
+    CUDA_CHECK(cudaGetLastError());
+    if (verify) {
+        int ro = 0;
+        for (int i = 0; i < n; ++i) {
+            // reference of job i, column c at ref + c*rows + ro: compare column by column
+            std::vector<float> tmp;
+            char what[160];
+            snprintf(what, sizeof(what), "multi job %d/%d %s K=%d", i, n, ggml_type_name(a.t[i]), a.K);
+            ggml_cuda_pool_alloc<float> refi(ctx.pool(), (size_t) a.N[i]*ncols);
+            for (int c = 0; c < ncols; ++c) {
+                CUDA_CHECK(cudaMemcpyAsync(refi.get() + (size_t) c*a.N[i], ref.get() + (size_t) c*rows + ro, a.N[i]*sizeof(float),
+                        cudaMemcpyDeviceToDevice, stream));
+            }
+            iq3nc_verify_report(what, a.dst[i], a.dcs[i], refi.get(), a.N[i], ncols, stream);
+            ro += a.N[i];
+        }
+    }
+    return true;
+}
+// ------------------------------------------------------------------------------------------------ MMVQ-NC A end
 #else
 bool ggml_cuda_mmvq_iq3_fuse_mixed_ok(const ggml_tensor *, const ggml_tensor *) {
     return false;
@@ -533,6 +997,21 @@ bool ggml_cuda_mmvq_mix_member(const ggml_tensor *) {
     return false;
 }
 bool ggml_cuda_mmvq_mix(ggml_backend_cuda_context &, ggml_tensor * const *, int, ggml_tensor *) {
+    return false;
+}
+// MMVQ-NC A
+bool ggml_cuda_mmvq_iq3_nc_ok(const ggml_tensor *, const ggml_tensor *, bool, int) {
+    return false;
+}
+bool ggml_cuda_mmvq_iq3_nc(ggml_backend_cuda_context &, const ggml_tensor *, const block_q8_1 *, int, ggml_tensor *,
+        const ggml_cuda_mm_fusion_args_host *) {
+    return false;
+}
+bool ggml_cuda_mmvq_iq3_multi_nc_ok(const ggml_tensor * const *, int, int) {
+    return false;
+}
+bool ggml_cuda_mmvq_iq3_multi_nc(ggml_backend_cuda_context &, const ggml_tensor * const *, ggml_tensor * const *, int,
+        const block_q8_1 *, int) {
     return false;
 }
 #endif

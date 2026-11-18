@@ -14,6 +14,7 @@
 #include <type_traits>
 #include <map>
 #include <mutex>
+#include <atomic>
 
 // only enabled on DGX Spark, where it is a gain on every type below. On the higher-bandwidth parts the kernel
 // has little exposed latency left to hide and the extra requests cost more than they save.
@@ -419,6 +420,10 @@ bool ggml_cuda_should_use_mmvq(enum ggml_type type, int cc, int64_t ne11) {
                 default:
                     return ne11 <= MMVQ_MAX_BATCH_SIZE;
             }
+        }
+        // MMVQ-NC B: Q4_K decode batches up to the NC max run on the N-column iq4k kernels (instead of MMQ)
+        if (type == GGML_TYPE_Q4_K && ne11 > 3 && GGML_CUDA_CC_IS_CDNA2(cc) && ggml_cuda_mmvq_iq4k_nc_route(ne11)) {
+            return true;
         }
         switch (type) { // tuned for CDNA2
             case GGML_TYPE_Q2_K:
@@ -1644,10 +1649,19 @@ static void codex_iq3_launch_packed(ggml_backend_cuda_context & ctx,
 #undef CODEX_LAUNCH
 }
 
-// Per-stream cache of the q8_1-quantized single-token activation (+ per-block int sums for the packed IQ3 path).
+// Per-stream cache of the q8_1-quantized activation (+ per-block int sums for the packed IQ3 path): a single-token
+// activation, or (MMVQ-NC) the flattened [K, 2..nc_max] activation of a multi-token verification step.
 // Consecutive GEMVs of one graph evaluation that consume the same src1 tensor (qkv/z, q/k/v, gate/up) quantize it once.
-// Invalidated at the start of every graph evaluation (ggml_cuda_mmvq_cache_reset). The buffer is dedicated (not from
-// the pool), so a cached activation cannot be overwritten by intermediate ops.
+// The buffer is dedicated (not from the pool), so the cached q8 data itself cannot be overwritten by intermediate ops.
+// The entry is dropped
+//  - at the start of every graph evaluation (ggml_cuda_mmvq_cache_reset),
+//  - whenever a node writes bytes of the cached f32 source (ggml_cuda_mmvq_cache_invalidate, called by the graph loop
+//    before every executed node / node group and, for all members of a fused group, after the group): covers in-place
+//    ops (res += a@b folded into the GEMV), allocator reuse and writes through views. After a fused group an entry the
+//    group itself filled for one of its members (q8 producers: rms_norm*w, swiglu, FA gate, ...) is only checked
+//    against the members that follow that member.
+// Lookups never happen between a write and its invalidation: a fused group reads cached activations only of tensors
+// that no earlier member of the same group writes (the fusions only read their inputs, then write their outputs).
 static __global__ void quantize_q8_1_sums(const float * __restrict__ x, block_q8_1 * __restrict__ y, int * __restrict__ sums,
         const int64_t ne10, const int64_t ne10_padded) {
     const int64_t i = (int64_t) blockIdx.x*blockDim.x + threadIdx.x;
@@ -1668,25 +1682,118 @@ static __global__ void quantize_q8_1_sums(const float * __restrict__ x, block_q8
 }
 
 // The identity of the cached activation is kept by value: base = root tensor (view_src or the tensor itself) at the
-// time of insertion, only ever compared as a pointer value, never dereferenced (the graph that owned it may be freed).
+// time of insertion, src = the tensor itself, both only ever compared as pointer values, never dereferenced (the graph
+// that owned them may be freed). [lo, hi): the bytes of the f32 source the q8 data was made from (overlap checks).
+// epoch: the node group (ggml_cuda_mmvq_cache_invalidate, MMVQ_Q8_INV_NODE) that filled the entry.
 struct mmvq_q8_cache_entry {
     char              * buf  = nullptr;
     size_t              size = 0;
     const ggml_tensor * base = nullptr;
+    const ggml_tensor * src  = nullptr;
     const void        * data = nullptr;
+    const char        * lo   = nullptr;
+    const char        * hi   = nullptr;
     int64_t             ne10 = 0;
+    uint64_t            epoch = 0;
     bool                valid = false;
 };
 static std::mutex mmvq_q8_cache_mutex;
 static std::map<std::pair<int, cudaStream_t>, mmvq_q8_cache_entry> mmvq_q8_caches;
+// number of valid entries (all devices; lets the per-node invalidation skip the lock while nothing is cached) and the
+// node-group counter of every device (advanced by the thread that evaluates graphs on that device)
+static std::atomic<int> mmvq_q8_n_valid{0};
+static std::atomic<uint64_t> mmvq_q8_epoch[GGML_CUDA_MAX_DEVICES] = {};
+
+static void mmvq_q8_entry_drop(mmvq_q8_cache_entry & e) {
+    if (e.valid) {
+        mmvq_q8_n_valid.fetch_sub(1, std::memory_order_relaxed);
+    }
+    e.valid = false;
+    e.base  = nullptr;
+    e.src   = nullptr;
+    e.data  = nullptr;
+    e.lo    = nullptr;
+    e.hi    = nullptr;
+}
+
+static void mmvq_q8_entry_fill(mmvq_q8_cache_entry & e, const int device, const ggml_tensor * t, const int64_t ne10) {
+    if (!e.valid) {
+        mmvq_q8_n_valid.fetch_add(1, std::memory_order_relaxed);
+    }
+    e.base  = t->view_src ? t->view_src : t;
+    e.src   = t;
+    e.data  = t->data;
+    e.lo    = (const char *) t->data;
+    e.hi    = e.lo + ggml_nbytes(t);
+    e.ne10  = ne10;
+    e.epoch = mmvq_q8_epoch[device].load(std::memory_order_relaxed);
+    e.valid = true;
+}
 
 void ggml_cuda_mmvq_cache_reset(ggml_backend_cuda_context & ctx) {
     std::lock_guard<std::mutex> lock(mmvq_q8_cache_mutex);
     for (auto & e : mmvq_q8_caches) {
         if (e.first.first == ctx.device) {
-            e.second.valid = false;
-            e.second.base  = nullptr;
-            e.second.data  = nullptr;
+            mmvq_q8_entry_drop(e.second);
+        }
+    }
+}
+
+static bool mmvq_q8_overlaps(const mmvq_q8_cache_entry & e, const ggml_tensor * t) {
+    const char * lo = (const char *) t->data;
+    return lo == nullptr || (lo < e.hi && e.lo < lo + ggml_nbytes(t));
+}
+
+// node is about to be written (MMVQ_Q8_INV_NODE: a node or the first node of a fused group, starts a new group;
+// MMVQ_Q8_INV_AHEAD: a member that a fusion runs ahead of the rest of its group): drop the entries of this device (any
+// stream) whose source bytes it overlaps
+void ggml_cuda_mmvq_cache_invalidate(ggml_backend_cuda_context & ctx, const ggml_tensor * node, const int mode) {
+    if (mode == MMVQ_Q8_INV_NODE) {
+        mmvq_q8_epoch[ctx.device].fetch_add(1, std::memory_order_relaxed);
+    }
+    if (mmvq_q8_n_valid.load(std::memory_order_relaxed) == 0) {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(mmvq_q8_cache_mutex);
+    for (auto & it : mmvq_q8_caches) {
+        mmvq_q8_cache_entry & e = it.second;
+        if (it.first.first == ctx.device && e.valid && mmvq_q8_overlaps(e, node)) {
+            mmvq_q8_entry_drop(e);
+        }
+    }
+}
+
+// the fused group nodes[0..n) just ran and may have written every (non-view) member: drop the entries whose source
+// bytes a member overlaps, except an entry the group itself filled for its member p (a q8 producer, or a GEMV of the
+// group that read p) against the members k <= p (written before p got the contents that were quantized)
+void ggml_cuda_mmvq_cache_invalidate_group(ggml_backend_cuda_context & ctx, ggml_tensor * const * nodes, const int n) {
+    if (mmvq_q8_n_valid.load(std::memory_order_relaxed) == 0) {
+        return;
+    }
+    const uint64_t epoch = mmvq_q8_epoch[ctx.device].load(std::memory_order_relaxed);
+    std::lock_guard<std::mutex> lock(mmvq_q8_cache_mutex);
+    for (auto & it : mmvq_q8_caches) {
+        mmvq_q8_cache_entry & e = it.second;
+        if (it.first.first != ctx.device || !e.valid) {
+            continue;
+        }
+        int p = -1;
+        if (e.epoch == epoch) {
+            for (int j = 0; j < n; ++j) {
+                if (nodes[j] == e.src) {
+                    p = j;
+                    break;
+                }
+            }
+        }
+        for (int k = p + 1; k < n; ++k) {
+            const ggml_tensor * t = nodes[k];
+            const bool view_or_noop = ggml_is_empty(t) || t->op == GGML_OP_RESHAPE || t->op == GGML_OP_TRANSPOSE ||
+                t->op == GGML_OP_VIEW || t->op == GGML_OP_PERMUTE || t->op == GGML_OP_NONE;   // (= ggml_cuda_is_view_or_noop)
+            if (!view_or_noop && mmvq_q8_overlaps(e, t)) {
+                mmvq_q8_entry_drop(e);
+                break;
+            }
         }
     }
 }
@@ -1701,6 +1808,7 @@ void ggml_cuda_mmvq_cache_release(const int device, cudaStream_t stream) {
             return;
         }
         buf = it->second.buf;
+        mmvq_q8_entry_drop(it->second);
         mmvq_q8_caches.erase(it);
     }
     if (buf) {
@@ -1733,14 +1841,12 @@ bool ggml_cuda_mmvq_cache_produce(ggml_backend_cuda_context & ctx, const ggml_te
         }
         e.size = std::max(need, (size_t) 1 << 20);
         CUDA_CHECK(cudaMalloc(&e.buf, e.size));
+        mmvq_q8_entry_drop(e);
     }
     const size_t sums_off = (q8_bytes + 255) & ~(size_t) 255;
     *q8   = (block_q8_1 *) e.buf;
     *sums = (int *) (e.buf + sums_off);
-    e.base  = t->view_src ? t->view_src : t;
-    e.data  = t->data;
-    e.ne10  = ne10;
-    e.valid = true;
+    mmvq_q8_entry_fill(e, ctx.device, t, ne10);
     return true;
 }
 
@@ -1767,7 +1873,7 @@ static bool mmvq_q8_cache_get(ggml_backend_cuda_context & ctx, const ggml_tensor
         }
         e.size = std::max(need, (size_t) 1 << 20);
         CUDA_CHECK(cudaMalloc(&e.buf, e.size));
-        e.valid = false;
+        mmvq_q8_entry_drop(e);
     }
     const size_t sums_off = (q8_bytes + 255) & ~(size_t) 255;
     *q8   = (const block_q8_1 *) e.buf;
@@ -1780,10 +1886,7 @@ static bool mmvq_q8_cache_get(ggml_backend_cuda_context & ctx, const ggml_tensor
     quantize_q8_1_sums<<<nblk, CUDA_QUANTIZE_BLOCK_SIZE, 0, stream>>>((const float *) src1->data, (block_q8_1 *) e.buf,
             (int *) (e.buf + sums_off), ne10, ne10_padded);
     CUDA_CHECK(cudaGetLastError());
-    e.base  = base_src1;
-    e.data  = src1->data;
-    e.ne10  = ne10;
-    e.valid = true;
+    mmvq_q8_entry_fill(e, ctx.device, src1, ne10);
     return true;
 }
 
@@ -1795,13 +1898,30 @@ bool ggml_cuda_mmvq_q8_cached(ggml_backend_cuda_context & ctx, const ggml_tensor
     const int * sums = nullptr;
     return mmvq_q8_cache_get(ctx, src1, ne10, GGML_PAD(ne10, MATRIX_ROW_PADDING), q8, &sums);
 }
+// MMVQ-NC S: the [K, ncols] activation quantized as one flat K*ncols row (K % 512 == 0: no padding, no block crosses a
+// column, so column c is byte-identical to the single-row quantization of that column); cache key (base, data, K*ncols)
+bool ggml_cuda_mmvq_q8_cached_nc(ggml_backend_cuda_context & ctx, const ggml_tensor * src1, const block_q8_1 ** q8, const int ** sums) {
+    if (src1->type != GGML_TYPE_F32 || !ggml_is_contiguous(src1) || src1->ne[2] != 1 || src1->ne[3] != 1 ||
+            src1->ne[0] % MATRIX_ROW_PADDING != 0 || src1->ne[1] < 1 || src1->ne[1] > std::max(1, ggml_cuda_mmvq_nc_max())) {
+        return false;
+    }
+    const int64_t n = src1->ne[0]*src1->ne[1];
+    return mmvq_q8_cache_get(ctx, src1, n, n, q8, sums);
+}
 #else
 bool ggml_cuda_mmvq_q8_cached(ggml_backend_cuda_context &, const ggml_tensor *, const block_q8_1 **) {
+    return false;
+}
+bool ggml_cuda_mmvq_q8_cached_nc(ggml_backend_cuda_context &, const ggml_tensor *, const block_q8_1 **, const int **) {
     return false;
 }
 // the activation cache is HIP-only; callers outside HIP-only code (fattn-common.cuh launch_fattn, fattn-dec.cu,
 // q8-producers.cu, ggml-cuda.cu) must link in every build
 void ggml_cuda_mmvq_cache_reset(ggml_backend_cuda_context &) {
+}
+void ggml_cuda_mmvq_cache_invalidate(ggml_backend_cuda_context &, const ggml_tensor *, int) {
+}
+void ggml_cuda_mmvq_cache_invalidate_group(ggml_backend_cuda_context &, ggml_tensor * const *, int) {
 }
 bool ggml_cuda_mmvq_cache_produce(ggml_backend_cuda_context &, const ggml_tensor *, block_q8_1 ** q8, int ** sums) {
     *q8   = nullptr;
@@ -1811,6 +1931,91 @@ bool ggml_cuda_mmvq_cache_produce(ggml_backend_cuda_context &, const ggml_tensor
 void ggml_cuda_mmvq_cache_release(int, cudaStream_t) {
 }
 #endif
+
+// ------------------------------------------------------------------------------------------------ MMVQ-NC S
+// N-column GEMVs (2 <= ne11 <= nc_max) for multi-token verification: GGML_MMVQ_NC=0 restores the previous behaviour for
+// ne11 > 1 exactly; GGML_MMVQ_NC_MAX (default 4, 2..6) is the largest column count taken. Every family reads the
+// switches through these two functions (one parse: any value starting with '0' turns the master switch off).
+// Output change (accepted): the kernels are not limited to speculative verification. Every MUL_MAT with 2..nc_max
+// columns takes them, also prompt chunks of that size (short prompts, the last chunk of a prompt split into ubatches),
+// which ran on the stock ncols > 1 kernels before. The N-column kernels give every column exactly the single-token
+// (N=1) result, the stock ones round differently, so greedy output can change; measured on the server without
+// speculative decoding (K=0): 2 of 4 prompts differ from the build without MMVQ-NC. This moves the results closer to
+// N=1 decode, it is not a regression; GGML_MMVQ_NC=0 restores the previous kernels and outputs exactly.
+bool ggml_cuda_mmvq_nc_enabled() {
+    static const bool enabled = [] {
+        const char * v = getenv("GGML_MMVQ_NC");
+        if (v == nullptr) {
+            return true;
+        }
+        while (*v == ' ' || *v == '\t') {
+            ++v;
+        }
+        return !(v[0] == '0' || v[0] == 'f' || v[0] == 'F' || v[0] == 'n' || v[0] == 'N');
+    }();
+    return enabled;
+}
+int ggml_cuda_mmvq_nc_max() {
+    static const int n = [] {
+        if (!ggml_cuda_mmvq_nc_enabled()) {
+            return 0;
+        }
+        const char * v = getenv("GGML_MMVQ_NC_MAX");
+        const int m = v ? atoi(v) : 4;
+        return std::min(6, std::max(2, m));
+    }();
+    return n;
+}
+// the weight types an N-column family handles: only these read the N-column activation from the q8 cache, so the stock
+// ne11 > 1 kernels of every other type keep the pool quantization exactly as before (the cache entry is dropped whenever
+// a node writes its source bytes, see above, so a cached N-column activation is always the current one)
+static bool ggml_cuda_mmvq_nc_type(const ggml_type t) {
+    switch (t) {
+        case GGML_TYPE_IQ3_S: case GGML_TYPE_IQ3_XXS:                                         // A
+        case GGML_TYPE_IQ4_XS: case GGML_TYPE_Q4_K:                                           // B
+        case GGML_TYPE_IQ2_S: case GGML_TYPE_IQ2_XS: case GGML_TYPE_IQ2_XXS: case GGML_TYPE_Q2_K: case GGML_TYPE_IQ1_M:   // C
+            return true;
+        default:
+            return false;
+    }
+}
+// will ggml_cuda_mul_mat_vec_q take this N-column MUL_MAT with the fusion (gate_w: SwiGLU gate weights; residual add)?
+// Exact: true only if one of the NC slots below will accept the call (a promised fusion that is not taken aborts).
+// Invariant shared with the only callers, the SwiGLU and ADD fusion sites of ggml_cuda_try_fuse: besides what is checked
+// here they pass nothing but (a) gate + glu_op = SWIGLU (not swapped), dst = the F32 contiguous GLU node of mm's shape,
+// gate and up on the same src1, or (b) x_bias = an F32 contiguous residual of mm's shape, dst = the F32 contiguous ADD
+// node of mm's shape; no ids, gate_bias, scales or shared experts. Given that, every slot's launcher (_iq3_nc,
+// _lowbit_nc, _iq4k_nc) checks nothing beyond its _ok predicate (dst / residual layout, fusion fields), so the slot
+// whose _ok is true takes the call; ggml_cuda_mul_mat_vec_q aborts if that is ever violated.
+// Side effect (family C): outside stream capture the low-bit SoA copy of mm->src[0] is created here if missing, so the
+// fusion can already form on the first evaluation; during capture nothing is allocated and the answer is then false.
+bool ggml_cuda_mmvq_nc_fusion_ok(ggml_backend_cuda_context & ctx, const ggml_tensor * mm, const ggml_tensor * gate_w, const bool residual) {
+    if (mm->op != GGML_OP_MUL_MAT || mm->src[2] || mm->type != GGML_TYPE_F32 || !ggml_is_contiguous(mm)) {
+        return false;
+    }
+    const ggml_tensor * src1 = mm->src[1];
+    if (src1->type != GGML_TYPE_F32 || src1->ne[2] != 1 || src1->ne[3] != 1 ||
+            mm->ne[1] != src1->ne[1] || src1->ne[1] < 2 || src1->ne[1] > ggml_cuda_mmvq_nc_max()) {
+        return false;
+    }
+    const int ncols = (int) src1->ne[1];
+    const ggml_tensor * w = mm->src[0];
+    if (ggml_cuda_mmvq_iq3_nc_ok(w, gate_w, residual, ncols)) {   // MMVQ-NC A (slot 1)
+        return true;
+    }
+    ggml_cuda_mmvq_lowbit_nc_prepare(ctx, w, ncols);               // MMVQ-NC C (slot 2)
+    if (ggml_cuda_mmvq_lowbit_nc_ok(w, gate_w, residual, ncols)) {
+        return true;
+    }
+    bool capturing = false;   // (the iq4k slot exists in HIP builds only)
+#if defined(GGML_USE_HIP)
+    hipStreamCaptureStatus status = hipStreamCaptureStatusNone;
+    CUDA_CHECK(hipStreamIsCapturing(ctx.stream(), &status));
+    capturing = status != hipStreamCaptureStatusNone;
+#endif
+    return ggml_cuda_mmvq_iq4k_nc_ok(w, gate_w, residual, ncols, capturing);  // MMVQ-NC B (slot 3)
+}
+// ------------------------------------------------------------------------------------------------ MMVQ-NC S end
 
 void ggml_cuda_mul_mat_vec_q(
         ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst,
@@ -1843,7 +2048,7 @@ void ggml_cuda_mul_mat_vec_q(
     if (fusion) {
         const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
         GGML_ASSERT( !ids || dst->ne[2] <= get_mmvq_mmid_max_batch(src0->type, cc));
-        GGML_ASSERT(  ids || dst->ne[1] == 1);
+        GGML_ASSERT(  ids || dst->ne[1] == 1 || (ne11 >= 2 && ne11 <= ggml_cuda_mmvq_nc_max()));   // MMVQ-NC S: N-column fusion
         // Scale fusion is only allowed for NVFP4 currently as the cost of checking this at run-time in the prologue is
         // non-negligible for some models such as gpt-oss-20b
         GGML_ASSERT((fusion->x_scale == nullptr && fusion->gate_scale == nullptr) || src0->type == GGML_TYPE_NVFP4);
@@ -1925,8 +2130,11 @@ void ggml_cuda_mul_mat_vec_q(
     const block_q8_1 * src1_q8_1_ptr = nullptr;
     const int * src1_sums = nullptr;
 #if defined(GGML_USE_HIP)
-    const bool use_q8_cache = !ids && ne11 == 1 && ne12 == 1 && ne13 == 1 && ggml_is_contiguous(src1) &&
-            mmvq_q8_cache_get(ctx, src1, ne10, ne10_padded, &src1_q8_1_ptr, &src1_sums);
+    // MMVQ-NC S: 2 <= ne11 <= nc_max with K % 512 == 0: the flattened activation (same column layout as the pool path)
+    const bool use_q8_cache = !ids && ne12 == 1 && ne13 == 1 && ggml_is_contiguous(src1) &&
+            (ne11 == 1 ? mmvq_q8_cache_get(ctx, src1, ne10, ne10_padded, &src1_q8_1_ptr, &src1_sums) :
+             ne11 <= ggml_cuda_mmvq_nc_max() && ggml_cuda_mmvq_nc_type(src0->type) &&
+             ggml_cuda_mmvq_q8_cached_nc(ctx, src1, &src1_q8_1_ptr, &src1_sums));
 #else
     const bool use_q8_cache = false;
 #endif
@@ -1945,6 +2153,21 @@ void ggml_cuda_mul_mat_vec_q(
     if (!ids && ne11 == 1 && ne12 == 1 && ne13 == 1 &&
             ggml_cuda_mmvq_iq3(ctx, src0, src1_q8_1_ptr, dst, fusion)) {
         return;
+    }
+    // MMVQ-NC S: N-column GEMVs; a fused call (accepted by ggml_cuda_mmvq_nc_fusion_ok) must be taken by one of them
+    if (!ids && ne11 >= 2 && ne11 <= ggml_cuda_mmvq_nc_max() && ne12 == 1 && ne13 == 1) {
+        if (ggml_cuda_mmvq_iq3_nc(ctx, src0, src1_q8_1_ptr, (int) ne11, dst, fusion)) {   // MMVQ-NC A (slot 1)
+            return;
+        }
+        if (ggml_cuda_mmvq_lowbit_nc(ctx, src0, src1_q8_1_ptr, (int) ne11, dst, fusion)) {   // MMVQ-NC C (slot 2)
+            return;
+        }
+        if (ggml_cuda_mmvq_iq4k_nc_checked(ctx, src0, src1, src1_q8_1_ptr, (int) ne11, dst, fusion)) {   // MMVQ-NC B (slot 3)
+            return;
+        }
+        if (fusion) {
+            GGML_ABORT("MMVQ-NC: fused N-column GEMV (%s, ncols %d) not taken", ggml_type_name(src0->type), (int) ne11);
+        }
     }
 #endif
     // a mixed-type gate must never reach the kernels below: they decode the gate with src0's type and row stride
@@ -2029,6 +2252,12 @@ void ggml_cuda_mul_mat_vec_q(
 bool ggml_cuda_mul_mat_vec_q_multi(ggml_backend_cuda_context & ctx,
         const ggml_tensor * const * src0, const ggml_tensor * src1, ggml_tensor * const * dst, const int n) {
 #if defined(GGML_USE_HIP)
+    if (src1->ne[1] >= 2) {   // MMVQ-NC A: N-column multi-job launch
+        const block_q8_1 * q8 = nullptr;
+        const int * sums = nullptr;
+        return ggml_cuda_mmvq_iq3_multi_nc_ok(src0, n, (int) src1->ne[1]) && ggml_cuda_mmvq_q8_cached_nc(ctx, src1, &q8, &sums) &&
+            ggml_cuda_mmvq_iq3_multi_nc(ctx, src0, dst, n, q8, (int) src1->ne[1]);
+    }
     if (src1->type != GGML_TYPE_F32 || !ggml_is_contiguous(src1) || src1->ne[1] != 1 || src1->ne[2] != 1 || src1->ne[3] != 1 ||
             !ggml_cuda_mmvq_iq3_multi_ok(src0, n)) {
         return false;

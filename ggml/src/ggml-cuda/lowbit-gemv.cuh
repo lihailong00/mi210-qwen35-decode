@@ -827,4 +827,479 @@ static inline bool supported(ggml_type t) {
     return t == GGML_TYPE_IQ2_S || t == GGML_TYPE_IQ2_XS || t == GGML_TYPE_IQ2_XXS || t == GGML_TYPE_Q2_K || t == GGML_TYPE_IQ1_M;
 }
 
+// MMVQ-NC lowbit: would launch() (the single-token launcher) take this shape? Same configuration choice and the same LDS limit
+// as try_launch; the N-column path must only run where the single-token path is this kernel too (else its reference is
+// stock mmvq, e.g. IQ1_M at K >= 30720, and the columns would not be bit-identical).
+template <class T, int L, int R, int NW>
+static inline bool try_launch_ok(const launch_cfg & c, int K) {
+    return c.L == L && c.R == R && c.NW == NW && gemv_lds_total<T>(K) <= 65536;
+}
+static inline bool launch_ok(ggml_type t, int K, int N) {
+    if (K % 256 != 0 || N % 64 != 0) return false;
+    const launch_cfg c = pick_cfg(t, N, K);
+#define LB_OK(...) if (try_launch_ok<__VA_ARGS__>(c, K)) return true;
+    switch (t) {
+        case GGML_TYPE_IQ2_S:
+            if (c.P == 1)    { LB_OK(iq2_s_t<false, 1>, 64, 1, 16) LB_OK(iq2_s_t<false, 1>, 32, 1, 16) }
+            else if (c.gn)   { LB_OK(iq2_s_t<false, 2, true>, 16, 1, 16) }
+            else             { LB_OK(iq2_s_t<false, 2>, 16, 1, 16) LB_OK(iq2_s_t<false, 2>, 64, 1, 16) }
+            break;
+        case GGML_TYPE_IQ2_XS:
+            if (c.P == 1)    { if (c.ys) { LB_OK(iq2_xs_t<true, 1>, 32, 1, 16) } else { LB_OK(iq2_xs_t<false, 1>, 64, 1, 16) } }
+            else             { LB_OK(iq2_xs_t<true, 2>, 16, 1, 16) }
+            break;
+        case GGML_TYPE_IQ2_XXS:
+            if (c.P == 1)    { if (c.ys) { LB_OK(iq2_xxs_t<true, 1>, 32, 1, 16) } else { LB_OK(iq2_xxs_t<false, 1>, 64, 1, 16) } }
+            else if (c.gn)   { LB_OK(iq2_xxs_t<false, 2, true>, 16, 1, 16) }
+            else if (c.ys)   { LB_OK(iq2_xxs_t<true, 2>, 16, 2, 16) }
+            else             { LB_OK(iq2_xxs_t<false, 2>, 16, 1, 16) }
+            break;
+        case GGML_TYPE_Q2_K:
+            LB_OK(q2_K, 16, 1, 16) LB_OK(q2_K, 16, 1, 8)
+            break;
+        case GGML_TYPE_IQ1_M:
+            LB_OK(iq1_m_pk, 16, 1, 16)
+            break;
+        default: break;
+    }
+#undef LB_OK
+    return false;
+}
+
+// ================================================================================================ MMVQ-NC lowbit
+// N-column GEMV (NC = 2..6 activation columns, one pass over the weights). Column c: q8_1 blocks at yg + c*ys,
+// output at dst + c*ldd, optional residual at residual + c*ldr.
+// Per column bit-identical to gemv<> on that column alone when L and the item size P equal those of the N=1 config
+// (pick_cfg): lane l then accumulates the same items l, l+L, ... in the same order, followed by the same
+// group_sum<L> and epilogue, and each item's fp32 value is the same expression of the same exact integer dot products.
+// The fp32 expression is spelled out with explicit roundings in compute_nc (contraction off, fma only where the N=1
+// kernels have one), because the compiler's contraction of compute() depends on how it vectorizes the surrounding
+// code (measured: compute() of the N=1 kernels is unfused for the IQ2/IQ1_M types and an fma chain for Q2_K; inlined
+// NC times into one loop it fuses differently). N=1 code as compiled (gfx90a, ROCm 7.2):
+//   IQ2_*  : sum = 0; for p < P: sum += (dw*d8_p) * (float) sumi_p          (no fma; P = 1: fma(dw*d8, sumi, 0))
+//   IQ1_M  : sum = 0; for p < P: sum += (dblk*d8_p) * ((float) isum_p * 0.125f)   (no fma)
+//   Q2_K   : sd = fma(d8_i*inv_i, SD_i, sd), sm = fma(d8_i, SM_i, sm) for i = 0..3 from 0; dm.x*sd - dm.y*sm
+//   then acc += item (one add per item, item order per lane as above).
+// Free to differ (no value changes): the sign side (YS or g-side: the integer dot is exact either way), the grid
+// table form, rows per lane group R, NW and the grid (they only change which wave owns a row).
+// The g-side form (YMODE 3: 9-word y records) is used for the IQ2 types: the grid lookups and signed weights are
+// shared by all columns, each column adds one LDS read + one dot per dword.
+#define LB_NC_MAX 6
+
+template <class T> struct nc_traits;
+template <int P, bool GN> struct nc_traits<iq2_s_t<false, P, GN>>   { static constexpr int kind = 0; };
+template <int P, bool GN> struct nc_traits<iq2_xs_t<false, P, GN>>  { static constexpr int kind = 1; };
+template <int P, bool GN> struct nc_traits<iq2_xxs_t<false, P, GN>> { static constexpr int kind = 2; };
+template <> struct nc_traits<q2_K>     { static constexpr int kind = 3; };
+template <> struct nc_traits<iq1_m_pk> { static constexpr int kind = 4; };
+
+// item value for NC columns (column c: y records at yr0 + c*colw); out[c] is what compute_item<T> gives on column c
+template <class T, int NC>
+static __device__ __forceinline__ void compute_nc(const uint32_t * __restrict__ tab, const typename T::raw & r, yptr yr0, const int colw,
+        const int it, float (&out)[NC]) {
+#pragma clang fp contract(off)
+    constexpr int kind = nc_traits<T>::kind;
+    if constexpr (kind <= 2) {   // IQ2_S / IQ2_XS / IQ2_XXS, g-side signs (YMODE 3), P = T::SPI sub-blocks per item
+        constexpr int P = T::SPI;
+        constexpr int W = yrec<3>::W;
+        static_assert(T::YMODE == 3, "NC uses g-side IQ2 traits");
+        const float dw = h2f(r.d);
+        const uint32_t M4 = vconst(0x04040404u), SB = sconst(0x03020100u);
+        float sum[NC];
+#pragma unroll
+        for (int c = 0; c < NC; ++c) sum[c] = 0.0f;
+#pragma unroll
+        for (int p = 0; p < P; ++p) {
+            const uint32_t q = r.a.w[2*p], S0 = r.a.w[2*p + 1];
+            gent g0, g1, g2, g3;
+            uint32_t S;
+            int sc = 0;
+            if constexpr (kind == 0) {
+                const uint32_t qhsc = r.b >> (16*p);
+                const uint32_t qhx = tab_u32(tab, T::QHX, qhsc & 0xFF);
+                const uint32_t X = perm(qhx, q, 0x05010400u), Z = perm(qhx, q, 0x07030602u);
+                tab_pairG<false>(tab, X, g0, g1); tab_pairG<false>(tab, Z, g2, g3);
+                S = S0;
+                sc = (qhsc >> 8) & 0xFF;
+            } else if constexpr (kind == 1) {
+                const uint32_t qh4 = spread4(S0 >> 28);
+                const uint32_t X = perm(qh4, q, 0x05010400u), Z = perm(qh4, q, 0x07030602u);
+                S = ksign_fix(S0);
+                tab_pairG<false>(tab, X, g0, g1); tab_pairG<false>(tab, Z, g2, g3);
+                sc = (r.b >> (8*p)) & 0xFF;
+            } else {
+                S = ksign_fix(S0);
+                g0 = tab_g1<false>(tab, q & 0xFF);         g1 = tab_g1<false>(tab, (q >> 8) & 0xFF);
+                g2 = tab_g1<false>(tab, (q >> 16) & 0xFF); g3 = tab_g1<false>(tab, q >> 24);
+            }
+#pragma unroll
+            for (int c = 0; c < NC; ++c) {
+                yptr yr = yr0 + c*colw + p*W;
+                int s0, s1;
+                dot32<false>(g0, g1, g2, g3, yr, S, M4, SB, s0, s1);
+                int sumi;
+                if constexpr (kind == 2) sumi = sdiv<3>(mul24(s0 + s1, (int) ((S0 >> 27) | 1u)));
+                else                     sumi = sdiv<2>(mad24(s0, sc & 0xF, mad24(s1, sc >> 4, sdiv<1>(s0 + s1))));
+                const float m = dw * __int_as_float(yr[yrec<3>::D]);
+                sum[c] = sum[c] + m * (float) sumi;
+            }
+        }
+#pragma unroll
+        for (int c = 0; c < NC; ++c) out[c] = sum[c];
+    } else if constexpr (kind == 3) {   // Q2_K
+        const uint32_t v[8] = {r.q0.x, r.q0.y, r.q0.z, r.q0.w, r.q1.x, r.q1.y, r.q1.z, r.q1.w};
+        float sd[NC], sm[NC];
+#pragma unroll
+        for (int c = 0; c < NC; ++c) { sd[c] = 0.0f; sm[c] = 0.0f; }
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            int x[8];
+#pragma unroll
+            for (int j = 0; j < 8; ++j) x[j] = i < 3 ? (int) (v[j] & (0x03030303u << (2*i))) : (int) ((v[j] >> 4) & 0x0C0C0C0Cu);
+            const uint32_t scb = (i < 2 ? r.sc.x : r.sc.y) >> (16*(i & 1));
+            const float inv = i == 0 ? 1.0f : i == 1 ? 0.25f : i == 2 ? 0.0625f : 0.25f;
+#pragma unroll
+            for (int c = 0; c < NC; ++c) {
+                yptr yr = yr0 + c*colw + i*11;
+                int s0 = dp4a0(x[0], yr[0]);
+                s0 = dp4a(x[1], yr[1], s0); s0 = dp4a(x[2], yr[2], s0); s0 = dp4a(x[3], yr[3], s0);
+                int s1 = dp4a0(x[4], yr[4]);
+                s1 = dp4a(x[5], yr[5], s1); s1 = dp4a(x[6], yr[6], s1); s1 = dp4a(x[7], yr[7], s1);
+                const int SD = mad24(s0, scb & 0xF, mul24(s1, (scb >> 8) & 0xF));
+                const int SM = mad24(yr[9], (scb >> 4) & 0xF, mul24(yr[10], (scb >> 12) & 0xF));
+                const float d8 = __int_as_float(yr[8]);
+                sd[c] = __builtin_fmaf(d8*inv, (float) SD, sd[c]);
+                sm[c] = __builtin_fmaf(d8, (float) SM, sm[c]);
+            }
+        }
+        const float2 dm = __half22float2(*(const half2 *) &r.dm);
+#pragma unroll
+        for (int c = 0; c < NC; ++c) out[c] = dm.x*sd[c] - dm.y*sm[c];
+    } else {   // IQ1_M (packed grid table), P = 2
+        constexpr int P = T::SPI;
+        const int ib0 = T::SPI*it;
+        const uint32_t u16 = ((r.sc.x & 0xFFFF) >> 12) | ((r.sc.x >> 24) & 0x00F0) | (((r.sc.y & 0xFFFF) >> 4) & 0x0F00) | ((r.sc.y >> 16) & 0xF000);
+        const float dblk = h2f(u16);
+        const uint32_t scw16 = ((ib0 < 4 ? r.sc.x : r.sc.y) >> (16*((ib0 >> 1) & 1))) & 0xFFFF;
+        float sum[NC];
+#pragma unroll
+        for (int c = 0; c < NC; ++c) sum[c] = 0.0f;
+#pragma unroll
+        for (int p = 0; p < P; ++p) {
+            const uint32_t Q = r.a[p];
+            const uint32_t qh = (r.b >> (16*p)) & 0xFFFF;
+            const uint32_t qhb = (qh & 0x0707u) | ((qh >> 4) & 0x0707u) << 16;
+            const uint32_t X = perm(qhb, Q, 0x06010400u), Z = perm(qhb, Q, 0x07030502u);
+            const uint32_t w0 = tab_u32(tab, 0, X & 0xFFFF), w1 = tab_u32(tab, 0, X >> 16);
+            const uint32_t w2 = tab_u32(tab, 0, Z & 0xFFFF), w3 = tab_u32(tab, 0, Z >> 16);
+            const uint2 g0 = make_uint2(w0 & 0x0F0F0F0Fu, (w0 >> 4) & 0x0F0F0F0Fu), g1 = make_uint2(w1 & 0x0F0F0F0Fu, (w1 >> 4) & 0x0F0F0F0Fu);
+            const uint2 g2 = make_uint2(w2 & 0x0F0F0F0Fu, (w2 >> 4) & 0x0F0F0F0Fu), g3 = make_uint2(w3 & 0x0F0F0F0Fu, (w3 >> 4) & 0x0F0F0F0Fu);
+            const int b0 = (int) ((qh >> 3) & 1), b1 = (int) ((qh >> 7) & 1), b2 = (int) ((qh >> 11) & 1), b3 = (int) ((qh >> 15) & 1);
+            const uint32_t tmp = scw16 >> (6*((ib0 + p) & 1));
+            const int sc0 = 2*(int) (tmp & 7) + 1, sc1 = 2*(int) ((tmp >> 3) & 7) + 1;
+#pragma unroll
+            for (int c = 0; c < NC; ++c) {
+                yptr yr = yr0 + c*colw + p*yrec<2>::W;
+                const int i01 = dp4a((int) g1.y, yr[3], dp4a((int) g1.x, yr[2], dp4a((int) g0.y, yr[1], dp4a0((int) g0.x, yr[0]))));
+                const int i23 = dp4a((int) g3.y, yr[7], dp4a((int) g3.x, yr[6], dp4a((int) g2.y, yr[5], dp4a0((int) g2.x, yr[4]))));
+                const int S0 = mad24(b1, yr[12], mad24(b0, yr[11], 8*i01 + yr[9]));
+                const int S1 = mad24(b3, yr[14], mad24(b2, yr[13], 8*i23 + yr[10]));
+                const float m = dblk * __int_as_float(yr[8]);
+                const float f = (float) mad24(S0, sc0, mul24(S1, sc1)) * 0.125f;
+                sum[c] = sum[c] + m * f;
+            }
+        }
+#pragma unroll
+        for (int c = 0; c < NC; ++c) out[c] = sum[c];
+    }
+}
+template <class T, int L, int R, int NW, int NC>
+__launch_bounds__(NW*64, 1)
+__global__ void gemv_nc(const soa s, const block_q8_1 * __restrict__ yg, const int ys, float * __restrict__ dst, const int ldd,
+        const int K, const int N, const float * __restrict__ residual, const int ldr) {
+#pragma clang fp contract(off)
+    extern __shared__ uint32_t smem[];   // [tables (at LDS address 0) | y records of column 0 | column 1 | ...]
+    uint32_t * tab = smem;
+    int * yrec_base = (int *) (smem + T::TAB_WORDS);
+#if LB_TAB0 && defined(__HIP_DEVICE_COMPILE__)
+    if ((uint32_t) (size_t) (__attribute__((address_space(3))) uint32_t *) smem != 0) __builtin_trap();
+#endif
+    constexpr int G = 64/L;
+    const int tid = threadIdx.y*64 + threadIdx.x;
+    const int lane = threadIdx.x % L, grp = threadIdx.x / L;
+    const int bpr = K / QK_K;
+    const int items = bpr*T::IPB;
+    const int U = N / (G*R);
+    const int ustep = gridDim.x*NW;
+    const int colw = (K/32)*yrec<T::YMODE>::W;   // y record words per column
+    int u = threadIdx.y*gridDim.x + blockIdx.x;
+    T::stage_tables(tab, tid, NW*64);
+#pragma unroll
+    for (int c = 0; c < NC; ++c) stage_y<T::YMODE>(yrec_base + c*colw, yg + (size_t) c*ys, K, tid, NW*64);
+    __syncthreads();
+    for (; u < U; u += ustep) {
+        const int row0 = (u*G + grp)*R;
+        float acc[NC][R];
+#pragma unroll
+        for (int c = 0; c < NC; ++c)
+#pragma unroll
+            for (int r = 0; r < R; ++r) acc[c][r] = 0.0f;
+        for (int it = lane; it < items; it += L) {
+            const uint32_t kb = it / T::IPB, ii = it % T::IPB;
+            const yptr yr0 = yrec_ptr<T>(yrec_base, kb*8 + ii*T::SPI);
+            typename T::raw cur[R];
+#pragma unroll
+            for (int r = 0; r < R; ++r) cur[r] = T::load(s, (uint32_t) (row0 + r)*bpr + kb, ii);
+#pragma unroll
+            for (int r = 0; r < R; ++r) {
+                float v[NC];
+                compute_nc<T, NC>(tab, cur[r], yr0, colw, ii, v);
+#pragma unroll
+                for (int c = 0; c < NC; ++c) acc[c][r] = acc[c][r] + v[c];
+            }
+        }
+#pragma unroll
+        for (int c = 0; c < NC; ++c)
+#pragma unroll
+            for (int r = 0; r < R; ++r) {
+                const float v = group_sum<L>(acc[c][r]);
+                if (lane == 0) {
+                    const int row = row0 + r;
+                    dst[(size_t) c*ldd + row] = residual ? v + residual[(size_t) c*ldr + row] : v;
+                }
+            }
+    }
+}
+
+// K-chunked variant for shapes where the y records of all NC columns do not fit next to the tables (ffn_down,
+// K = 17408): y is staged KCB 256-blocks at a time and each wave keeps the accumulators of its UM units (unit k:
+// u0 + k*ustep) across the chunks. Lane l still takes items l, l+L, ... in increasing order (a chunk boundary only
+// pauses it), so the result per column is the same as gemv<> / gemv_nc<>.
+template <class T, int L, int R, int NW, int NC, int UM>
+__launch_bounds__(NW*64, 1)
+__global__ void gemv_nck(const soa s, const block_q8_1 * __restrict__ yg, const int ys, float * __restrict__ dst, const int ldd,
+        const int K, const int N, const float * __restrict__ residual, const int ldr, const int KCB) {
+#pragma clang fp contract(off)
+    extern __shared__ uint32_t smem[];   // [tables (at LDS address 0) | chunk y records of column 0 | column 1 | ...]
+    uint32_t * tab = smem;
+    int * yrec_base = (int *) (smem + T::TAB_WORDS);
+#if LB_TAB0 && defined(__HIP_DEVICE_COMPILE__)
+    if ((uint32_t) (size_t) (__attribute__((address_space(3))) uint32_t *) smem != 0) __builtin_trap();
+#endif
+    constexpr int G = 64/L;
+    const int tid = threadIdx.y*64 + threadIdx.x;
+    const int lane = threadIdx.x % L, grp = threadIdx.x / L;
+    const int bpr = K / QK_K;
+    const int U = N / (G*R);
+    const int ustep = gridDim.x*NW;
+    const int colw = KCB*8*yrec<T::YMODE>::W;   // y record words per column per chunk
+    const int u0 = threadIdx.y*gridDim.x + blockIdx.x;
+    T::stage_tables(tab, tid, NW*64);
+    float acc[UM][NC][R];
+#pragma unroll
+    for (int k = 0; k < UM; ++k)
+#pragma unroll
+        for (int c = 0; c < NC; ++c)
+#pragma unroll
+            for (int r = 0; r < R; ++r) acc[k][c][r] = 0.0f;
+    int it0 = lane;   // next item of this lane
+    for (int kb0 = 0; kb0 < bpr; kb0 += KCB) {
+        const int nkb = min(KCB, bpr - kb0);
+        __syncthreads();   // the previous chunk (and the tables, first time) are done with
+#pragma unroll
+        for (int c = 0; c < NC; ++c) stage_y<T::YMODE>(yrec_base + c*colw, yg + (size_t) c*ys + (size_t) kb0*(QK_K/QK8_1), nkb*QK_K, tid, NW*64);
+        __syncthreads();
+        const int it_end = (kb0 + nkb)*T::IPB;
+#pragma unroll
+        for (int k = 0; k < UM; ++k) {
+            const int u = u0 + k*ustep;
+            if (u >= U) break;
+            const int row0 = (u*G + grp)*R;
+            for (int it = it0; it < it_end; it += L) {
+                const uint32_t kb = it / T::IPB, ii = it % T::IPB;
+                const yptr yr0 = yrec_ptr<T>(yrec_base, (kb - kb0)*8 + ii*T::SPI);
+                typename T::raw cur[R];
+#pragma unroll
+                for (int r = 0; r < R; ++r) cur[r] = T::load(s, (uint32_t) (row0 + r)*bpr + kb, ii);
+#pragma unroll
+                for (int r = 0; r < R; ++r) {
+                    float v[NC];
+                    compute_nc<T, NC>(tab, cur[r], yr0, colw, ii, v);
+#pragma unroll
+                    for (int c = 0; c < NC; ++c) acc[k][c][r] = acc[k][c][r] + v[c];
+                }
+            }
+        }
+        if (it0 < it_end) it0 += ((it_end - it0 + L - 1)/L)*L;
+    }
+#pragma unroll
+    for (int k = 0; k < UM; ++k) {
+        const int u = u0 + k*ustep;
+        if (u >= U) break;
+        const int row0 = (u*G + grp)*R;
+#pragma unroll
+        for (int c = 0; c < NC; ++c)
+#pragma unroll
+            for (int r = 0; r < R; ++r) {
+                const float v = group_sum<L>(acc[k][c][r]);
+                if (lane == 0) {
+                    const int row = row0 + r;
+                    dst[(size_t) c*ldd + row] = residual ? v + residual[(size_t) c*ldr + row] : v;
+                }
+            }
+    }
+}
+
+template <class T> static inline size_t gemv_nc_lds(int K, int nc) {
+    return (size_t) T::TAB_WORDS*4 + (size_t) nc*(K/32)*yrec<T::YMODE>::W*4;
+}
+
+static inline int nc_env(const char * name, int def) {
+    const char * v = getenv(name);
+    return v ? atoi(v) : def;
+}
+
+static inline int nc_num_cu() {
+    static const int n = [] {
+        int dev = 0, v = 0;
+        if (hipGetDevice(&dev) != hipSuccess || hipDeviceGetAttribute(&v, hipDeviceAttributeMultiprocessorCount, dev) != hipSuccess || v <= 0) {
+            (void) hipGetLastError();
+            v = 104;
+        }
+        return v;
+    }();
+    return n;
+}
+
+// K-chunked launch of all nc columns; 0 if not applicable (then column passes)
+template <class T, int L, int R, int NW>
+static inline int launch_nck_t(const soa & s, const block_q8_1 * y, int ys, float * dst, int ldd, int K, int N, int nc, int grid,
+        hipStream_t st, const float * residual, int ldr) {
+    // only the configs whose y records can overflow LDS at NC <= 6 and where one K-chunked pass beats column passes
+    // (measured, ffn_down 5120x17408 at NC = 4: IQ2_S 114 -> 86 us; Q2_K: column passes of 2 are faster, 2x45 us
+    // vs 97 us): the K > 8192 IQ2 ones (L = 64) and IQ1_M (K = 5120 at NC = 6)
+    if constexpr (!(L == 64 || T::type == GGML_TYPE_IQ1_M)) {
+        GGML_UNUSED_VARS(s, y, ys, dst, ldd, K, N, nc, grid, st, residual, ldr);
+        return 0;
+    } else {
+    static const int enabled = nc_env("GGML_MMVQ_NC_LB_KCHUNK", 1);
+    static const int grid_k  = nc_env("GGML_MMVQ_NC_LB_KGRID", 0);
+    if (!enabled) return 0;
+    const int bpr = K/QK_K;
+    const size_t per_blk = (size_t) nc*8*yrec<T::YMODE>::W*4;   // LDS bytes per 256-block of all columns
+    static const int lds_cap = std::min(nc_env("GGML_MMVQ_NC_LB_KLDS", 65536), 65536);   // LDS per workgroup (32768: 2 per CU; at most 64 KB)
+    const int kcb_max = (int) (((size_t) lds_cap - (size_t) T::TAB_WORDS*4)/per_blk);
+    if (kcb_max < 1) return 0;
+    const int nchunks = (bpr + kcb_max - 1)/kcb_max;
+    const int KCB = (bpr + nchunks - 1)/nchunks;
+    grid = grid_k > 0 ? grid_k : nc_num_cu();   // one workgroup per CU (the chunk fills the LDS)
+    const int U = N/((64/L)*R);
+    const int um = (U + grid*NW - 1)/(grid*NW);
+    const size_t lds = (size_t) T::TAB_WORDS*4 + (size_t) KCB*per_blk;
+    const dim3 b(64, NW);
+#define LB_NCK(NC_, UM_) if (nc == NC_ && um == UM_) { hipLaunchKernelGGL((gemv_nck<T, L, R, NW, NC_, UM_>), dim3(grid), b, lds, st, s, y, ys, dst, ldd, K, N, residual, ldr, KCB); return NC_; }
+#define LB_NCK_U(NC_) LB_NCK(NC_, 1) LB_NCK(NC_, 2) LB_NCK(NC_, 3) LB_NCK(NC_, 4)
+    LB_NCK_U(2) LB_NCK_U(3) LB_NCK_U(4) LB_NCK_U(5) LB_NCK_U(6)
+#undef LB_NCK_U
+#undef LB_NCK
+    return 0;
+    }
+}
+
+// tuning knobs for the NC launches (debug: GGML_MMVQ_NC_LB_GRID overrides the grid of every NC launch)
+static inline int nc_grid_override() {
+    static const int g = [] { const char * v = getenv("GGML_MMVQ_NC_LB_GRID"); return v ? atoi(v) : 0; }();
+    return g;
+}
+
+// largest column count <= nc whose y records fit next to the tables (1 = only the N=1 kernel fits)
+template <class T> static inline int nc_fit(int K, int nc) {
+    while (nc > 1 && gemv_nc_lds<T>(K, nc) > 65536) --nc;
+    return nc;
+}
+
+template <class T, int L, int R, int NW>
+static inline int launch_nc_t(const soa & s, const block_q8_1 * y, int ys, float * dst, int ldd, int K, int N, int nc, int grid,
+        hipStream_t st, const float * residual, int ldr) {
+    const int fit = nc_fit<T>(K, nc);
+    if (fit < nc) {   // all columns in one pass over the weights with K-chunked y staging
+        const int done = launch_nck_t<T, L, R, NW>(s, y, ys, dst, ldd, K, N, nc, grid, st, residual, ldr);
+        if (done) return done;
+    }
+    if (fit < nc && fit >= 2) {   // column passes of balanced sizes (4 = 2+2, not 3+1)
+        const int passes = (nc + fit - 1)/fit;
+        nc = (nc + passes - 1)/passes;
+    } else {
+        nc = fit;
+    }
+    if (N % ((64/L)*R) != 0) return 0;
+    const size_t lds = gemv_nc_lds<T>(K, nc);
+    const dim3 b(64, NW);
+    switch (nc) {
+        case 2: hipLaunchKernelGGL((gemv_nc<T, L, R, NW, 2>), dim3(grid), b, lds, st, s, y, ys, dst, ldd, K, N, residual, ldr); return 2;
+        case 3: hipLaunchKernelGGL((gemv_nc<T, L, R, NW, 3>), dim3(grid), b, lds, st, s, y, ys, dst, ldd, K, N, residual, ldr); return 3;
+        case 4: hipLaunchKernelGGL((gemv_nc<T, L, R, NW, 4>), dim3(grid), b, lds, st, s, y, ys, dst, ldd, K, N, residual, ldr); return 4;
+        case 5: hipLaunchKernelGGL((gemv_nc<T, L, R, NW, 5>), dim3(grid), b, lds, st, s, y, ys, dst, ldd, K, N, residual, ldr); return 5;
+        case 6: hipLaunchKernelGGL((gemv_nc<T, L, R, NW, 6>), dim3(grid), b, lds, st, s, y, ys, dst, ldd, K, N, residual, ldr); return 6;
+        default: return 0;   // 1 column (or none) fits: the caller runs the N=1 kernel
+    }
+}
+
+typedef iq2_s_t<false, 1> nc_s1; typedef iq2_s_t<false, 2> nc_s2; typedef iq2_xs_t<false, 1> nc_xs1; typedef iq2_xs_t<false, 2> nc_xs2;
+typedef iq2_xxs_t<false, 1> nc_xxs1; typedef iq2_xxs_t<false, 2> nc_xxs2;
+// one NC launch for up to nc columns; returns the number of columns done (0: run column 0 with launch())
+static inline int launch_nc_chunk(ggml_type t, const soa & s, const block_q8_1 * y, int ys, float * dst, int ldd, int K, int N, int nc,
+        hipStream_t st, const float * residual, int ldr) {
+    const launch_cfg c = pick_cfg(t, N, K);   // L and P fix the fp32 accumulation order: keep them
+    const int grid = nc_grid_override() > 0 ? nc_grid_override() : c.grid;
+    static const int rr = nc_env("GGML_MMVQ_NC_LB_R", 1);   // tuning: rows per lane group
+#define LB_NC(T, L_) if (c.L == L_) return rr == 2 ? launch_nc_t<T, L_, 2, 16>(s, y, ys, dst, ldd, K, N, nc, grid, st, residual, ldr) : launch_nc_t<T, L_, 1, 16>(s, y, ys, dst, ldd, K, N, nc, grid, st, residual, ldr);
+    switch (t) {
+        case GGML_TYPE_IQ2_S:
+            if (c.P == 1) { LB_NC(nc_s1, 64) LB_NC(nc_s1, 32) }
+            else          { LB_NC(nc_s2, 64) LB_NC(nc_s2, 16) }
+            break;
+        case GGML_TYPE_IQ2_XS:
+            if (c.P == 1) { LB_NC(nc_xs1, 64) LB_NC(nc_xs1, 32) }
+            else          { LB_NC(nc_xs2, 16) }
+            break;
+        case GGML_TYPE_IQ2_XXS:
+            if (c.P == 1) { LB_NC(nc_xxs1, 64) LB_NC(nc_xxs1, 32) }
+            else          { LB_NC(nc_xxs2, 16) }
+            break;
+        case GGML_TYPE_Q2_K:
+            LB_NC(q2_K, 16)
+            break;
+        case GGML_TYPE_IQ1_M:
+            LB_NC(iq1_m_pk, 16)
+            break;
+        default: break;
+    }
+#undef LB_NC
+    return 0;
+}
+
+// all nc columns (column passes when the y records of all columns do not fit in LDS; a single remaining column runs
+// the N=1 launcher itself). Returns false only for unsupported types / shapes, all checked before anything is launched:
+// launch_ok is exactly the condition under which launch() (the single-column fallback) succeeds, and a pass of 2+
+// columns either launches or reports 0 columns done (then launch() runs that column), so nothing fails mid-way.
+static inline bool launch_nc(ggml_type t, const void * soa_base, const block_q8_1 * y, int ys, float * dst, int ldd, int K, int N, int nc,
+        hipStream_t st, const float * residual, int ldr) {
+    if (K % 256 != 0 || N % 64 != 0 || nc < 2 || nc > LB_NC_MAX || !supported(t) || !launch_ok(t, K, N)) return false;
+    const launch_cfg c = pick_cfg(t, N, K);
+    if (c.L == 0) return false;
+    const soa s = soa_make(t, soa_base, (size_t) N*(K/QK_K));
+    for (int c0 = 0; c0 < nc; ) {
+        const float * res = residual ? residual + (size_t) c0*ldr : nullptr;
+        int done = nc - c0 >= 2 ? launch_nc_chunk(t, s, y + (size_t) c0*ys, ys, dst + (size_t) c0*ldd, ldd, K, N, nc - c0, st, res, ldr) : 0;
+        if (done == 0) {
+            if (!launch(t, soa_base, y + (size_t) c0*ys, dst + (size_t) c0*ldd, K, N, st, res)) return false;
+            done = 1;
+        }
+        c0 += done;
+    }
+    return true;
+}
+// ================================================================================================ MMVQ-NC lowbit end
+
 } // namespace lb

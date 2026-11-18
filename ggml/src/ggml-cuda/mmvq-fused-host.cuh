@@ -13,6 +13,13 @@ bool ggml_cuda_mmvq_fused_preq(ggml_backend_cuda_context & ctx, const ggml_tenso
 
 // invalidate the per-stream cache of the quantized single-token activation (call at the start of every graph evaluation)
 void ggml_cuda_mmvq_cache_reset(ggml_backend_cuda_context & ctx);
+// drop the cached activation whose f32 source bytes a node writes (the graph loop calls these for every executed node,
+// see mmvq.cu): _invalidate with MMVQ_Q8_INV_NODE before a node / the first node of a fused group (starts a new group),
+// with MMVQ_Q8_INV_AHEAD before a member that a fusion runs ahead of the rest of its group; _invalidate_group after a
+// fused group nodes[0..n) for all its members (keeps what the group produced last for a member)
+enum { MMVQ_Q8_INV_NODE = 0, MMVQ_Q8_INV_AHEAD = 1 };
+void ggml_cuda_mmvq_cache_invalidate(ggml_backend_cuda_context & ctx, const ggml_tensor * node, int mode);
+void ggml_cuda_mmvq_cache_invalidate_group(ggml_backend_cuda_context & ctx, ggml_tensor * const * nodes, int n);
 // producer API (mmvq.cu): get the cache buffer for the q8_1 blocks + int sums of the single-row activation t
 bool ggml_cuda_mmvq_cache_produce(ggml_backend_cuda_context & ctx, const ggml_tensor * t, block_q8_1 ** q8, int ** sums);
 // free the per-stream state of the activation cache (mmvq.cu) and of the cooperative quantizer (mmvq-fused.cu) of a
@@ -88,6 +95,41 @@ bool ggml_cuda_mmvq_q8_cached(ggml_backend_cuda_context & ctx, const ggml_tensor
 // glu (optional): the SWIGLU node of a gate/up pair, computed in the same launch (+ its q8_1 for ffn_down).
 // GGML_MMVQ_MIX=0 disables, =2 runs the IQ4 job first, GGML_MMVQ_MIX_GLU=0 keeps the SwiGLU separate.
 // soa_il4: the iq4k IL = 4 copy (mmvq-iq4k.cu).
+// MMVQ-NC S: N-column (2 <= ncols <= nc_max) GEMVs for multi-token verification. nc_max: GGML_MMVQ_NC_MAX (default 4,
+// 2..6), 0 if GGML_MMVQ_NC=0. q8_cached_nc: q8_1 of a [K, ncols] f32 activation (K % 512 == 0) from the activation cache,
+// column c at q8 + c*K/32 (byte-identical to the single-row quantization of every column). fusion_ok: will
+// ggml_cuda_mul_mat_vec_q fuse this MUL_MAT (N columns) with a SwiGLU gate (gate_w) or a residual add; it is exact (a
+// promised fusion that no NC slot takes aborts) and may create a low-bit SoA copy outside stream capture (ctx).
+bool ggml_cuda_mmvq_nc_enabled();
+int  ggml_cuda_mmvq_nc_max();
+bool ggml_cuda_mmvq_q8_cached_nc(ggml_backend_cuda_context & ctx, const ggml_tensor * src1, const block_q8_1 ** q8, const int ** sums);
+bool ggml_cuda_mmvq_nc_fusion_ok(ggml_backend_cuda_context & ctx, const ggml_tensor * mm, const ggml_tensor * gate_w, bool residual);
+// MMVQ-NC B: IQ4_XS / Q4_K N-column GEMVs (mmvq-iq4k.cu, iq4k-gemv-nc.cuh). _ok: exact predicate of _nc (types, shapes,
+// LDS, existing SoA copies); _nc: y = q8_1 columns at y + j*(GGML_PAD(K, 512)/32); false: nothing launched.
+// capturing: the stream of the caller is being captured (no SoA copy can be created, also not in verify mode)
+bool ggml_cuda_mmvq_iq4k_nc_ok(const ggml_tensor * w, const ggml_tensor * gate_w, bool residual, int ncols, bool capturing);
+bool ggml_cuda_mmvq_iq4k_nc(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const block_q8_1 * y, int ncols, ggml_tensor * dst,
+        const ggml_cuda_mm_fusion_args_host * fusion);
+// _nc plus the GGML_MMVQ_NC_VERIFY=n debug check (first n launches compared bitwise with the single-token path per column)
+bool ggml_cuda_mmvq_iq4k_nc_checked(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1,
+        const block_q8_1 * y, int ncols, ggml_tensor * dst, const ggml_cuda_mm_fusion_args_host * fusion);
+// Q4_K with ne11 = 4..NC max goes to MMVQ (N-column iq4k kernels) instead of MMQ on CDNA2
+bool ggml_cuda_mmvq_iq4k_nc_route(int64_t ne11);
+// MMVQ-NC C: low-bit (IQ2_S/IQ2_XS/IQ2_XXS/Q2_K/IQ1_M) N-column GEMVs (mmvq-lowbit.cu, lowbit-gemv.cuh): q8_1 column j at
+// y + j*GGML_PAD(K, 512)/32, dst column j at dst->data + j*dst->nb[1]; plain and residual epilogues. _ok is exact (incl.
+// the existing SoA copy); _prepare creates the copy outside stream capture. false: nothing launched.
+bool ggml_cuda_mmvq_lowbit_nc_ok(const ggml_tensor * w, const ggml_tensor * gate_w, bool residual, int ncols);
+void ggml_cuda_mmvq_lowbit_nc_prepare(ggml_backend_cuda_context & ctx, const ggml_tensor * w, int ncols);
+bool ggml_cuda_mmvq_lowbit_nc(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const block_q8_1 * y, int ncols, ggml_tensor * dst,
+        const ggml_cuda_mm_fusion_args_host * fusion);
+// MMVQ-NC A: N-column IQ3_S/IQ3_XXS GEMVs (mmvq-iq3.cu, iq3gemv-nc.cuh), per column bit-identical to the single-token path.
+// y: q8_1 activation, column c at y + c*GGML_PAD(K, 512)/32. _ok is exact (true only if the launch will happen).
+bool ggml_cuda_mmvq_iq3_nc_ok(const ggml_tensor * w, const ggml_tensor * gate_w, bool residual, int ncols);
+bool ggml_cuda_mmvq_iq3_nc(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const block_q8_1 * y, int ncols, ggml_tensor * dst,
+        const ggml_cuda_mm_fusion_args_host * fusion);
+bool ggml_cuda_mmvq_iq3_multi_nc_ok(const ggml_tensor * const * w, int n, int ncols);
+bool ggml_cuda_mmvq_iq3_multi_nc(ggml_backend_cuda_context & ctx, const ggml_tensor * const * w, ggml_tensor * const * dst, int n,
+        const block_q8_1 * y, int ncols);
 bool ggml_cuda_mmvq_mix_member(const ggml_tensor * mm);
 bool ggml_cuda_mmvq_mix(ggml_backend_cuda_context & ctx, ggml_tensor * const * mm, int n, ggml_tensor * glu = nullptr);
 const void * ggml_cuda_mmvq_iq4k_soa_il4(const ggml_tensor * w, int device, cudaStream_t stream);

@@ -1318,6 +1318,9 @@ struct test_case {
     virtual bool run_whole_graph() { return false; }
     virtual std::vector<ggml_tensor *> fusion_test_nodes() { return {}; }
     virtual bool use_weight_context() { return false; }
+    // evaluate the graph once on backend1 before the comparison (then re-initialize the inputs): state the backend creates
+    // in the first evaluation (re-laid-out weight copies) is then in place, as in the second token of a model
+    virtual bool warmup_backend1() { return false; }
 
     ggml_cgraph * gf = nullptr;
     ggml_cgraph * gb = nullptr;
@@ -1500,6 +1503,10 @@ struct test_case {
         initialize_tensors(ctx.get());
         if (ctx_weights) {
             initialize_tensors(ctx_weights.get());
+        }
+        if (warmup_backend1()) {
+            ggml_backend_graph_compute(backend1, gf);
+            initialize_tensors(ctx.get());
         }
 
         // TODO: [TAG_MUL_MAT_ID_SKIP] @ngxson : remove this once CUDA implements mul_mat_id with -1 = skipped
@@ -8196,6 +8203,10 @@ enum gemm_fusion_pattern {
     GEMM_FUSION_FFN_SHARED_AFTER,  // as GEMM_FUSION_FFN, another mat-mul of the same input after the down mat-mul
     GEMM_FUSION_FFN_GEGLU,       // as GEMM_FUSION_FFN with GEGLU (must not be merged as SwiGLU)
     GEMM_FUSION_FFN_GATE_OUT,    // as GEMM_FUSION_FFN, the gate mat-mul result is a graph output
+    GEMM_FUSION_FFN_IQ3MIX,      // as GEMM_FUSION_FFN_ADD with the up weight of the other IQ3 type (IQ3_S <-> IQ3_XXS)
+    GEMM_FUSION_NORM_SHARED_IQ3MIX, // as GEMM_FUSION_NORM_SHARED, the second weight of the other IQ3 type and 3/5 of the rows
+    GEMM_FUSION_MM,              // a plain mul_mat (MMVQ-NC B)
+    GEMM_FUSION_RES_INPLACE,     // as GEMM_FUSION_RES_REUSED, the residual is updated by a plain in-place add (no mat-mul)
 };
 
 static std::string var_to_str(gemm_fusion_pattern pattern) {
@@ -8219,6 +8230,10 @@ static std::string var_to_str(gemm_fusion_pattern pattern) {
         case GEMM_FUSION_FFN_SHARED_AFTER:  return "ffn-shared-after";
         case GEMM_FUSION_FFN_GEGLU:       return "ffn-geglu";
         case GEMM_FUSION_FFN_GATE_OUT:    return "ffn-gate-out";
+        case GEMM_FUSION_FFN_IQ3MIX:      return "ffn-iq3mix-add";
+        case GEMM_FUSION_NORM_SHARED_IQ3MIX: return "norm-2mm-iq3mix";
+        case GEMM_FUSION_MM:              return "mm";
+        case GEMM_FUSION_RES_INPLACE:     return "res-inplace";
     }
     return "unknown";
 }
@@ -8231,8 +8246,10 @@ struct test_gemm_fusion : public test_case {
     const gemm_fusion_pattern pattern;
     std::vector<ggml_tensor *> expand_order; // expanded in this order before the returned tensor
 
-    test_gemm_fusion(ggml_type type_a, int64_t m, int64_t n, int64_t k, gemm_fusion_pattern pattern)
-        : type_a(type_a), m(m), n(n), k(k), pattern(pattern) {}
+    test_gemm_fusion(ggml_type type_a, int64_t m, int64_t n, int64_t k, gemm_fusion_pattern pattern, bool warm = false)
+        : type_a(type_a), m(m), n(n), k(k), pattern(pattern), warm(warm) {}
+    const bool warm;
+    bool warmup_backend1() override { return warm; }
 
     std::string vars() override {
         return VARS_TO_STR5(type_a, m, n, k, pattern);
@@ -8274,6 +8291,11 @@ struct test_gemm_fusion : public test_case {
                         out = ggml_add_inplace(ctx, res, out);
                     }
                 } break;
+            case GEMM_FUSION_MM:
+                {
+                    ggml_tensor * b = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, n);
+                    out = ggml_mul_mat(ctx, a, b);
+                } break;
             case GEMM_FUSION_ADD:
             case GEMM_FUSION_ADD_RESHAPE:
                 {
@@ -8286,21 +8308,30 @@ struct test_gemm_fusion : public test_case {
                     }
                     out = ggml_add_inplace(ctx, res, out);
                 } break;
+            case GEMM_FUSION_NORM_SHARED_IQ3MIX:
             case GEMM_FUSION_NORM_SHARED:
             case GEMM_FUSION_NORM_SHARED_ADD:
                 {
                     ggml_tensor * x  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, n);
                     ggml_tensor * w  = ggml_new_tensor_1d(ctx_weights, GGML_TYPE_F32, k);
-                    ggml_tensor * a2 = ggml_new_tensor_2d(ctx_weights, type_a, k, m);
+                    // IQ3MIX: the other IQ3 type, 3/5 of the rows (qkv + z of the linear-attention layers: 10240 + 6144)
+                    ggml_tensor * a2 = pattern == GEMM_FUSION_NORM_SHARED_IQ3MIX ?
+                        ggml_new_tensor_2d(ctx_weights, type_a == GGML_TYPE_IQ3_S ? GGML_TYPE_IQ3_XXS : GGML_TYPE_IQ3_S, k, (m*3/5 + 3)/4*4) :
+                        ggml_new_tensor_2d(ctx_weights, type_a, k, m);
                     ggml_tensor * y  = ggml_mul(ctx, ggml_rms_norm(ctx, x, 1e-6f), w);
                     ggml_tensor * mm = ggml_mul_mat(ctx, a, y);
                     if (pattern == GEMM_FUSION_NORM_SHARED_ADD) {
                         ggml_tensor * res = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, m, n);
                         mm = ggml_add_inplace(ctx, res, mm);
                     }
+                    if (pattern == GEMM_FUSION_NORM_SHARED_IQ3MIX) {
+                        out = ggml_concat(ctx, mm, ggml_mul_mat(ctx, a2, y), 0);
+                        break;
+                    }
                     out = ggml_add(ctx, mm, ggml_mul_mat(ctx, a2, y));
                 } break;
             case GEMM_FUSION_RES_REUSED:
+            case GEMM_FUSION_RES_INPLACE:
                 {
                     // u = (wa + wb) res; res += a b (in place); v = (wa + wb) res; out = u + v, evaluated in this order.
                     // The mat-muls of v read the very same tensor as those of u, but behind the in-place sum: they
@@ -8311,7 +8342,9 @@ struct test_gemm_fusion : public test_case {
                     ggml_tensor * wa  = ggml_new_tensor_2d(ctx_weights, type_a, m, 64);
                     ggml_tensor * wb  = ggml_new_tensor_2d(ctx_weights, type_a, m, 64);
                     ggml_tensor * u   = ggml_add(ctx, ggml_mul_mat(ctx, wa, res), ggml_mul_mat(ctx, wb, res));
-                    ggml_tensor * sum = ggml_add_inplace(ctx, res, ggml_mul_mat(ctx, a, b));
+                    ggml_tensor * sum = pattern == GEMM_FUSION_RES_INPLACE ?
+                        ggml_add_inplace(ctx, res, ggml_new_tensor_2d(ctx, GGML_TYPE_F32, m, n)) :
+                        ggml_add_inplace(ctx, res, ggml_mul_mat(ctx, a, b));
                     ggml_tensor * v   = ggml_add(ctx, ggml_mul_mat(ctx, wa, res), ggml_mul_mat(ctx, wb, res));
                     // nothing but the node order says that v reads the residual after the sum was added to it
                     expand_order = { u, sum, v };
@@ -8341,9 +8374,11 @@ struct test_gemm_fusion : public test_case {
             case GEMM_FUSION_FFN_UP_FIRST:
             case GEMM_FUSION_FFN_MIXED:
             case GEMM_FUSION_FFN_GATE_USED:
+            case GEMM_FUSION_FFN_IQ3MIX:
                 {
                     // x [m, n] -> gate/up [k, n] -> down (a) -> [m, n]; a merged gate/up GEMM must give the same result
-                    const ggml_type type_up = pattern == GEMM_FUSION_FFN_MIXED && type_a == GGML_TYPE_IQ3_S ? GGML_TYPE_IQ4_XS : type_a;
+                    const ggml_type type_up = pattern == GEMM_FUSION_FFN_MIXED && type_a == GGML_TYPE_IQ3_S ? GGML_TYPE_IQ4_XS :
+                        pattern == GEMM_FUSION_FFN_IQ3MIX ? (type_a == GGML_TYPE_IQ3_S ? GGML_TYPE_IQ3_XXS : GGML_TYPE_IQ3_S) : type_a;
                     ggml_tensor * x  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, m, n);
                     ggml_tensor * wg = ggml_new_tensor_2d(ctx_weights, type_a,  m, k);
                     ggml_tensor * wu = ggml_new_tensor_2d(ctx_weights, type_up, m, k);
@@ -8357,7 +8392,7 @@ struct test_gemm_fusion : public test_case {
                         up   = ggml_mul_mat(ctx, wu, x);
                     }
                     out = ggml_mul_mat(ctx, a, ggml_swiglu_split(ctx, gate, up));
-                    if (pattern == GEMM_FUSION_FFN_ADD || pattern == GEMM_FUSION_FFN_MIXED) {
+                    if (pattern == GEMM_FUSION_FFN_ADD || pattern == GEMM_FUSION_FFN_MIXED || pattern == GEMM_FUSION_FFN_IQ3MIX) {
                         ggml_tensor * res = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, m, n);
                         out = ggml_add_inplace(ctx, res, out);
                     }
@@ -8409,6 +8444,57 @@ struct test_gemm_fusion : public test_case {
         for (ggml_tensor * t : expand_order) {
             ggml_build_forward_expand(gf, t);
         }
+    }
+};
+
+// MMVQ-NC mix: two mat-muls (weights type_1 [k, m1] and type_2 [k, m2]) on the same normed activation of n columns, as
+// the linear-attention qkv + z pair (out = concat) or a gate/up pair (glu: out = swiglu(first, second), m1 == m2). With
+// one IQ3_S/IQ3_XXS and one IQ4_XS/Q4_K weight the HIP backend runs them as one mixed pair launch (n = 1..NC_MAX).
+struct test_mix_pair : public test_case {
+    const ggml_type type_1;
+    const ggml_type type_2;
+    const int64_t m1;
+    const int64_t m2;
+    const int64_t n;
+    const int64_t k;
+    const bool glu;
+
+    test_mix_pair(ggml_type type_1, ggml_type type_2, int64_t m1, int64_t m2, int64_t n, int64_t k, bool glu)
+        : type_1(type_1), type_2(type_2), m1(m1), m2(m2), n(n), k(k), glu(glu) {}
+
+    std::string vars() override {
+        return VARS_TO_STR7(type_1, type_2, m1, m2, n, k, glu);
+    }
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "MIX_PAIR";
+    }
+
+    bool run_whole_graph() override { return true; }
+    bool use_weight_context() override { return true; }
+
+    double max_nmse_err() override {
+        return 5e-4;
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        return build_graph(ctx, ctx);
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx, ggml_context * ctx_weights) override {
+        ggml_tensor * x  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, n);
+        ggml_tensor * w  = ggml_new_tensor_1d(ctx_weights, GGML_TYPE_F32, k);
+        ggml_tensor * a1 = ggml_new_tensor_2d(ctx_weights, type_1, k, m1);
+        ggml_tensor * a2 = ggml_new_tensor_2d(ctx_weights, type_2, k, m2);
+        ggml_set_name(a1, "a1");
+        ggml_set_name(a2, "a2");
+        ggml_tensor * y  = ggml_mul(ctx, ggml_rms_norm(ctx, x, 1e-6f), w);
+        ggml_tensor * r1 = ggml_mul_mat(ctx, a1, y);
+        ggml_tensor * r2 = ggml_mul_mat(ctx, a2, y);
+        ggml_tensor * out = glu ? ggml_swiglu_split(ctx, r1, r2) : ggml_concat(ctx, r1, r2, 0);
+        ggml_set_name(out, "out");
+        return out;
     }
 };
 
@@ -11898,12 +11984,111 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     for (int64_t k : {1026, 1028, 1100}) {
         test_cases.emplace_back(new test_gemm_fusion(GGML_TYPE_IQ3_S, 512, 300, k, GEMM_FUSION_FFN_ADD));
     }
+    // MMVQ-NC B: IQ4_XS / Q4_K decode GEMVs with n = 1..6 columns at the model shapes, tails and odd sizes (with
+    // GGML_MMVQ_NC_VERIFY=n the backend also compares every N-column launch bitwise with the single-token path)
+    for (ggml_type t : {GGML_TYPE_IQ4_XS, GGML_TYPE_Q4_K}) {
+        for (int64_t n = 1; n <= 6; ++n) {
+            test_cases.emplace_back(new test_gemm_fusion(t, 5120,  n, 17408, GEMM_FUSION_ADD));         // ffn_down + residual
+            test_cases.emplace_back(new test_gemm_fusion(t, 5120,  n, 6144,  GEMM_FUSION_ADD));         // ssm_out / attn_output
+            test_cases.emplace_back(new test_gemm_fusion(t, 5120,  n, 17408, GEMM_FUSION_FFN_ADD));     // SwiGLU gate/up + down
+            test_cases.emplace_back(new test_gemm_fusion(t, 10240, n, 5120,  GEMM_FUSION_MM));          // qkv
+            test_cases.emplace_back(new test_gemm_fusion(t, 12288, n, 5120,  GEMM_FUSION_NORM_SHARED)); // q (+ another)
+            test_cases.emplace_back(new test_gemm_fusion(t, 6144,  n, 5120,  GEMM_FUSION_NORM_SHARED)); // z
+            test_cases.emplace_back(new test_gemm_fusion(t, 1024,  n, 5120,  GEMM_FUSION_NORM_SHARED)); // k + v (small-N)
+            test_cases.emplace_back(new test_gemm_fusion(t, 1000,  n, 5120,  GEMM_FUSION_MM));          // small-N, odd rows
+            test_cases.emplace_back(new test_gemm_fusion(t, 2052,  n, 9216,  GEMM_FUSION_ADD));         // K > 8192, odd units
+            test_cases.emplace_back(new test_gemm_fusion(t, 2050,  n, 9216,  GEMM_FUSION_ADD));         // rows % 4 != 0
+            test_cases.emplace_back(new test_gemm_fusion(t, 1024,  n, 4352,  GEMM_FUSION_FFN_ADD));     // K = 1024 gate/up (1-2 steps per row)
+            test_cases.emplace_back(new test_gemm_fusion(t, 2048,  n, 8448,  GEMM_FUSION_ADD));         // items % L != 0
+        }
+    }
+    for (int64_t n = 1; n <= 6; ++n) {
+        test_cases.emplace_back(new test_gemm_fusion(GGML_TYPE_Q4_K, 248320, n, 5120, GEMM_FUSION_MM)); // LM head
+    }
     for (int64_t n : {2047, 2048, 4100}) {
         test_cases.emplace_back(new test_gemm_fusion(GGML_TYPE_IQ3_S, 2048, n, 1024, GEMM_FUSION_FFN_ADD));
         test_cases.emplace_back(new test_gemm_fusion(GGML_TYPE_IQ3_S, 2048, n, 1024, GEMM_FUSION_FFN_MIXED));
     }
     // the real shape (n_embd 5120, n_ff 17408) at a table size with a merged entry
     test_cases.emplace_back(new test_gemm_fusion(GGML_TYPE_IQ3_S, 5120, 724, 17408, GEMM_FUSION_FFN_MIXED));
+
+    // MMVQ-NC A: N-column (multi-token verification) IQ3 GEMVs at the real shapes, n = 1..6 (n >= 2: per-column bit-identity
+    // to the single-token path with GGML_MMVQ_NC_VERIFY), plus small / odd shapes (unit-major layout, K phases)
+    for (ggml_type t : {GGML_TYPE_IQ3_S, GGML_TYPE_IQ3_XXS}) {
+        for (int64_t n = 1; n <= 6; ++n) {
+            test_cases.emplace_back(new test_gemm_fusion(t, 5120,  n, 17408, GEMM_FUSION_ADD, true));            // ffn_down + residual
+            test_cases.emplace_back(new test_gemm_fusion(t, 5120,  n, 6144,  GEMM_FUSION_ADD, true));            // attn / linear-attn out
+            test_cases.emplace_back(new test_gemm_fusion(t, 5120,  n, 17408, GEMM_FUSION_FFN_ADD, true));        // gate/up SwiGLU + down
+            test_cases.emplace_back(new test_gemm_fusion(t, 5120,  n, 17408, GEMM_FUSION_FFN_IQ3MIX, true));     // mixed IQ3 gate/up
+            test_cases.emplace_back(new test_gemm_fusion(t, 10240, n, 5120,  GEMM_FUSION_NORM_SHARED, true));    // multi-job, same type
+            test_cases.emplace_back(new test_gemm_fusion(t, 10240, n, 5120,  GEMM_FUSION_NORM_SHARED_IQ3MIX, true)); // multi-job, mixed
+            test_cases.emplace_back(new test_gemm_fusion(t, 100,   n, 1280,  GEMM_FUSION_ADD, true));
+            test_cases.emplace_back(new test_gemm_fusion(t, 768,   n, 2304,  GEMM_FUSION_FFN_IQ3MIX, true));
+            test_cases.emplace_back(new test_gemm_fusion(t, 36,    n, 768,   GEMM_FUSION_NORM_SHARED_IQ3MIX, true));
+        }
+        // GEGLU gate/up must not be fused onto the N-column SwiGLU kernel (it ran unfused before; must not abort)
+        for (int64_t n = 2; n <= 4; ++n) {
+            test_cases.emplace_back(new test_gemm_fusion(t, 1024, n, 5120, GEMM_FUSION_FFN_GEGLU, true));
+        }
+    }
+    // MMVQ-NC B: Q4_K small-N (rows < 2048) with K < 2048, where the single-token stock kernel uses its small_k variant
+    // (the N-column path must leave these to the old path), and the first K above it
+    for (int64_t k : {256, 1024, 1792, 2048}) {
+        for (int64_t n = 2; n <= 4; ++n) {
+            test_cases.emplace_back(new test_gemm_fusion(GGML_TYPE_Q4_K, 1024, n, k, GEMM_FUSION_MM));
+        }
+    }
+    // MMVQ-NC C: IQ1_M at K = 32768, where the single-token low-bit kernel exceeds 64 KB of LDS (stock path at N = 1)
+    for (int64_t n = 2; n <= 4; ++n) {
+        test_cases.emplace_back(new test_gemm_fusion(GGML_TYPE_IQ1_M, 256, n, 32768, GEMM_FUSION_MM));
+    }
+    // q8_1 activation cache (HIP) vs in-place writes, at 1..6 columns of every N-column family: the residual (K = 1024, so
+    // its quantized copy is cached) is quantized for two GEMVs, updated in place, and read again by the same two GEMVs,
+    // which must see the updated values. res-inplace: a plain in-place add; res-reused: res += a@b folded into the GEMV,
+    // b with k = 1280 (K % 512 != 0, so the N-column b is not cached and the cached residual stays in place)
+    for (ggml_type t : {GGML_TYPE_IQ3_S, GGML_TYPE_IQ3_XXS, GGML_TYPE_IQ4_XS, GGML_TYPE_Q4_K, GGML_TYPE_IQ2_S, GGML_TYPE_Q2_K}) {
+        for (int64_t n = 1; n <= 6; ++n) {
+            test_cases.emplace_back(new test_gemm_fusion(t, 1024, n, 1024, GEMM_FUSION_RES_INPLACE, true));
+            test_cases.emplace_back(new test_gemm_fusion(t, 1024, n, 1280, GEMM_FUSION_RES_REUSED, true));
+        }
+    }
+
+    // MMVQ-NC lowbit: few-column GEMVs of the low-bit types (HIP: one weight pass for all columns, per column the same
+    // bits as the single-column kernel, see GGML_MMVQ_NC_VERIFY) at the model shapes (n_embd 5120, n_ff 17408, qkv
+    // 10240, z 6144, q 12288, k 1024) and odd ones (K % 512 != 0, a single 256 block, 64 rows), plain and residual add
+    for (ggml_type t : {GGML_TYPE_IQ2_S, GGML_TYPE_IQ2_XS, GGML_TYPE_IQ2_XXS, GGML_TYPE_Q2_K, GGML_TYPE_IQ1_M}) {
+        for (int64_t n : {1, 2, 3, 4, 5, 6}) {
+            test_cases.emplace_back(new test_gemm_fusion(t, 5120, n, 17408, GEMM_FUSION_FFN_ADD));
+            for (int64_t m : {1024, 6144, 10240, 12288}) {
+                test_cases.emplace_back(new test_gemm_fusion(t, m, n, 5120, GEMM_FUSION_NORM_SHARED));
+            }
+            test_cases.emplace_back(new test_gemm_fusion(t, 192, n, 768,  GEMM_FUSION_NORM_SHARED));
+            test_cases.emplace_back(new test_gemm_fusion(t, 64,  n, 256,  GEMM_FUSION_ADD));
+            test_cases.emplace_back(new test_gemm_fusion(t, 512, n, 1280, GEMM_FUSION_FFN_ADD));
+        }
+    }
+
+    // MMVQ-NC mix: mixed IQ3 + IQ4_XS/Q4_K pairs at n = 1..6 columns, all four type combinations, both member orders:
+    // small / odd shapes (unit counts not a multiple of the wave count, k = 1024, 3072 and 8192) at every n, the real
+    // ones (qkv 10240 + z 6144, gate/up 17408, k = 5120) at a few n (IQ3 weights are slow to create on the CPU).
+    // GGML_MMVQ_NC_VERIFY=n additionally compares every column bitwise with the single-column launch.
+    {
+        const ggml_type t3s[2] = { GGML_TYPE_IQ3_S, GGML_TYPE_IQ3_XXS };
+        const ggml_type t4s[2] = { GGML_TYPE_IQ4_XS, GGML_TYPE_Q4_K };
+        for (ggml_type t3 : t3s) {
+            for (ggml_type t4 : t4s) {
+                for (int64_t n = 1; n <= 6; ++n) {
+                    test_cases.emplace_back(new test_mix_pair(t3, t4, 1028, 2052, n, 1024, false));
+                    test_cases.emplace_back(new test_mix_pair(t4, t3, 2048, 1028, n, 8192, false));
+                    test_cases.emplace_back(new test_mix_pair(t4, t3, 2052, 2052, n, 3072, true));
+                }
+            }
+        }
+        test_cases.emplace_back(new test_mix_pair(GGML_TYPE_IQ3_S,   GGML_TYPE_IQ4_XS, 10240,  6144, 4, 5120, false));
+        test_cases.emplace_back(new test_mix_pair(GGML_TYPE_Q4_K,    GGML_TYPE_IQ3_XXS, 10240, 6144, 3, 5120, false));
+        test_cases.emplace_back(new test_mix_pair(GGML_TYPE_IQ3_XXS, GGML_TYPE_IQ4_XS, 17408, 17408, 4, 5120, true));
+        test_cases.emplace_back(new test_mix_pair(GGML_TYPE_Q4_K,    GGML_TYPE_IQ3_S,  17408, 17408, 2, 5120, true));
+    }
 
     test_cases.emplace_back(new test_ssm_scan(GGML_TYPE_F32, 16, 1, 1024, 1, 32, 4)); // Mamba-1
     test_cases.emplace_back(new test_ssm_scan(GGML_TYPE_F32, 96, 64, 128, 8, 1, 1)); // Nemotron-3-Puzzle decode (scan path, unused warp in last block)
