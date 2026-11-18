@@ -4,7 +4,8 @@
 
 // fused single-token, single-sequence gated delta net decode (GGML_OP_GDN_DECODE_PREP / GGML_OP_GDN_DECODE_OUT)
 
-bool ggml_cuda_gdn_decode_supported(const ggml_tensor * op);
+// device: the device the op would run on (the N-token / rollback-slot variants need a wave64 device)
+bool ggml_cuda_gdn_decode_supported(const ggml_tensor * op, int device);
 
 void ggml_cuda_op_gdn_decode_prep(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
 

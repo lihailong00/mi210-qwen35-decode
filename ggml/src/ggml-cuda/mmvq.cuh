@@ -21,3 +21,12 @@ void ggml_cuda_op_mul_mat_vec_q(
     const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst, const char * src0_dd_i, const float * src1_ddf_i,
     const char * src1_ddq_i, float * dst_dd_i, const int64_t row_low, const int64_t row_high, const int64_t src1_ncols,
     const int64_t src1_padded_row_size, cudaStream_t stream);
+// MTP2-P0: the largest column count each N-column family takes (0: off), defined in the family files, and the type-level
+// route predicate (mmvq.cu) used by ggml_cuda_should_use_mmvq on CDNA2
+int  ggml_cuda_mmvq_iq3_nc_max();      // A: mmvq-iq3.cu
+int  ggml_cuda_mmvq_iq4k_nc_max();     // B: mmvq-iq4k.cu
+int  ggml_cuda_mmvq_lowbit_nc_max();   // C: mmvq-lowbit.cu
+int  ggml_cuda_mmvq_mix_nc_max();      // D: mmvq-iq3.cu
+bool ggml_cuda_mmvq_nc_takes(ggml_type type, int64_t ne11);
+// unfused MUL_MAT with more than MMVQ_MAX_BATCH_SIZE columns on the MMVQ route: false = declined, nothing launched
+bool ggml_cuda_mul_mat_vec_q_nc(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst);

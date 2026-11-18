@@ -392,6 +392,12 @@ bool ggml_cuda_should_use_mmvq(enum ggml_type type, int cc, int64_t ne11) {
         }
     }
     if (GGML_CUDA_CC_IS_CDNA(cc)) {
+        // MTP2-P0 begin: 2 <= ne11 <= the family maximum of an N-column family (A IQ3, B IQ4_XS/Q4_K, C low-bit) goes to
+        // MMVQ; a tensor the family declines at ne11 > MMVQ_MAX_BATCH_SIZE is sent on to MMQ by ggml_cuda_mul_mat_vec_q
+        if (GGML_CUDA_CC_IS_CDNA2(cc) && ggml_cuda_mmvq_nc_takes(type, ne11)) {
+            return true;
+        }
+        // MTP2-P0 end
         if (GGML_CUDA_CC_IS_CDNA1(cc)) {
             switch (type) {
                 case GGML_TYPE_Q4_0:
@@ -420,10 +426,6 @@ bool ggml_cuda_should_use_mmvq(enum ggml_type type, int cc, int64_t ne11) {
                 default:
                     return ne11 <= MMVQ_MAX_BATCH_SIZE;
             }
-        }
-        // MMVQ-NC B: Q4_K decode batches up to the NC max run on the N-column iq4k kernels (instead of MMQ)
-        if (type == GGML_TYPE_Q4_K && ne11 > 3 && GGML_CUDA_CC_IS_CDNA2(cc) && ggml_cuda_mmvq_iq4k_nc_route(ne11)) {
-            return true;
         }
         switch (type) { // tuned for CDNA2
             case GGML_TYPE_Q2_K:
@@ -1934,7 +1936,7 @@ void ggml_cuda_mmvq_cache_release(int, cudaStream_t) {
 
 // ------------------------------------------------------------------------------------------------ MMVQ-NC S
 // N-column GEMVs (2 <= ne11 <= nc_max) for multi-token verification: GGML_MMVQ_NC=0 restores the previous behaviour for
-// ne11 > 1 exactly; GGML_MMVQ_NC_MAX (default 4, 2..6) is the largest column count taken. Every family reads the
+// ne11 > 1 exactly; GGML_MMVQ_NC_MAX (default 16, 2..16) is the largest column count taken. Every family reads the
 // switches through these two functions (one parse: any value starting with '0' turns the master switch off).
 // Output change (accepted): the kernels are not limited to speculative verification. Every MUL_MAT with 2..nc_max
 // columns takes them, also prompt chunks of that size (short prompts, the last chunk of a prompt split into ubatches),
@@ -1961,11 +1963,30 @@ int ggml_cuda_mmvq_nc_max() {
             return 0;
         }
         const char * v = getenv("GGML_MMVQ_NC_MAX");
-        const int m = v ? atoi(v) : 4;
-        return std::min(6, std::max(2, m));
+        const int m = v ? atoi(v) : 16;   // MTP2-P0: default 16 (every verification size of MTP K <= 15 / n-gram drafts)
+        // MTP2-P0: GGML_MMVQ_NC_MAX 2..16
+        return std::min(16, std::max(2, m));
     }();
     return n;
 }
+// MTP2-P0 begin: does an N-column family take ne11 columns of this weight type (type level; the family launcher still
+// checks the tensor, and a declined call with ne11 > MMVQ_MAX_BATCH_SIZE goes to MMQ in ggml_cuda_mul_mat_vec_q)
+bool ggml_cuda_mmvq_nc_takes(ggml_type type, int64_t ne11) {
+    if (ne11 < 2 || ne11 > 16) {
+        return false;
+    }
+    switch (type) {
+        case GGML_TYPE_IQ3_S: case GGML_TYPE_IQ3_XXS:
+            return ne11 <= ggml_cuda_mmvq_iq3_nc_max();
+        case GGML_TYPE_IQ4_XS: case GGML_TYPE_Q4_K:
+            return ne11 <= ggml_cuda_mmvq_iq4k_nc_max();
+        case GGML_TYPE_IQ2_S: case GGML_TYPE_IQ2_XS: case GGML_TYPE_IQ2_XXS: case GGML_TYPE_Q2_K: case GGML_TYPE_IQ1_M:
+            return ne11 <= ggml_cuda_mmvq_lowbit_nc_max();
+        default:
+            return false;
+    }
+}
+// MTP2-P0 end
 // the weight types an N-column family handles: only these read the N-column activation from the q8 cache, so the stock
 // ne11 > 1 kernels of every other type keep the pool quantization exactly as before (the cache entry is dropped whenever
 // a node writes its source bytes, see above, so a cached N-column activation is always the current one)
@@ -2017,6 +2038,9 @@ bool ggml_cuda_mmvq_nc_fusion_ok(ggml_backend_cuda_context & ctx, const ggml_ten
 }
 // ------------------------------------------------------------------------------------------------ MMVQ-NC S end
 
+// MTP2-P0: decline signal of an unfused N-column call above MMVQ_MAX_BATCH_SIZE (see ggml_cuda_mul_mat_vec_q_nc)
+static thread_local bool mmvq_nc_allow_decline = false;
+static thread_local bool mmvq_nc_declined      = false;
 void ggml_cuda_mul_mat_vec_q(
         ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst,
         const ggml_cuda_mm_fusion_args_host * fusion) {
@@ -2169,6 +2193,15 @@ void ggml_cuda_mul_mat_vec_q(
             GGML_ABORT("MMVQ-NC: fused N-column GEMV (%s, ncols %d) not taken", ggml_type_name(src0->type), (int) ne11);
         }
     }
+    // MTP2-P0 begin: more columns than the stock kernels take (a tensor an N-column family declined: shape, view, missing
+    // SoA copy during capture, per-shape cap): nothing is launched, ggml_cuda_mul_mat_vec_q_nc reports the decline and its
+    // caller (ggml_cuda_mul_mat) takes the route these batches took before (MMQ, or cuBLAS for types MMQ lacks)
+    if (!ids && !fusion && ne11 > MMVQ_MAX_BATCH_SIZE) {
+        GGML_ASSERT(mmvq_nc_allow_decline && "N-column MUL_MAT above MMVQ_MAX_BATCH_SIZE outside ggml_cuda_mul_mat_vec_q_nc");
+        mmvq_nc_declined = true;
+        return;
+    }
+    // MTP2-P0 end
 #endif
     // a mixed-type gate must never reach the kernels below: they decode the gate with src0's type and row stride
     GGML_ASSERT(!fusion || !fusion->gate || fusion->gate->type == src0->type);
@@ -2305,4 +2338,14 @@ void ggml_cuda_op_mul_mat_vec_q(
         1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, stream);
 
     GGML_UNUSED_VARS(src1, dst, src1_ddf_i, src1_ncols, src1_padded_row_size);
+}
+
+// MTP2-P0: an unfused MUL_MAT with MMVQ_MAX_BATCH_SIZE < ne11 <= 16 columns routed here by ggml_cuda_mmvq_nc_takes; false if
+// no N-column family took the tensor (nothing was written to dst), then the caller runs the previous route
+bool ggml_cuda_mul_mat_vec_q_nc(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
+    mmvq_nc_allow_decline = true;
+    mmvq_nc_declined      = false;
+    ggml_cuda_mul_mat_vec_q(ctx, src0, src1, nullptr, dst, nullptr);
+    mmvq_nc_allow_decline = false;
+    return !mmvq_nc_declined;
 }

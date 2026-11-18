@@ -2766,6 +2766,55 @@ extern "C" {
             int                   S,
             float                 eps);
 
+    // N-token variants (n_tokens = qkv->ne[1] >= 1 consecutive tokens of one sequence, e.g. an MTP verification batch):
+    // every token runs exactly the single-token computation in order, the states are carried from token to token.
+    //   qkv [conv_dim, n_tokens], x [n_embd, n_tokens], z [H_v*S, n_tokens] (contiguous);
+    //   prep result [2*H_k*S + 3*H_v, n_tokens] (column t = the single-token prep result of token t, the scratch tail of
+    //   column 0 is used by the backend), out result [H_v*S, n_tokens].
+    //   K >= 1 rollback snapshot slots, slot s at row dst_row + s*slot_stride (slot 0 = the final state, written to
+    //   dst_row like the single-token ops): the recurrent state after token n_tokens-1-s goes to slot s for
+    //   s < min(n_tokens, K); the conv state window ending at token n_tokens-1-s goes to slot s for s < min(n_tokens+1, K)
+    //   (slot n_tokens = the conv state before the first token), as build_conv_state / build_recurrent_attn write them.
+    //   the states are read from row s_copy[0] before anything is written.
+    GGML_API struct ggml_tensor * ggml_gdn_decode_prep_ext(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * qkv,
+            struct ggml_tensor  * x,
+            struct ggml_tensor  * w_alpha,
+            struct ggml_tensor  * w_beta,
+            struct ggml_tensor  * dt_bias,
+            struct ggml_tensor  * a,
+            struct ggml_tensor  * conv_w,
+            struct ggml_tensor  * conv_state,
+            struct ggml_tensor  * s_copy,
+            struct ggml_tensor  * dep,
+            int                   dst_row,
+            int                   H_k,
+            int                   H_v,
+            int                   S,
+            float                 eps_l2,
+            int                   K,
+            int                   slot_stride);
+
+    GGML_API struct ggml_tensor * ggml_gdn_decode_out_ext(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * prep,
+            struct ggml_tensor  * qkv,
+            struct ggml_tensor  * conv_w,
+            struct ggml_tensor  * conv_state,
+            struct ggml_tensor  * z,
+            struct ggml_tensor  * norm_w,
+            struct ggml_tensor  * ssm_state,
+            struct ggml_tensor  * s_copy,
+            struct ggml_tensor  * dep,
+            int                   dst_row,
+            int                   H_k,
+            int                   H_v,
+            int                   S,
+            float                 eps,
+            int                   K,
+            int                   slot_stride);
+
     // DSA lightning indexer
     //
     // q:       [n_embd_idx, n_head_idx, n_batch, ne3 ]

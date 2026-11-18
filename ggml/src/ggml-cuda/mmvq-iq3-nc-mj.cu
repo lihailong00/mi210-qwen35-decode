@@ -57,6 +57,42 @@ bool iq3nc_launch_multi(const iq3nc_multi_args & a, cudaStream_t stream) {
             return false;
         }
     }
+    if (iq3mf_use(a.ncols)) {
+        // MFMA form: one launch (mixed types: both tables, per-job type) if a full K phase fits next to the tables,
+        // else one launch per type (the jobs keep their own rows, outputs and arithmetic)
+        const bool one = !(hs && hx) || ((a.ncols + 3)/4 <= 2 && iq3mf_fit8(GGML_TYPE_IQ3_S, GGML_TYPE_IQ3_XXS, a.ncols));
+        for (int pass = 0; pass < (one ? 1 : 2); ++pass) {
+            iq3mf_desc d{};
+            for (int j = 0; j < 3; ++j) {
+                d.job[j] = iq3mf_job{};
+                d.job[j].ubeg = INT_MAX;
+            }
+            d.y = a.y; d.ycb = a.ycb; d.nc = a.ncols; d.K = a.K; d.ncu = a.ncu; d.sm = a.sm; d.mode = 0;
+            const ggml_type tp = pass == 0 ? (hs ? GGML_TYPE_IQ3_S : GGML_TYPE_IQ3_XXS) : GGML_TYPE_IQ3_XXS;
+            d.t0 = one ? (hs ? GGML_TYPE_IQ3_S : GGML_TYPE_IQ3_XXS) : tp;
+            d.t1 = one && hs && hx ? GGML_TYPE_IQ3_XXS : GGML_TYPE_COUNT;
+            int ub = 0, nj = 0;
+            for (int i = 0; i < a.n; ++i) {
+                if (!one && a.t[i] != tp) {
+                    continue;
+                }
+                iq3mf_job & J = d.job[nj++];
+                J.w    = a.w[i];
+                J.dst  = a.dst[i];
+                J.dcs  = a.dcs[i];
+                J.nh   = (uint32_t) a.N[i]*(uint32_t) (a.K/128);
+                J.ubeg = ub;
+                J.tsel = d.t1 != GGML_TYPE_COUNT && a.t[i] == GGML_TYPE_IQ3_XXS ? 1 : 0;
+                J.U    = a.N[i]/4;
+                ub += a.N[i]/4;
+            }
+            d.utot = ub;
+            if (nj > 0 && !iq3mf_launch(d, stream)) {
+                return false;
+            }
+        }
+        return true;
+    }
     nc::mjnc_args ma{};
     for (int j = 0; j < MJ_MAX; ++j) {
         ma.job[j].ubeg = INT_MAX;

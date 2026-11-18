@@ -86,7 +86,9 @@ bool ggml_cuda_mmvq_lowbit(ggml_backend_cuda_context & ctx, const ggml_tensor * 
 // N-column GEMVs (ne11 = 2..nc_max) on the same SoA copy (same repack kind, no extra VRAM): one pass over the weights
 // for all columns, per column bit-identical to ggml_cuda_mmvq_lowbit on that column alone (see lb::gemv_nc).
 // Switches: GGML_MMVQ_NC=0 (all families) / GGML_MMVQ_NC_LOWBIT=0 / GGML_MMVQ_LOWBIT=0 -> previous behaviour.
-// GGML_MMVQ_NC_MAX (default 4, 2..6). Debug: GGML_MMVQ_NC_VERIFY=n checks the first n launches column by column
+// GGML_MMVQ_NC_MAX (default 4). MTP2-C: from 3 columns on (GGML_MMVQ_NC_LB_MF_MIN) the integer dot products run on the
+// matrix cores (lb::launch_mf, up to 16 columns, same per-column bits); GGML_MMVQ_NC_LOWBIT_MFMA=0 -> the dp4a NC kernels
+// and at most 6 columns exactly as before. Debug: GGML_MMVQ_NC_VERIFY=n checks the first n launches column by column
 // against the N=1 launcher on a separately quantized column (bitwise); GGML_MMVQ_NC_BENCH=reps times NC vs N=1.
 static int lowbit_env_int(const char * name, int def) {
     const char * v = getenv(name);
@@ -98,13 +100,19 @@ static bool lowbit_nc_enabled() {
     return enabled;
 }
 static int lowbit_nc_max() {
-    return std::min(ggml_cuda_mmvq_nc_max(), LB_NC_MAX);
+    return std::min(ggml_cuda_mmvq_nc_max(), lb::nc_max_cols());   // MTP2-C (was LB_NC_MAX)
 }
 static bool lowbit_type(ggml_type type) {
     return type == GGML_TYPE_IQ2_S || type == GGML_TYPE_IQ2_XS || type == GGML_TYPE_IQ2_XXS || type == GGML_TYPE_Q2_K || type == GGML_TYPE_IQ1_M;
 }
 static bool lowbit_nc_shape_ok(const ggml_tensor * w, int ncols) {
     if (!lowbit_nc_enabled() || ncols < 2 || ncols > lowbit_nc_max() || !lowbit_type(w->type)) {
+        return false;
+    }
+    // MTP2-merge: optional cap: Q2_K above GGML_MMVQ_NC_LB_Q2K_MAX columns is declined (MMQ is faster at 13..16 columns but
+    // not bit-identical to the single-token path); default 16 = no cap. Only with the MFMA form on.
+    static const int q2k_max = lowbit_env_int("GGML_MMVQ_NC_LB_Q2K_MAX", 16);
+    if (w->type == GGML_TYPE_Q2_K && ncols > q2k_max && lb::nc_max_cols() > 6) {
         return false;
     }
     const int64_t K = w->ne[0];
@@ -114,6 +122,13 @@ static bool lowbit_nc_shape_ok(const ggml_tensor * w, int ncols) {
            lb::launch_ok(w->type, (int) K, (int) N) &&
            GGML_CUDA_CC_IS_CDNA2(ggml_cuda_info().devices[ggml_cuda_get_device()].cc);
 }
+
+// MTP2-C begin: largest column count family C takes (0: N-column path off)
+int ggml_cuda_mmvq_lowbit_nc_max();
+int ggml_cuda_mmvq_lowbit_nc_max() {
+    return lowbit_nc_enabled() ? lowbit_nc_max() : 0;
+}
+// MTP2-C end
 
 bool ggml_cuda_mmvq_lowbit_nc_ok(const ggml_tensor * w, const ggml_tensor * gate_w, bool residual, int ncols) {
     GGML_UNUSED(residual);   // plain and residual epilogues, as at N=1
@@ -284,6 +299,10 @@ bool ggml_cuda_mmvq_lowbit(ggml_backend_cuda_context &, const ggml_tensor *, con
 // MMVQ-NC lowbit
 bool ggml_cuda_mmvq_lowbit_nc_ok(const ggml_tensor *, const ggml_tensor *, bool, int) {
     return false;
+}
+int ggml_cuda_mmvq_lowbit_nc_max();   // MTP2-C
+int ggml_cuda_mmvq_lowbit_nc_max() {
+    return 0;
 }
 void ggml_cuda_mmvq_lowbit_nc_prepare(ggml_backend_cuda_context &, const ggml_tensor *, int) {
 }

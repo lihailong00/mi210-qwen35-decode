@@ -389,36 +389,52 @@ static bool qwen35_gdn_fused_decode_enabled() {
     return enabled;
 }
 
+// LLAMA_GDN_FUSED_DECODE_N: the largest ubatch (tokens of one sequence, e.g. an MTP verification batch) that takes the
+// N-token fused ops, also with rollback snapshots (n_rs_seq > 0); default 16 (the backend limit). 0 restores the
+// previous graphs exactly: the fused ops only for a single token without snapshots, the unfused graph otherwise.
+static int qwen35_gdn_fused_decode_n_max() {
+    static const int n_max = [] {
+        const char * e = getenv("LLAMA_GDN_FUSED_DECODE_N");
+        const int n = e ? atoi(e) : 16;
+        return n < 0 ? 0 : (n > 16 ? 16 : n);
+    }();
+    return n_max;
+}
+
 static bool qwen35_tensor_on_dev(const ggml_tensor * t, ggml_backend_dev_t dev) {
     return t != nullptr && t->buffer != nullptr &&
         ggml_backend_buft_get_device(ggml_backend_buffer_get_type(t->buffer)) == dev;
 }
 
-// Fused decode of one linear-attention layer for a single token of a single sequence (ggml_gdn_decode_prep +
-// ggml_gdn_decode_out). The ops update the conv/ssm states in place in the recurrent cache, so they are only used
+// Fused decode of one linear-attention layer for the tokens of a single sequence (ggml_gdn_decode_prep(_ext) +
+// ggml_gdn_decode_out(_ext)): one token, or up to LLAMA_GDN_FUSED_DECODE_N tokens (MTP verification), with or without
+// rollback snapshots. The ops update the conv/ssm states in place in the recurrent cache, so they are only used
 // when they run on the device that holds the states (and every weight that steers the op placement); otherwise,
 // or if the backend does not support them, nullptr is returned and the caller builds the unfused graph.
-// returns the gated, normalized attention output [head_v_dim*num_v_heads, 1] (input of ssm_out)
+// returns the gated, normalized attention output [head_v_dim*num_v_heads, n_tokens] (input of ssm_out)
 // Every precondition that the ggml_gdn_decode_prep/_out constructors assert on (plus the contiguity the reshapes need),
 // checked before any node is built, so that an unusual GGUF (e.g. ssm_alpha/ssm_beta of different types from a
 // --tensor-type override) falls back to the unfused graph instead of aborting. Backend limits are left to supports_op.
 static bool qwen35_gdn_fused_decode_args_ok(const llama_layer & layer, const ggml_tensor * qkv_mixed, const ggml_tensor * x,
         const ggml_tensor * z, const ggml_tensor * conv_states, const ggml_tensor * ssm_states, const ggml_tensor * s_copy,
-        const int64_t H_k, const int64_t H_v, const int64_t S, const int64_t dst_row) {
+        const int64_t H_k, const int64_t H_v, const int64_t S, const int64_t dst_row, const int64_t n_tokens,
+        const int64_t last_row) {
     const ggml_tensor * wa = layer.ssm_alpha;
     const ggml_tensor * wb = layer.ssm_beta;
     const ggml_tensor * dt = layer.ssm_dt;
     const ggml_tensor * a  = layer.ssm_a;
     const ggml_tensor * cw = layer.ssm_conv1d;
     const ggml_tensor * nw = layer.ssm_norm;
-    if (!wa || !wb || !dt || !a || !cw || !nw || !s_copy || H_k <= 0 || H_v <= 0 || S <= 0 || H_v % H_k != 0) {
+    if (!wa || !wb || !dt || !a || !cw || !nw || !s_copy || H_k <= 0 || H_v <= 0 || S <= 0 || H_v % H_k != 0 ||
+            n_tokens < 1) {
         return false;
     }
     const int64_t conv_dim = (2*H_k + H_v) * S;
     const int64_t n_embd   = x->ne[0];
     const int64_t d_conv   = cw->ne[0];
-    return qkv_mixed->type == GGML_TYPE_F32 && ggml_is_contiguous(qkv_mixed) && ggml_nelements(qkv_mixed) == conv_dim &&
-           x->type == GGML_TYPE_F32 && ggml_is_contiguous(x) && ggml_nelements(x) == n_embd &&
+    return qkv_mixed->type == GGML_TYPE_F32 && ggml_is_contiguous(qkv_mixed) && qkv_mixed->ne[0] == conv_dim &&
+           ggml_nelements(qkv_mixed) == conv_dim*n_tokens &&
+           x->type == GGML_TYPE_F32 && ggml_is_contiguous(x) && ggml_nelements(x) == n_embd*n_tokens &&
            wa->ne[0] == n_embd && wa->ne[1] == H_v && ggml_is_contiguous_rows(wa) &&
            wb->ne[0] == n_embd && wb->ne[1] == H_v && ggml_is_contiguous_rows(wb) &&
            wa->type == wb->type &&
@@ -426,12 +442,12 @@ static bool qwen35_gdn_fused_decode_args_ok(const llama_layer & layer, const ggm
            a->type == GGML_TYPE_F32 && ggml_nelements(a) == H_v && ggml_is_contiguous(a) &&
            cw->type == GGML_TYPE_F32 && cw->ne[1] == conv_dim && ggml_is_contiguous(cw) && d_conv >= 2 &&
            conv_states->type == GGML_TYPE_F32 && conv_states->ne[0] == (d_conv - 1)*conv_dim &&
-           conv_states->nb[0] == sizeof(float) && dst_row >= 0 && dst_row < conv_states->ne[1] &&
+           conv_states->nb[0] == sizeof(float) && dst_row >= 0 && last_row < conv_states->ne[1] &&
            s_copy->type == GGML_TYPE_I32 && ggml_nelements(s_copy) >= 1 &&
-           z->type == GGML_TYPE_F32 && ggml_is_contiguous(z) && ggml_nelements(z) == H_v*S &&
+           z->type == GGML_TYPE_F32 && ggml_is_contiguous(z) && ggml_nelements(z) == H_v*S*n_tokens &&
            nw->type == GGML_TYPE_F32 && ggml_is_contiguous(nw) && ggml_nelements(nw) == S &&
            ssm_states->type == GGML_TYPE_F32 && ssm_states->ne[0] == S*S*H_v &&
-           ssm_states->nb[0] == sizeof(float) && dst_row < ssm_states->ne[1];
+           ssm_states->nb[0] == sizeof(float) && last_row < ssm_states->ne[1];
 }
 
 static ggml_tensor * qwen35_build_gdn_fused_decode(
@@ -451,12 +467,18 @@ static ggml_tensor * qwen35_build_gdn_fused_decode(
     const int64_t num_v_heads = hparams.ssm_dt_rank;
     const int64_t head_v_dim  = hparams.ssm_d_inner / num_v_heads;
 
+    // single token without snapshots: the single-token ops (graph unchanged); 1..LLAMA_GDN_FUSED_DECODE_N tokens or
+    // rollback snapshots: the N-token ops (per token the same arithmetic, K = n_rs_seq + 1 snapshot slots)
+    const int64_t n_tok  = g.ubatch.n_seq_tokens;
+    const bool    single = n_tok == 1 && g.cparams.n_rs_seq == 0;
     if (!qwen35_gdn_fused_decode_enabled() ||
-        g.ubatch.n_seq_tokens != 1 || g.ubatch.n_seqs != 1 || g.cparams.n_rs_seq != 0 ||
-        mctx->get_n_rs() != 1 || head_k_dim != head_v_dim ||
+        !(single || (n_tok >= 1 && n_tok <= qwen35_gdn_fused_decode_n_max())) ||
+        g.ubatch.n_seqs != 1 || mctx->get_n_rs() != 1 || head_k_dim != head_v_dim ||
         layer.ssm_alpha_s != nullptr || layer.ssm_beta_s != nullptr) {
         return nullptr;
     }
+    const int K           = (int) g.cparams.n_rs_seq + 1;
+    const int slot_stride = K > 1 ? (int) mctx->get_size() : 0;
 
     ggml_tensor * conv_states_all = mctx->get_r_l(il);
     ggml_tensor * ssm_states_all  = mctx->get_s_l(il);
@@ -495,8 +517,9 @@ static ggml_tensor * qwen35_build_gdn_fused_decode(
         }
     }
 
+    const int64_t last_row = (int64_t) mctx->get_head() + (int64_t) (K - 1)*slot_stride;
     if (!qwen35_gdn_fused_decode_args_ok(layer, qkv_mixed, x, z, conv_states_all, ssm_states_all, inp->s_copy,
-            num_k_heads, num_v_heads, head_k_dim, (int64_t) mctx->get_head())) {
+            num_k_heads, num_v_heads, head_k_dim, (int64_t) mctx->get_head(), n_tok, last_row)) {
         return nullptr;
     }
 
@@ -516,19 +539,37 @@ static ggml_tensor * qwen35_build_gdn_fused_decode(
 
     const int dst_row = (int) mctx->get_head();
 
-    ggml_tensor * qkv_1d = ggml_reshape_1d(ctx0, qkv_mixed, ggml_nelements(qkv_mixed));
+    ggml_tensor * prep;
+    ggml_tensor * out;
+    if (single) {
+        ggml_tensor * qkv_1d = ggml_reshape_1d(ctx0, qkv_mixed, ggml_nelements(qkv_mixed));
 
-    ggml_tensor * prep = ggml_gdn_decode_prep(ctx0, qkv_1d, x,
-            layer.ssm_alpha, layer.ssm_beta, layer.ssm_dt, layer.ssm_a, layer.ssm_conv1d,
-            conv_states_all, inp->s_copy, zero_row(conv_states_all),
-            dst_row, (int) num_k_heads, (int) num_v_heads, (int) head_k_dim,
-            hparams.f_norm_rms_eps / (float) head_k_dim); // == build_gdn_l2_norm eps
+        prep = ggml_gdn_decode_prep(ctx0, qkv_1d, x,
+                layer.ssm_alpha, layer.ssm_beta, layer.ssm_dt, layer.ssm_a, layer.ssm_conv1d,
+                conv_states_all, inp->s_copy, zero_row(conv_states_all),
+                dst_row, (int) num_k_heads, (int) num_v_heads, (int) head_k_dim,
+                hparams.f_norm_rms_eps / (float) head_k_dim); // == build_gdn_l2_norm eps
 
-    ggml_tensor * out = ggml_gdn_decode_out(ctx0, prep, qkv_1d, layer.ssm_conv1d, conv_states_all,
-            ggml_reshape_1d(ctx0, z, ggml_nelements(z)), layer.ssm_norm,
-            ssm_states_all, inp->s_copy, zero_row(ssm_states_all),
-            dst_row, (int) num_k_heads, (int) num_v_heads, (int) head_v_dim,
-            hparams.f_norm_rms_eps);
+        out = ggml_gdn_decode_out(ctx0, prep, qkv_1d, layer.ssm_conv1d, conv_states_all,
+                ggml_reshape_1d(ctx0, z, ggml_nelements(z)), layer.ssm_norm,
+                ssm_states_all, inp->s_copy, zero_row(ssm_states_all),
+                dst_row, (int) num_k_heads, (int) num_v_heads, (int) head_v_dim,
+                hparams.f_norm_rms_eps);
+    } else {
+        ggml_tensor * qkv_2d = ggml_reshape_2d(ctx0, qkv_mixed, qkv_mixed->ne[0], n_tok);
+
+        prep = ggml_gdn_decode_prep_ext(ctx0, qkv_2d, x,
+                layer.ssm_alpha, layer.ssm_beta, layer.ssm_dt, layer.ssm_a, layer.ssm_conv1d,
+                conv_states_all, inp->s_copy, zero_row(conv_states_all),
+                dst_row, (int) num_k_heads, (int) num_v_heads, (int) head_k_dim,
+                hparams.f_norm_rms_eps / (float) head_k_dim, K, slot_stride);
+
+        out = ggml_gdn_decode_out_ext(ctx0, prep, qkv_2d, layer.ssm_conv1d, conv_states_all,
+                ggml_reshape_2d(ctx0, z, head_v_dim*num_v_heads, n_tok), layer.ssm_norm,
+                ssm_states_all, inp->s_copy, zero_row(ssm_states_all),
+                dst_row, (int) num_k_heads, (int) num_v_heads, (int) head_v_dim,
+                hparams.f_norm_rms_eps, K, slot_stride);
+    }
 
     if (!ggml_backend_dev_supports_op(dev, prep) || !ggml_backend_dev_supports_op(dev, out)) {
         return nullptr;
@@ -537,7 +578,7 @@ static ggml_tensor * qwen35_build_gdn_fused_decode(
     g.cb(prep, "gdn_decode_prep", il);
     g.cb(out,  "final_output",    il);
 
-    return ggml_reshape_2d(ctx0, out, head_v_dim*num_v_heads, 1);
+    return ggml_reshape_2d(ctx0, out, head_v_dim*num_v_heads, n_tok);
 }
 
 ggml_tensor * llama_model_qwen35::graph::build_layer_attn_linear(
@@ -593,8 +634,9 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn_linear(
             }
         }
         const char * m = getenv("GGML_MMVQ_NC_MAX");
-        const int n = m ? atoi(m) : 4;
-        return n < 2 ? 2 : (n > 6 ? 6 : n);
+        const int n = m ? atoi(m) : 16;   // MTP2-P0: default 16 (= ggml_cuda_mmvq_nc_max)
+        // MTP2-P0: qkv/z reorder up to 16 tokens
+        return n < 2 ? 2 : (n > 16 ? 16 : n);
     }();
     if (ubatch.n_tokens >= 2 && (int) ubatch.n_tokens <= nc_order_max) {
         ggml_build_forward_expand(gf, qkv_mixed);

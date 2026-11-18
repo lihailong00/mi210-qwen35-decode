@@ -1,11 +1,15 @@
 // MMVQ-NC A: N-column IQ3_S / IQ3_XXS GEMV launchers, single / residual / SwiGLU gate+up (iq3gemv-nc.cuh).
 // Config as the single-token launcher (mmvq-iq3.cu iq3g_launch): P = 2, L = 16, NW = 16, persistent grid = CUs;
 // K phases (up to nc::PH_MAXU units per wave) when the NC activation record sets do not fit next to the tables.
+// ncols >= GGML_MMVQ_NC_IQ3_MFMA_MIN (and every ncols above the dp4a range, up to 16): the int8-MFMA form (iq3gemv-mf.cuh).
 #include "common.cuh"
 #include "mmvq-iq3-nc.cuh"
 
 #if defined(GGML_USE_HIP)
 #include "iq3gemv-nc.cuh"
+#include <algorithm>
+#include <climits>
+#include <cstdlib>
 
 namespace {
 constexpr int NCL = 16, NCNW = 16, NCP = 2;
@@ -57,7 +61,66 @@ bool launch_single_tb(const iq3nc_single_args & a, cudaStream_t stream) {
 }
 } // namespace
 
+// ---- MFMA form
+bool iq3mf_enabled() {
+    static const bool enabled = [] { const char * v = getenv("GGML_MMVQ_NC_IQ3_MFMA"); return v == nullptr || v[0] != '0'; }();
+    return enabled;
+}
+int iq3mf_min() {
+    static const int m = [] { const char * v = getenv("GGML_MMVQ_NC_IQ3_MFMA_MIN"); return v ? std::max(2, atoi(v)) : 4; }();   // N = 2..3: the dp4a form is faster
+    return m;
+}
+bool iq3mf_use(const int ncols) {
+    // above the dp4a form's range the MFMA form is the only one (whatever the minimum says)
+    return iq3mf_enabled() && ncols >= 2 && ncols <= IQ3MF_MAX && (ncols >= iq3mf_min() || ncols > IQ3NC_MAX);
+}
+bool iq3mf_glu_split(const ggml_type tgate, const ggml_type tup, const int ncols) {
+    // one launch keeps two accumulator sets: up to 2 column groups; and a full K phase must fit next to both tables
+    return (ncols + 3)/4 > 2 || !iq3mf_fit8(tgate, tup, ncols);
+}
+static void iq3mf_job_init(iq3mf_desc & d) {
+    for (int j = 0; j < 3; ++j) {
+        d.job[j] = iq3mf_job{};
+        d.job[j].ubeg = INT_MAX;
+    }
+}
+static bool iq3mf_launch_single(const iq3nc_single_args & a, cudaStream_t stream) {
+    iq3mf_desc d{};
+    iq3mf_job_init(d);
+    d.y = a.y; d.ycb = a.ycb; d.nc = a.ncols; d.K = a.K; d.ncu = a.ncu; d.sm = a.sm;
+    d.utot = a.N/4;
+    iq3mf_job & J = d.job[0];
+    J.nh = (uint32_t) a.N*(uint32_t) (a.K/128);
+    J.ubeg = 0;
+    J.U = a.N/4;
+    if (a.tb == GGML_TYPE_COUNT) {
+        d.mode = 0; d.t0 = a.ta; d.t1 = GGML_TYPE_COUNT;
+        J.w = a.wa; J.dst = a.dst; J.dcs = a.dcs; J.aux = a.res; J.acs = a.rcs;
+        return iq3mf_launch(d, stream);
+    }
+    if (!iq3mf_glu_split(a.ta, a.tb, a.ncols)) {
+        d.mode = 1; d.t0 = a.ta; d.t1 = a.tb;
+        J.w = a.wa; J.w2 = a.wb; J.dst = a.dst; J.dcs = a.dcs;
+        return iq3mf_launch(d, stream);
+    }
+    if (!a.gsc) {
+        return false;
+    }
+    // split gate / up: gate pass (fma accumulation, raw group sums into the scratch), then the up pass with the epilogue
+    d.mode = 2; d.t0 = a.ta; d.t1 = GGML_TYPE_COUNT;
+    J.w = a.wa; J.dst = a.gsc; J.dcs = a.N;
+    if (!iq3mf_launch(d, stream)) {
+        return false;
+    }
+    d.mode = 3; d.t0 = a.tb;
+    J.w = a.wb; J.dst = a.dst; J.dcs = a.dcs; J.aux = a.gsc; J.acs = a.N;
+    return iq3mf_launch(d, stream);
+}
+
 bool iq3nc_launch_single(const iq3nc_single_args & a, cudaStream_t stream) {
+    if (iq3mf_use(a.ncols)) {
+        return iq3mf_launch_single(a, stream);
+    }
     switch (a.ta) {
         case GGML_TYPE_IQ3_S:   return launch_single_tb<iq3g::iq3s_t>(a, stream);
         case GGML_TYPE_IQ3_XXS: return launch_single_tb<iq3g::iq3xxs_t>(a, stream);

@@ -695,6 +695,443 @@ __global__ void gemv_pair_nc(const uint8_t * __restrict__ w3, float * __restrict
         else part3_nc<T3, T4, SM, NC>(w3, d3, N3, ld3, K, w2, nwv, lane, grp, ys, cw);
     }
 }
+
+// ---- MTP2-D: pair kernel with both parts on the matrix cores, nc = 2..16 activation columns (gemv_pair_mf).
+// Every (row, column) output is bit-identical to gemv_pair on that column alone (= to gemv_pair_nc):
+//  * integer stage: the per-sub-block int32 sums of 4 rows x 4 columns come from v_mfma_i32_4x4x4i8 chains (16 blocks of
+//    4 lanes, lane = 4*l + q: l = the N=1 item lane, q = row of the unit for the A operand, column for B / D). Integer
+//    sums are exact in any order. A = the decoded int8 weights of row q (IQ3: sign-expanded table words, IQ4_XS: lookup8
+//    values, Q4_K: nibbles), B = column q's q8 words. CG = ceil(nc/4) chains share the decoded A words.
+//  * float stage: per (row, column) exactly the fp32 steps of the single-column kernel in the same item order per item
+//    lane (items l, l + 16, ...) with the same group reduction tree (IQ3: l^1, l^2, l^7, l^15 = iq3g::group_sum<16>;
+//    IQ4: l^8, l^4, l^2, l^1 = iq4k::group_sum<16>). Rows (0, 1) and (2, 3) of a lane run as packed fp32 pairs
+//    (v_pk_mul / v_pk_add / v_pk_fma_f32 round every element like the scalar instruction); the per-row data of the 4 rows
+//    come by quad broadcast. Integer products of the N=1 code are evaluated as exact fp32 products (all operands and
+//    products are integers below 2^24, so (float) (a*b) == (float) a * (float) b):
+//      IQ3_S:   (float) (s*(1 + 2*sc))                 = (float) s * (float) (1 + 2*sc)
+//      IQ3_XXS: (float) sdiv<1>(ls*s + sdiv<1>(s))    = truncf((float) s * ((2*ls + 1)/4))   (|s*(2*ls + 1)| < 2^23)
+//      IQ4_XS:  (float) (s*(ls - 32))                  = (float) s * (float) (ls - 32)        (|s*(ls - 32)| <= 516128*32 < 2^24)
+//      Q4_K:    (float) (dot*sc), (float) (sum*m)      = (float) dot * (float) sc, ...        (< 2^22)
+// Schedule: persistent, one workgroup of NWM waves per CU. Workgroup b owns the IQ3 units [U3*b/G, U3*(b+1)/G) and the
+// IQ4 units [U4*b/G, U4*(b+1)/G) (U = rows/4); its waves take them round robin (IQ3 first, then IQ4) in passes of S
+// slots. The activation is staged in LDS in steps of 1024 weights (one IQ3 step-major chunk step = one Q4_K step = two
+// IQ4_XS steps): all K at once when it fits (NB = 0), else a ring of NB = 2 / 1 one-step buffers (workgroup barriers per
+// step). A wave keeps the accumulators of its S slots across the steps of a pass. LDS records = yrec (Q4_K pair records),
+// column stride cs = steps*320 + 8 words (16-byte reads of the 4 columns of a quad hit different banks).
+// MIXG_MF_FENCE (MIXG_MF_SCHED, default on): scheduling fence after every column group and slot (keeps the live ranges of the
+// per-group operands short: no spills)
+#ifndef MIXG_MF_PF
+#define MIXG_MF_PF 0
+#endif
+#ifndef MIXG_MF_SCHED
+#define MIXG_MF_SCHED 1
+#endif
+#if MIXG_MF_SCHED && defined(__HIP_DEVICE_COMPILE__)
+#define MIXG_MF_FENCE() __builtin_amdgcn_sched_barrier(0)
+#else
+#define MIXG_MF_FENCE() do {} while (0)
+#endif
+typedef float mixg_f2 __attribute__((ext_vector_type(2)));
+static __device__ __forceinline__ mixg_f2 mf_mul(const mixg_f2 a, const mixg_f2 b) {
+#pragma clang fp contract(off)
+    return a*b;
+}
+static __device__ __forceinline__ mixg_f2 mf_add(const mixg_f2 a, const mixg_f2 b) {
+#pragma clang fp contract(off)
+    return a + b;
+}
+static __device__ __forceinline__ mixg_f2 mf_sub(const mixg_f2 a, const mixg_f2 b) {
+#pragma clang fp contract(off)
+    return a - b;
+}
+static __device__ __forceinline__ mixg_f2 mf_fma(const mixg_f2 a, const mixg_f2 b, const mixg_f2 c) {
+    return __builtin_elementwise_fma(a, b, c);
+}
+static __device__ __forceinline__ mixg_f2 mf_sp(const float v) { return mixg_f2{v, v}; }
+static __device__ __forceinline__ mixg_f2 mf_cvt(const int a, const int b) { return mixg_f2{(float) a, (float) b}; }
+// the value of rows 0, 1 / 2, 3 of the quad (quad broadcast)
+static __device__ __forceinline__ void mf_q2(const float v, mixg_f2 & r01, mixg_f2 & r23) {
+    const uint32_t u = __float_as_uint(v);
+    r01 = mixg_f2{__uint_as_float(quad_bcast<0>(u)), __uint_as_float(quad_bcast<1>(u))};
+    r23 = mixg_f2{__uint_as_float(quad_bcast<2>(u)), __uint_as_float(quad_bcast<3>(u))};
+}
+// v + v[lane ^ m] for the four lane masks m given as bpermute byte addresses (in order)
+static __device__ __forceinline__ float mf_gsum(float v, const int b0, const int b1, const int b2, const int b3) {
+#if defined(__HIP_DEVICE_COMPILE__)
+    v += __int_as_float(__builtin_amdgcn_ds_bpermute(b0, __float_as_int(v)));
+    v += __int_as_float(__builtin_amdgcn_ds_bpermute(b1, __float_as_int(v)));
+    v += __int_as_float(__builtin_amdgcn_ds_bpermute(b2, __float_as_int(v)));
+    v += __int_as_float(__builtin_amdgcn_ds_bpermute(b3, __float_as_int(v)));
+#else
+    (void) b0; (void) b1; (void) b2; (void) b3;
+#endif
+    return v;
+}
+// weights of one slot and step (12 words): IQ3 item (P = 2) {q0 | fa (S) / a (XXS) | fb.x, fb.y (S) / d (XXS), p},
+// IQ4_XS items k = 0, 1 {q(0) | q(1) | h(0), h(1)}, Q4_K item {a | b | h}
+struct mfw { uint4 a, b, c; };
+// one 8-MFMA chain: int sums of 4 rows (A words a) x this lane's column (B words b0 | b1) over 32 weights
+static __device__ __forceinline__ mixg_i32x4 mf_chain(const int (&a)[8], const uint4 b0, const uint4 b1) {
+    mixg_i32x4 c = {0, 0, 0, 0};
+#if defined(__HIP_DEVICE_COMPILE__)
+    const uint32_t b[8] = {b0.x, b0.y, b0.z, b0.w, b1.x, b1.y, b1.z, b1.w};
+#pragma unroll
+    for (int k = 0; k < 8; ++k) {
+        c = __builtin_amdgcn_mfma_i32_4x4x4i8(a[k], (int) b[k], c, 0, 0, 0);
+    }
+#else
+    (void) a; (void) b0; (void) b1;
+#endif
+    return c;
+}
+
+// IQ3 slot-step: item 16*st + l of this lane's row (q8 blocks 2*rec, 2*rec + 1: record yr = 20*rec words, column 0).
+// Sub-block j outer, column group g inner: every accumulator still adds j = 0 before j = 1 (the N=1 order).
+template <class T3, int CG>
+static __device__ __forceinline__ void mf_s3(mixg_f2 (&acc)[CG][2], const mfw & w, const uint32_t * yr, const int (&co)[CG]) {
+    typename T3::template ld<2> c;
+    c.q0 = w.a; c.q1 = w.a;
+    if constexpr (T3::TAB_WORDS == 8192) {
+        c.fa = w.b; c.fb = make_uint2(w.c.x, w.c.y);
+    } else {
+        c.a = w.b; c.d = w.c.x;
+    }
+    c.p = (int) w.c.z;
+    const typename T3::template dec<2> d = T3::template prep<2>(c);
+    mixg_f2 dw01, dw23;
+    mf_q2(T3::template dw<2>(d), dw01, dw23);
+#pragma unroll
+    for (int j = 0; j < 2; ++j) {
+        int t[8];
+        nc_tab8<T3, 0>(d, j, t);
+        float f;
+        if constexpr (T3::TAB_WORDS == 8192) {
+            f = (float) (1 + 2*(int) ((d.sc >> (4*j)) & 0xFu));
+        } else {
+            f = (float) (2*iq3g::dp4a((int) ((d.a[j] >> 7) & 0x01010101u), 0x08040201, 0) + 1) * 0.25f;
+        }
+        mixg_f2 f01, f23;
+        mf_q2(f, f01, f23);
+#pragma unroll
+        for (int g = 0; g < CG; ++g) {
+            const uint32_t * yc = yr + co[g];   // co[g] = column min(4*g + q, nc - 1) (>= nc: a duplicate, never stored)
+            const uint4 y0 = *(const uint4 *) (yc + 8*j), y1 = *(const uint4 *) (yc + 8*j + 4);
+            const mixg_f2 dy = mf_sp(__uint_as_float(yc[16 + j]));
+            const mixg_i32x4 s = mf_chain(t, y0, y1);
+            mixg_f2 s01 = mf_mul(mf_cvt(s[0], s[1]), f01), s23 = mf_mul(mf_cvt(s[2], s[3]), f23);
+            if constexpr (T3::TAB_WORDS != 8192) {
+                s01 = mixg_f2{truncf(s01.x), truncf(s01.y)}; s23 = mixg_f2{truncf(s23.x), truncf(s23.y)};
+            }
+            // N=1: acc + (dw*dy)*sv
+            acc[g][0] = mf_add(acc[g][0], mf_mul(mf_mul(dw01, dy), s01));
+            acc[g][1] = mf_add(acc[g][1], mf_mul(mf_mul(dw23, dy), s23));
+            MIXG_MF_FENCE();
+        }
+    }
+}
+
+// IQ4_XS slot-step: items k = 0, 1 (q8 blocks b0 + 16*k of the step buffer, b0 = 32*ls + l); item k outer, group g inner
+template <int CG>
+static __device__ __forceinline__ void mf_s4x(mixg_f2 (&acc)[CG][2], const mfw & w, const iq4k::iq4xs_t::lc & c,
+        const uint32_t * buf, const int b0, const int (&co)[CG]) {
+#pragma unroll
+    for (int k = 0; k < 2; ++k) {
+        const uint4 qq = k ? w.b : w.a;
+        const uint32_t hx = k ? w.c.z : w.c.x, hy = k ? w.c.w : w.c.y;
+        uint32_t lo[4], hi[4];
+        iq4k::lookup8(qq.x, c.T, c.m4, c.sb, lo[0], hi[0]);
+        iq4k::lookup8(qq.y, c.T, c.m4, c.sb, lo[1], hi[1]);
+        iq4k::lookup8(qq.z, c.T, c.m4, c.sb, lo[2], hi[2]);
+        iq4k::lookup8(qq.w, c.T, c.m4, c.sb, lo[3], hi[3]);
+        const int a[8] = {(int) lo[0], (int) lo[1], (int) lo[2], (int) lo[3], (int) hi[0], (int) hi[1], (int) hi[2], (int) hi[3]};
+        const int ls = (int) (((hy >> c.shl) & 0xFu) | (((hx >> c.shh) & 3u) << 4));
+        mixg_f2 dh01, dh23, fl01, fl23;
+        mf_q2(iq4k::h2f(hx), dh01, dh23);
+        mf_q2((float) (ls - 32), fl01, fl23);
+        const int b = b0 + 16*k;
+        const int o = 20*(b >> 1) + 8*(b & 1), e = 20*(b >> 1) + 16 + (b & 1);
+#pragma unroll
+        for (int g = 0; g < CG; ++g) {
+            const uint32_t * yc = buf + co[g];
+            const uint4 y0 = *(const uint4 *) (yc + o), y1 = *(const uint4 *) (yc + o + 4);
+            const mixg_f2 d8 = mf_sp(__uint_as_float(yc[e]));
+            const mixg_i32x4 s = mf_chain(a, y0, y1);
+            // N=1: acc = fma(dh*d8, (float) (s*(ls - 32)), acc)
+            acc[g][0] = mf_fma(mf_mul(dh01, d8), mf_mul(mf_cvt(s[0], s[1]), fl01), acc[g][0]);
+            acc[g][1] = mf_fma(mf_mul(dh23, d8), mf_mul(mf_cvt(s[2], s[3]), fl23), acc[g][1]);
+            MIXG_MF_FENCE();
+        }
+    }
+}
+
+// Q4_K slot-step: item rec = 16*ls + l (sub-block pair = q8 blocks 2*rec, 2*rec + 1: record yr, column 0)
+template <int CG>
+static __device__ __forceinline__ void mf_s4k(mixg_f2 (&acc)[CG][2], const mfw & w, const iq4k::q4k_t::lc & c,
+        const uint32_t * yr, const int (&co)[CG]) {
+    const uint32_t qw[8] = {w.a.x, w.a.y, w.a.z, w.a.w, w.b.x, w.b.y, w.b.z, w.b.w};
+    int ql[8], qh[8];
+#pragma unroll
+    for (int k = 0; k < 8; ++k) { ql[k] = (int) (qw[k] & 0x0F0F0F0Fu); qh[k] = (int) ((qw[k] >> 4) & 0x0F0F0F0Fu); }
+    const uint32_t t1 = w.c.y >> c.sh, t2 = w.c.z >> c.sh, t3 = w.c.w >> c.sh;
+    const uint32_t SC = c.hi ? ((t3 & 0x0F0Fu) | ((t1 >> 2) & 0x3030u)) : (t1 & 0x3F3Fu);
+    const uint32_t MM = c.hi ? (((t3 >> 4) & 0x0F0Fu) | ((t2 >> 2) & 0x3030u)) : (t2 & 0x3F3Fu);
+    const float2 dm = __half22float2(*(const half2 *) &w.c.x);
+    mixg_f2 sa01, sa23, sb01, sb23, ma01, ma23, mb01, mb23, dx01, dx23, dy01, dy23;
+    mf_q2((float) (SC & 0xFFu), sa01, sa23);
+    mf_q2((float) (SC >> 8),    sb01, sb23);
+    mf_q2((float) (MM & 0xFFu), ma01, ma23);
+    mf_q2((float) (MM >> 8),    mb01, mb23);
+    mf_q2(dm.x, dx01, dx23);
+    mf_q2(dm.y, dy01, dy23);
+#pragma unroll
+    for (int g = 0; g < CG; ++g) {
+        const uint32_t * yc = yr + co[g];
+        const uint4 dd = *(const uint4 *) (yc + 16);
+        const mixg_i32x4 sa = mf_chain(ql, *(const uint4 *) yc,       *(const uint4 *) (yc + 4));
+        const mixg_i32x4 sb = mf_chain(qh, *(const uint4 *) (yc + 8), *(const uint4 *) (yc + 12));
+        const mixg_f2 da = mf_sp(__uint_as_float(dd.x)), db = mf_sp(__uint_as_float(dd.y));
+        const mixg_f2 fz = mf_sp((float) (int) dd.z), fw = mf_sp((float) (int) dd.w);
+        // N=1 (gemv_pair, compiled): sumf_d = fma(db, B, da*A), sumf_m = fma(da, Mz, db*Mw), acc + (dm.x*sumf_d - dm.y*sumf_m)
+        {
+            const mixg_f2 A = mf_mul(mf_cvt(sa[0], sa[1]), sa01), B = mf_mul(mf_cvt(sb[0], sb[1]), sb01);
+            const mixg_f2 sd = mf_fma(db, B, mf_mul(da, A));
+            const mixg_f2 sm = mf_fma(da, mf_mul(fz, ma01), mf_mul(db, mf_mul(fw, mb01)));
+            acc[g][0] = mf_add(acc[g][0], mf_sub(mf_mul(dx01, sd), mf_mul(dy01, sm)));
+        }
+        {
+            const mixg_f2 A = mf_mul(mf_cvt(sa[2], sa[3]), sa23), B = mf_mul(mf_cvt(sb[2], sb[3]), sb23);
+            const mixg_f2 sd = mf_fma(db, B, mf_mul(da, A));
+            const mixg_f2 sm = mf_fma(da, mf_mul(fz, ma23), mf_mul(db, mf_mul(fw, mb23)));
+            acc[g][1] = mf_add(acc[g][1], mf_sub(mf_mul(dx23, sd), mf_mul(dy23, sm)));
+        }
+        MIXG_MF_FENCE();
+    }
+}
+
+// activation staging. Ring: one q8_1 block per thread and step (nc*32 <= threads), loaded one step ahead.
+struct mf_pre { uint32_t ds; uint4 q0, q1; };
+static __device__ __forceinline__ void mf_pre_load(mf_pre & p, const block_q8_1 * __restrict__ yg, const int K, const int step,
+        const int tid, const int nc) {
+    if (tid < nc*32) {
+        const int col = tid >> 5, b = tid & 31;
+        const uint8_t * a = (const uint8_t *) (yg + (size_t) col*(K/32) + step*32 + b);
+        p.ds = iq4k::ld_u32_opaque(a);
+        p.q0 = *(const uint4 *) (a + 4);
+        p.q1 = *(const uint4 *) (a + 20);
+    }
+}
+static __device__ __forceinline__ void mf_pre_store(const mf_pre & p, uint32_t * buf, const int cs, const int tid, const int nc) {
+    if (tid < nc*32) {
+        yrt::put_y(buf + (tid >> 5)*cs, tid & 31, p.q0, p.q1, iq4k::h2f(p.ds));
+    }
+}
+// ring cursor: gsi = step sequence number (all passes); buffer gsi % NB holds step gsi % nst
+template <int NB>
+struct mf_ring {
+    mf_pre pre;
+    int gsi, total, nst, cs, bw, K, nc;
+    uint32_t * base;
+    const block_q8_1 * yg;
+    // called by every thread of the workgroup at the start of each step; returns that step's buffer
+    __device__ __forceinline__ const uint32_t * enter(const int tid) {
+        if constexpr (NB == 0) {
+            (void) tid;
+            return base;
+        } else {
+            uint32_t * buf = base + (NB == 2 ? (gsi & 1)*bw : 0);
+            if (gsi > 0) {
+                if constexpr (NB == 1) __syncthreads();         // every wave is done with the previous step's records
+                mf_pre_store(pre, buf, cs, tid, nc);
+                __syncthreads();
+            }
+            if (gsi + 1 < total) {
+                mf_pre_load(pre, yg, K, (gsi + 1) % nst, tid, nc);
+            }
+            ++gsi;
+            return buf;
+        }
+    }
+};
+
+// column stride (words) and LDS bytes; NB = 0: all K staged, NB = 1 / 2: ring of one-step buffers
+static __host__ __device__ inline int mf_cs(const int K, const int NB) { return (NB == 0 ? K/1024 : 1)*320 + 8; }
+template <class T3>
+static inline size_t lds_bytes_mf(const int K, const int nc, const int NB) {
+    return (size_t) T3::TAB_WORDS*4 + (size_t) (NB == 2 ? 2 : 1)*nc*mf_cs(K, NB)*4;
+}
+
+// yg: nc*K/32 q8_1 blocks (column col at yg + col*K/32); outputs d3 / d4 with column strides ld3 / ld4 (floats).
+// nc = 4*(CG - 1) + 1 .. 4*CG; S slots per wave and pass; NWM waves per workgroup (one workgroup per CU).
+template <class T3, class T4, int SM, int CG, int NB, int S, int NWM>
+__launch_bounds__(NWM*64, 1)
+__global__ void gemv_pair_mf(const uint8_t * __restrict__ w3, float * __restrict__ d3, const int N3, const int ld3,
+        const iq4k::soa s4, float * __restrict__ d4, const int N4, const int ld4,
+        const block_q8_1 * __restrict__ yg, const int K, const int nc) {
+    extern __shared__ __align__(16) uint32_t smem[];
+#if defined(__HIP_DEVICE_COMPILE__)
+    if ((uint32_t) (size_t) (__attribute__((address_space(3))) uint32_t *) smem != 0) __builtin_trap();
+#endif
+    constexpr bool XS = std::is_same<T4, iq4k::iq4xs_t>::value;
+    constexpr int NT = NWM*64;
+    typedef typename T3::template ld<2> ld3t;
+    typedef typename T4::raw raw4;
+    const int tid = threadIdx.y*64 + threadIdx.x;
+#if defined(__HIP_DEVICE_COMPILE__)
+    const int wy = __builtin_amdgcn_readfirstlane(threadIdx.y);
+#else
+    const int wy = threadIdx.y;
+#endif
+    const int l = threadIdx.x >> 2, q = threadIdx.x & 3;
+    const int nst = K/1024;
+    // this workgroup's units: IQ3 [a3, a3 + n3), IQ4 [a4, a4 + cnt - n3)
+    const int G = gridDim.x, bk = blockIdx.x;
+    const int U3 = N3/RG, U4 = N4/RG;
+    const int a3 = (int) (((int64_t) U3*bk)/G), a4 = (int) (((int64_t) U4*bk)/G);
+    const int n3 = (int) (((int64_t) U3*(bk + 1))/G) - a3;
+    const int cnt = n3 + (int) (((int64_t) U4*(bk + 1))/G) - a4;
+    const int nsl = (cnt + NWM - 1)/NWM;                      // slots of the busiest wave
+    const int np  = (nsl + S - 1)/S;                          // passes (uniform in the workgroup: ring barriers)
+    const int myn = cnt > wy ? (cnt - 1 - wy)/NWM + 1 : 0;    // this wave's slots
+
+    mf_ring<NB> rg;
+    rg.base  = smem + T3::TAB_WORDS;
+    rg.cs    = mf_cs(K, NB);
+    rg.bw    = nc*rg.cs;
+    rg.nst   = nst;
+    rg.total = np*nst;
+    rg.gsi   = 0;
+    rg.yg    = yg;
+    rg.K     = K;
+    rg.nc    = nc;
+    {
+        constexpr int GA = T3::TAB_WORDS/16;
+        const uint32_t gw = iq3g::grid_word<T3>(tid % GA);
+        if constexpr (NB == 0) {
+            const int nb = K/32, nbt = nc*nb;
+            for (int b = tid; b < nbt; b += NT) {
+                const uint8_t * p = (const uint8_t *) (yg + b);
+                const uint32_t ds = iq4k::ld_u32_opaque(p);
+                const uint4 q0 = *(const uint4 *) (p + 4);
+                const uint4 q1 = *(const uint4 *) (p + 20);
+                const int col = b / nb;
+                yrt::put_y(rg.base + col*rg.cs, b - col*nb, q0, q1, iq4k::h2f(ds));
+            }
+        } else {
+            mf_pre_load(rg.pre, yg, K, 0, tid, nc);
+            mf_pre_store(rg.pre, rg.base, rg.cs, tid, nc);
+        }
+        iq3g::tab_store<T3, NT>(smem, gw, tid);
+    }
+    __syncthreads();
+
+    const int items = K/128;
+    const uint32_t nh3 = (uint32_t) N3*(uint32_t) items;
+    const uint32_t bpr = K / QK_K;
+    const uint32_t boff = 4*bpr*RG;
+    const uint32_t slane = (l/T4::IPB)*RG + q;
+    const typename T4::lc c4 = T4::lane_consts(l);
+    // group sums by ds_bpermute with fixed byte addresses. IQ3 (iq3g::group_sum<16>: l ^ 1, ^ 2, ^ 7, ^ 15): lane ^ 4, ^ 8,
+    // ^ 28, ^ 60; IQ4 (iq4k::group_sum<16>: l ^ 8, ^ 4, ^ 2, ^ 1): lane ^ 32, ^ 16, ^ 8, ^ 4
+    const int bx4 = (int) ((threadIdx.x ^ 4) << 2), bx8 = (int) ((threadIdx.x ^ 8) << 2);
+    const int bx28 = (int) ((threadIdx.x ^ 28) << 2), bx60 = (int) ((threadIdx.x ^ 60) << 2);
+    const int bx16 = (int) ((threadIdx.x ^ 16) << 2), bx32 = (int) ((threadIdx.x ^ 32) << 2);
+    int co[CG];                                               // word offset of this lane's column of group g
+#pragma unroll
+    for (int g = 0; g < CG; ++g) co[g] = min(4*g + q, nc - 1)*rg.cs;
+    auto load4 = [&](const int un, const int kk) -> raw4 {
+        const uint32_t qs_ = ((uint32_t) un*bpr*8 + kk*L)*RG, ss_ = ((uint32_t) un*bpr + kk*(L/T4::IPB))*RG;
+        return T4::load_c(s4, qs_ + threadIdx.x, ss_ + slane, boff);
+    };
+
+    for (int ps = 0; ps < np; ++ps) {
+        const int nv = min(max(myn - ps*S, 0), S);              // valid slots of this wave in this pass (a prefix)
+        bool is3[S];
+        int  un[S];
+#pragma unroll
+        for (int s = 0; s < S; ++s) {
+            const int cc = wy + (ps*S + s)*NWM;
+            is3[s] = cc < n3;
+            un[s]  = cc < n3 ? a3 + cc : a4 + cc - n3;
+        }
+        auto load = [&](const int s, const int st0) -> mfw {
+            // opaque unit and step: the per-slot load addresses are formed here, not hoisted out of the step loop
+            // (S slots x 64-bit lane addresses would cost ~20 VGPRs per slot)
+            int us = un[s], st = st0;
+#if defined(__HIP_DEVICE_COMPILE__)
+            asm volatile("" : "+s"(us), "+s"(st));
+#endif
+            mfw r;
+            if (is3[s]) {
+                const ld3t x = iq3g::mj_load<T3, 2, RG, SM>(w3, nh3, us, items, q, 16*st + l, U3);
+                r.a = x.q0;
+                if constexpr (T3::TAB_WORDS == 8192) {
+                    r.b = x.fa; r.c = make_uint4(x.fb.x, x.fb.y, (uint32_t) x.p, 0u);
+                } else {
+                    r.b = x.a;  r.c = make_uint4(x.d, 0u, (uint32_t) x.p, 0u);
+                }
+            } else if constexpr (XS) {
+                const raw4 x0 = load4(us, 2*st), x1 = load4(us, 2*st + 1);
+                r.a = x0.q; r.b = x1.q; r.c = make_uint4(x0.h.x, x0.h.y, x1.h.x, x1.h.y);
+            } else {
+                const raw4 x = load4(us, st);
+                r.a = x.a; r.b = x.b; r.c = x.h;
+            }
+            return r;
+        };
+        mixg_f2 acc[S][CG][2];
+#pragma unroll
+        for (int s = 0; s < S; ++s) for (int g = 0; g < CG; ++g) { acc[s][g][0] = mf_sp(0.0f); acc[s][g][1] = mf_sp(0.0f); }
+        // weights: MIXG_MF_PF = 1: one step ahead per slot (pre[s] = slot s's next step); 0: one (slot, step) ahead
+        mfw pre[MIXG_MF_PF ? S : 1];
+#pragma unroll
+        for (int s = 0; s < (MIXG_MF_PF ? S : 1); ++s) {
+            if (s < nv) pre[s] = load(s, 0);
+        }
+        for (int st = 0; st < nst; ++st) {
+            const uint32_t * buf = rg.enter(tid);
+            const int ls  = NB == 0 ? st : 0;                      // step within the buffer
+#pragma unroll
+            for (int s = 0; s < S; ++s) {
+                if (s < nv) {
+                    mfw cur;
+                    if constexpr (MIXG_MF_PF) {
+                        cur = pre[s];
+                        if (st + 1 < nst) pre[s] = load(s, st + 1);
+                    } else {
+                        cur = pre[0];
+                        if (s + 1 < nv) pre[0] = load(s + 1 < S ? s + 1 : s, st);
+                        else if (st + 1 < nst) pre[0] = load(0, st + 1);
+                    }
+                    if (is3[s]) {
+                        mf_s3<T3, CG>(acc[s], cur, buf + 20*(16*ls + l), co);
+                    } else if constexpr (XS) {
+                        mf_s4x<CG>(acc[s], cur, c4, buf, 32*ls + l, co);
+                    } else {
+                        mf_s4k<CG>(acc[s], cur, c4, buf + 20*(16*ls + l), co);
+                    }
+                    MIXG_MF_FENCE();
+                }
+            }
+        }
+#pragma unroll
+        for (int s = 0; s < S; ++s) {
+            if (s < nv) {
+                float * dst = is3[s] ? d3 : d4;
+                const int ld = is3[s] ? ld3 : ld4;
+#pragma unroll
+                for (int g = 0; g < CG; ++g) {
+#pragma unroll
+                    for (int i = 0; i < 4; ++i) {
+                        const float a = i < 2 ? acc[s][g][0][i] : acc[s][g][1][i - 2];
+                        const float v = is3[s] ? mf_gsum(a, bx4, bx8, bx28, bx60) : mf_gsum(a, bx32, bx16, bx8, bx4);
+                        if (l == 0 && 4*g + q < nc) dst[(size_t) (4*g + q)*ld + un[s]*RG + i] = v;
+                    }
+                }
+            }
+        }
+    }
+}
+
 // MMVQ-NC mix end ------------------------------------------------------------------------------------------------------
 
 } // namespace mixg

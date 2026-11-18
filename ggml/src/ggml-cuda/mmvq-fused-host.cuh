@@ -95,8 +95,8 @@ bool ggml_cuda_mmvq_q8_cached(ggml_backend_cuda_context & ctx, const ggml_tensor
 // glu (optional): the SWIGLU node of a gate/up pair, computed in the same launch (+ its q8_1 for ffn_down).
 // GGML_MMVQ_MIX=0 disables, =2 runs the IQ4 job first, GGML_MMVQ_MIX_GLU=0 keeps the SwiGLU separate.
 // soa_il4: the iq4k IL = 4 copy (mmvq-iq4k.cu).
-// MMVQ-NC S: N-column (2 <= ncols <= nc_max) GEMVs for multi-token verification. nc_max: GGML_MMVQ_NC_MAX (default 4,
-// 2..6), 0 if GGML_MMVQ_NC=0. q8_cached_nc: q8_1 of a [K, ncols] f32 activation (K % 512 == 0) from the activation cache,
+// MMVQ-NC S: N-column (2 <= ncols <= nc_max) GEMVs for multi-token verification. nc_max: GGML_MMVQ_NC_MAX (default 16,
+// 2..16), 0 if GGML_MMVQ_NC=0. q8_cached_nc: q8_1 of a [K, ncols] f32 activation (K % 512 == 0) from the activation cache,
 // column c at q8 + c*K/32 (byte-identical to the single-row quantization of every column). fusion_ok: will
 // ggml_cuda_mul_mat_vec_q fuse this MUL_MAT (N columns) with a SwiGLU gate (gate_w) or a residual add; it is exact (a
 // promised fusion that no NC slot takes aborts) and may create a low-bit SoA copy outside stream capture (ctx).

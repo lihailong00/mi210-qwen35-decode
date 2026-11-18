@@ -353,7 +353,25 @@ static void ggml_cuda_op_gated_delta_net_impl(
         state_slot_stride = cache->slot_stride;
     }
 
-    {
+    // MTP2-merge: with rollback snapshots (K > 1, e.g. a prompt evaluated while MTP drafting is on) the chunked prefill
+    // kernels (WY / MFMA) are not used, so the outputs and the final state differed in the last bits from the same batch
+    // without snapshots (the no-speculation run). GGML_CUDA_GDN_KEEP_RS_EXACT (default 1): the snapshot recurrence below
+    // runs from a copy of the input state, then the chunked kernel the K = 1 call would take recomputes the outputs and
+    // slot 0 from that copy, so both are bit-identical to the call without snapshots (slots 1..K-1 come from the
+    // recurrence). 0 restores the previous behaviour exactly.
+    static const bool keep_rs_exact = [] {
+        const char * e = getenv("GGML_CUDA_GDN_KEEP_RS_EXACT");
+        return e == nullptr || atoi(e) != 0;
+    }();
+    const bool exact_k1 = keep_rs && keep_rs_exact && !kda && n_tokens >= 2;
+    ggml_cuda_pool_alloc<float> s_copy(ctx.pool());
+    if (exact_k1) {
+        const size_t ns = (size_t) S_v*S_v*H*n_seqs;
+        s_copy.alloc(ns);
+        CUDA_CHECK(cudaMemcpyAsync(s_copy.get(), s_d, ns*sizeof(float), cudaMemcpyDeviceToDevice, stream));
+        s_d = s_copy.get();
+    }
+    if (!exact_k1) {
         ggml_cuda_gdn_mma_args args = ggml_cuda_gdn_mma_args_from_tensor(dst);
         args.state_out = state_d;
         if (ggml_cuda_gdn_mma_launch(ctx.device, args, stream)) {
@@ -381,6 +399,15 @@ static void ggml_cuda_op_gated_delta_net_impl(
             launch_gated_delta_net<false, true>(q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d,
                 S_v, H, n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
                 sb1, sb2, sb3, neqk1, rq3, scale, state_slot_stride, K, stream);
+            if (exact_k1) {   // MTP2-merge: outputs + slot 0 as the call without snapshots computes them
+                ggml_cuda_gdn_mma_args args = ggml_cuda_gdn_mma_args_from_tensor(dst);
+                args.state     = s_d;
+                args.state_out = state_d;
+                if (!ggml_cuda_gdn_mma_launch(ctx.device, args, stream) && !ggml_cuda_gdn_wy_launch(ctx, args, stream)) {
+                    ggml_cuda_gdn_mfma_launch(ctx.device, args, stream);
+                }
+                // none taken: the K = 1 call runs the same recurrence, whose outputs and last state are the ones above
+            }
         } else {
             launch_gated_delta_net<false, false>(q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d,
                 S_v, H, n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,

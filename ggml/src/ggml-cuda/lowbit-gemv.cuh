@@ -1279,19 +1279,643 @@ static inline int launch_nc_chunk(ggml_type t, const soa & s, const block_q8_1 *
     return 0;
 }
 
+// ------------------------------------------------------------------------------------------------ MTP2-C: MFMA N-column
+// N-column GEMV (NC = 2..16) with the integer dot products on the matrix cores (v_mfma_i32_4x4x4i8: 16 blocks of 4 lanes).
+// Lane = 4*b + q. Block b is an item lane slot: item lane l = b + 16*h (h = 0..L/16-1, L = the N=1 config's lanes per row).
+//   B operand (lane 4*b + q): row q of the 4-row unit, decoded at item lane l exactly as the N=1 lane l of that row does it
+//     (the sign-applied int8 weights, 4 per dword);
+//   A operand (lane 4*b + i): column 4*cg + i of the y records (q8 dwords).
+//   D[i] of lane 4*b + q = the exact int32 sum of row q, column 4*cg + i over the chain.
+// So every per-row value (dw, sub-block scales) stays in its own lane, and the 4 D values are 4 columns of that row.
+// Integer stage: the chains cover the N=1 dp4a chain halves (dwords 0..3 / 4..7 of a 32-weight group), int32 sums are
+// exact in any order. Exact integer identities (all integers involved are < 2^24 in magnitude, so every fp32 step on
+// them below is exact and gives the N=1 integers bit for bit):
+//   IQ2_S / IQ2_XS: chain s0 (dwords 0..3) continued to s01 (0..7); sdiv<2>(s0*sa + s1*sb + sdiv<1>(s0 + s1)) =
+//     trunc(0.25*fma(s0, sa - sb, fma(s01, sb, trunc(0.5*s01))))
+//   IQ2_XXS: sdiv<3>(s01*ls) = trunc(s01*(ls/8)) (s01*ls < 2^24 and ls/8 exact: the product is exact)
+//   Q2_K: weights prescaled by the 4-bit scale (bytes sc*((v >> 2g) & 3) <= 45, one chain of 8) give SDn = SD/4^g',
+//     fma(d8*inv, SD, sd) = fma(d8, SDn, sd) (d8*inv = d8/4^g' exactly, so the same exact product);
+//     SM = fma(ma, Y01, mb*Y23) with the float y half sums (exact)
+//   IQ1_M: bytes 8*g + 9 - 2*delta (<= 25), chains started at -16*sum(y) give S0 / S1 directly
+//     (= 8*i01 + y9 + b0*y11 + b1*y12 of the N=1 code); mad24(S0, sc0, mul24(S1, sc1)) = fma(S0, sc0, S1*sc1)
+// Float stage per (row, column, item lane l): the N=1 fp32 sequence (contraction off, fma only where N=1 has one; packed
+// fp32 ops round per element like the scalar ones). Lane l accumulates items l, l+L, ... in increasing order (K chunks
+// only pause it; steps past the row end are computed on a clamped item and dropped by a select) and group_sum<L> is the
+// same butterfly (item lane l ^ 8, ^ 4, ^ 2, ^ 1 = lane ^ 32, ^ 16, ^ 8, ^ 4, then the cross-wave ^ 16, ^ 32 of L > 16;
+// identical to the row_ror form at lane 0 because fp add is commutative). So every output is bit-identical to the N=1
+// kernel of that column. The first item term t = x0 instead of 0 + x0 differs only in the sign of a zero, which the
+// accumulator (starting at +0, never -0) absorbs.
+// y records of all columns are staged per K chunk (KCB 256-blocks, aligned to L items): q8 dwords per column (record
+// stride RS words) + d8 (and the Q2_K / IQ1_M y sums) as [record][column] arrays read 4 columns at a time.
+// Switch: GGML_MMVQ_NC_LOWBIT_MFMA=0 -> the dp4a NC kernels above exactly (and N <= LB_NC_MAX). Tuning / debug:
+// GGML_MMVQ_NC_LB_MF_MIN (smallest NC taken), GGML_MMVQ_NC_LB_MF_LDS (LDS cap per workgroup), GGML_MMVQ_NC_LB_MF_GRID,
+// GGML_MMVQ_NC_LB_MF_NW (waves per workgroup).
+#define LB_NC_MAX_MF 16
+#ifndef LB_MF_SCHED_STEP
+#define LB_MF_SCHED_STEP 1
+#endif
+
+typedef int lb_i32x4 __attribute__((ext_vector_type(4)));
+typedef unsigned int lb_u32x4 __attribute__((ext_vector_type(4)));
+static __device__ __forceinline__ lb_i32x4 mf4(const uint32_t a, const uint32_t b, const lb_i32x4 c) {
+#if defined(__HIP_DEVICE_COMPILE__)
+    return __builtin_amdgcn_mfma_i32_4x4x4i8((int) a, (int) b, c, 0, 0, 0);
+#else
+    GGML_UNUSED_VARS(a, b);
+    return c;
+#endif
+}
+static __device__ __forceinline__ float mf_add(const float a, const float b) {
+#pragma clang fp contract(off)
+    return a + b;
+}
+// packed fp32 (v_pk_mul / v_pk_add / v_pk_fma round per element exactly like the scalar ops; never contracted)
+typedef float lb_f2 __attribute__((ext_vector_type(2)));
+static __device__ __forceinline__ lb_f2 f2_mul(const lb_f2 a, const lb_f2 b) {
+#pragma clang fp contract(off)
+    return a*b;
+}
+static __device__ __forceinline__ lb_f2 f2_add(const lb_f2 a, const lb_f2 b) {
+#pragma clang fp contract(off)
+    return a + b;
+}
+static __device__ __forceinline__ lb_f2 f2_sub(const lb_f2 a, const lb_f2 b) {
+#pragma clang fp contract(off)
+    return a - b;
+}
+static __device__ __forceinline__ lb_f2 f2_fma(const lb_f2 a, const lb_f2 b, const lb_f2 c) { return __builtin_elementwise_fma(a, b, c); }
+static __device__ __forceinline__ lb_f2 f2_trunc(const lb_f2 a) { return __builtin_elementwise_trunc(a); }
+static __device__ __forceinline__ lb_f2 f2_s(const float a) { lb_f2 r; r.x = a; r.y = a; return r; }
+static __device__ __forceinline__ lb_f2 f2_cvt(const int a, const int b) { lb_f2 r; r.x = (float) a; r.y = (float) b; return r; }
+static __device__ __forceinline__ lb_f2 f2_u(const uint32_t a, const uint32_t b) { lb_f2 r; r.x = __uint_as_float(a); r.y = __uint_as_float(b); return r; }
+// value of lane (lane ^ M) within 32 lanes (ds_swizzle bit mode)
+template <int M> static __device__ __forceinline__ float mf_swz(const float v) {
+#if defined(__HIP_DEVICE_COMPILE__)
+    return __int_as_float(__builtin_amdgcn_ds_swizzle(__float_as_int(v), (M << 10) | 0x1F));
+#else
+    return v;
+#endif
+}
+// value of lane (lane + R) mod 16 within its row of 16 (DPP row_ror)
+template <int R> static __device__ __forceinline__ float mf_ror(const float v) {
+#if defined(__HIP_DEVICE_COMPILE__)
+    return __int_as_float(__builtin_amdgcn_mov_dpp(__float_as_int(v), 0x120 | R, 0xF, 0xF, false));
+#else
+    return v;
+#endif
+}
+// 16-byte LDS read at a byte address (tables at LDS address 0, see LB_TAB0)
+static __device__ __forceinline__ lb_u32x4 mf_lds4(const uint32_t a) {
+#if defined(__HIP_DEVICE_COMPILE__)
+    return *(__attribute__((address_space(3))) const lb_u32x4 *) (size_t) a;
+#else
+    GGML_UNUSED(a);
+    return lb_u32x4{0, 0, 0, 0};
+#endif
+}
+
+// per type: y records per item (NG), q8 record stride RS (words, multiple of 4) in the column arrays, NX extra
+// [record][column] arrays (Q2_K: float y sums of qs[0..15], qs[16..31]; IQ1_M: int -16*the same sums)
+template <class T> struct mf_k {
+    static constexpr int kind = nc_traits<T>::kind;
+    static constexpr int NG = T::SPI;
+    static constexpr int RS = kind == 3 ? 12 : 8;
+    static constexpr int NX = kind >= 3 ? 2 : 0;
+};
+
+// sign-applied grid words of one 32-weight IQ2 group (the dp4a operands of dot32<false>, same order)
+static __device__ __forceinline__ void mf_iq2_words(const gent & a, const gent & b, const gent & c, const gent & d, const uint32_t S,
+        uint32_t (&w)[8]) {
+    const uint32_t M4 = vconst(0x04040404u), SB = sconst(0x03020100u);
+    w[0] = perm(a.nx, a.x, ysel<0>(S, M4, SB)); w[1] = perm(a.ny, a.y, ysel<4>(S, M4, SB));
+    w[2] = perm(b.nx, b.x, ysel<1>(S, M4, SB)); w[3] = perm(b.ny, b.y, ysel<5>(S, M4, SB));
+    w[4] = perm(c.nx, c.x, ysel<2>(S, M4, SB)); w[5] = perm(c.ny, c.y, ysel<6>(S, M4, SB));
+    w[6] = perm(d.nx, d.x, ysel<3>(S, M4, SB)); w[7] = perm(d.ny, d.y, ysel<7>(S, M4, SB));
+}
+
+// B words of group g of the item of this lane's row
+template <class T>
+static __device__ __forceinline__ void mf_group(const uint32_t * __restrict__ tab, const typename T::raw & r, const int g, uint32_t (&w)[8]) {
+    constexpr int kind = mf_k<T>::kind;
+    if constexpr (kind == 0) {
+        const uint32_t q = r.a.w[2*g], S = r.a.w[2*g + 1];
+        const uint32_t qhsc = r.b >> (16*g);
+        const uint32_t qhx = tab_u32(tab, T::QHX, qhsc & 0xFF);
+        const uint32_t X = perm(qhx, q, 0x05010400u), Z = perm(qhx, q, 0x07030602u);
+        gent g0, g1, g2, g3;
+        tab_pairG<false>(tab, X, g0, g1); tab_pairG<false>(tab, Z, g2, g3);
+        mf_iq2_words(g0, g1, g2, g3, S, w);
+    } else if constexpr (kind == 1) {
+        const uint32_t q = r.a.w[2*g], S0 = r.a.w[2*g + 1];
+        const uint32_t qh4 = spread4(S0 >> 28);
+        const uint32_t X = perm(qh4, q, 0x05010400u), Z = perm(qh4, q, 0x07030602u);
+        gent g0, g1, g2, g3;
+        tab_pairG<false>(tab, X, g0, g1); tab_pairG<false>(tab, Z, g2, g3);
+        mf_iq2_words(g0, g1, g2, g3, ksign_fix(S0), w);
+    } else if constexpr (kind == 2) {
+        const uint32_t q = r.a.w[2*g], S0 = r.a.w[2*g + 1];
+        const gent g0 = tab_g1<false>(tab, q & 0xFF),         g1 = tab_g1<false>(tab, (q >> 8) & 0xFF);
+        const gent g2 = tab_g1<false>(tab, (q >> 16) & 0xFF), g3 = tab_g1<false>(tab, q >> 24);
+        mf_iq2_words(g0, g1, g2, g3, ksign_fix(S0), w);
+    } else if constexpr (kind == 3) {   // prescaled: sc*((v >> 2g) & 3) via a v_perm table {0, sc, 2sc, 3sc}
+        const uint32_t v[8] = {r.q0.x, r.q0.y, r.q0.z, r.q0.w, r.q1.x, r.q1.y, r.q1.z, r.q1.w};
+        const uint32_t scb = (g < 2 ? r.sc.x : r.sc.y) >> (16*(g & 1));
+        const uint32_t Ta = (uint32_t) __mul24((int) (scb & 0xF), 0x030201) << 8, Tb = (uint32_t) __mul24((int) ((scb >> 8) & 0xF), 0x030201) << 8;
+        const int sh = g < 3 ? 2*g : 6;
+#pragma unroll
+        for (int j = 0; j < 8; ++j) w[j] = perm(0u, j < 4 ? Ta : Tb, (v[j] >> sh) & 0x03030303u);
+    } else {
+        const uint32_t Q = r.a[g];
+        const uint32_t qh = (r.b >> (16*g)) & 0xFFFF;
+        const uint32_t qhb = (qh & 0x0707u) | ((qh >> 4) & 0x0707u) << 16;
+        const uint32_t X = perm(qhb, Q, 0x06010400u), Z = perm(qhb, Q, 0x07030502u);
+        const uint32_t w0 = tab_u32(tab, 0, X & 0xFFFF), w1 = tab_u32(tab, 0, X >> 16);
+        const uint32_t w2 = tab_u32(tab, 0, Z & 0xFFFF), w3 = tab_u32(tab, 0, Z >> 16);
+        // per 8 weights: + 9 - 2*delta, i.e. 0x07 | (delta ? 0 : 2) per byte
+        const uint32_t k0 = (qh & 0x0008u) ? 0u : 0x02020202u, k1 = (qh & 0x0080u) ? 0u : 0x02020202u;
+        const uint32_t k2 = (qh & 0x0800u) ? 0u : 0x02020202u, k3 = (qh & 0x8000u) ? 0u : 0x02020202u;
+        w[0] = (((w0 << 3) & 0x78787878u) | 0x07070707u) + k0; w[1] = (((w0 >> 1) & 0x78787878u) | 0x07070707u) + k0;
+        w[2] = (((w1 << 3) & 0x78787878u) | 0x07070707u) + k1; w[3] = (((w1 >> 1) & 0x78787878u) | 0x07070707u) + k1;
+        w[4] = (((w2 << 3) & 0x78787878u) | 0x07070707u) + k2; w[5] = (((w2 >> 1) & 0x78787878u) | 0x07070707u) + k2;
+        w[6] = (((w3 << 3) & 0x78787878u) | 0x07070707u) + k3; w[7] = (((w3 >> 1) & 0x78787878u) | 0x07070707u) + k3;
+    }
+}
+
+// word offset of column c in the q8 column arrays (sw: bank swizzle of column pairs)
+static __host__ __device__ __forceinline__ int mf_cb(const int c, const int colw, const int sw) { return c*colw + ((c >> 1) & 1)*sw; }
+
+// stage nrec records of ncp columns (columns >= nc: copies of column nc-1)
+template <class T>
+static __device__ __forceinline__ void mf_stage(uint32_t * __restrict__ yA, float * __restrict__ d8s, float * __restrict__ x0s, float * __restrict__ x1s,
+        const block_q8_1 * __restrict__ yg, const int ys, const int nc, const int ncp, const int colw, const int sw, const int nrec, const int tid, const int nt) {
+    typedef mf_k<T> MK;
+    for (int t = tid; t < ncp*nrec; t += nt) {
+        const int c = t / nrec, k = t - c*nrec;
+        const int cs = c < nc ? c : nc - 1;
+        const uint8_t * bp = (const uint8_t *) (yg + (size_t) cs*ys + k);
+        const uint4 q0 = *(const uint4 *) (bp + 4), q1 = *(const uint4 *) (bp + 20);
+        const uint32_t ds = *(const uint32_t *) bp;
+        {
+            uint4 * r = (uint4 *) (yA + mf_cb(c, colw, sw) + k*MK::RS);
+            r[0] = q0; r[1] = q1;
+        }
+        d8s[k*ncp + c] = __half2float(__ushort_as_half((unsigned short) (ds & 0xFFFF)));
+        if constexpr (MK::NX) {
+            const int q[8] = {(int) q0.x, (int) q0.y, (int) q0.z, (int) q0.w, (int) q1.x, (int) q1.y, (int) q1.z, (int) q1.w};
+            int s4[4];
+#pragma unroll
+            for (int j = 0; j < 4; ++j) s4[j] = dp4a(q[2*j+1], 0x01010101, dp4a(q[2*j], 0x01010101, 0));
+            if constexpr (MK::kind == 3) {
+                x0s[k*ncp + c] = (float) (s4[0] + s4[1]);
+                x1s[k*ncp + c] = (float) (s4[2] + s4[3]);
+            } else {
+                x0s[k*ncp + c] = __int_as_float(-16*(s4[0] + s4[1]));
+                x1s[k*ncp + c] = __int_as_float(-16*(s4[2] + s4[3]));
+            }
+        }
+    }
+}
+
+// one item lane slot of one step: MFMA integer sums + the N=1 fp32 item value of this lane's row for its CG*4 columns,
+// added to acc (only when valid). rec = chunk record index of the item's first group; byte addresses: colb (column
+// arrays), d8b / x0b / x1b ([record][column] arrays)
+template <class T, int CG>
+static __device__ __forceinline__ void mf_item(const uint32_t * __restrict__ tab, const typename T::raw & r, const uint32_t ii,
+        const uint32_t rec, const uint32_t colb, const uint32_t cgs, const uint32_t d8b, const uint32_t x0b, const uint32_t x1b,
+        const bool valid, float (&acc)[CG][4]) {
+#pragma clang fp contract(off)
+    typedef mf_k<T> MK;
+    constexpr int kind = MK::kind, NG = MK::NG, RS = MK::RS, NCP = 4*CG;
+    float dw = 0.0f, dmy = 0.0f;
+    if constexpr (kind <= 2) dw = h2f(r.d);
+    if constexpr (kind == 3) { const float2 dm = __half22float2(*(const half2 *) &r.dm); dw = dm.x; dmy = dm.y; }
+    if constexpr (kind == 4) {
+        const uint32_t u16 = ((r.sc.x & 0xFFFF) >> 12) | ((r.sc.x >> 24) & 0x00F0) | (((r.sc.y & 0xFFFF) >> 4) & 0x0F00) | ((r.sc.y >> 16) & 0xF000);
+        dw = h2f(u16);
+    }
+    uint32_t scw16 = 0;
+    int ib0 = 0;
+    if constexpr (kind == 4) {
+        ib0 = T::SPI*(int) ii;
+        scw16 = ((ib0 < 4 ? r.sc.x : r.sc.y) >> (16*((ib0 >> 1) & 1))) & 0xFFFF;
+    }
+    GGML_UNUSED(ii);
+    // per-row B words and constants of every group first (shared by all columns)
+    uint32_t w[NG][8];
+    float c0[NG], c1[NG];
+#pragma unroll
+    for (int g = 0; g < NG; ++g) {
+        mf_group<T>(tab, r, g, w[g]);
+        c0[g] = 0.0f; c1[g] = 0.0f;
+        if constexpr (kind == 0 || kind == 1) {
+            const uint32_t sc = kind == 0 ? (r.b >> (16*g + 8)) & 0xFF : (r.b >> (8*g)) & 0xFF;
+            c0[g] = (float) ((int) (sc & 0xF) - (int) (sc >> 4)); c1[g] = (float) (int) (sc >> 4);
+        } else if constexpr (kind == 2) {
+            c0[g] = (float) (int) ((r.a.w[2*g + 1] >> 27) | 1u) * 0.125f;
+        } else if constexpr (kind == 3) {
+            const uint32_t scb = (g < 2 ? r.sc.x : r.sc.y) >> (16*(g & 1));
+            c0[g] = (float) (int) ((scb >> 4) & 0xF); c1[g] = (float) (int) ((scb >> 12) & 0xF);
+        } else {
+            const uint32_t tmp = scw16 >> (6*((ib0 + g) & 1));
+            c0[g] = (float) (2*(int) (tmp & 7) + 1); c1[g] = (float) (2*(int) ((tmp >> 3) & 7) + 1);
+        }
+    }
+    const lb_f2 dw2 = f2_s(dw), dmi = f2_s(dmy);
+    // (column group cg, group g) steps n = cg*NG + g, software pipelined: LDS operands of step n+2 and the MFMA chains
+    // of step n+1 are issued before the fp32 stage of step n
+    constexpr int NI = CG*NG;
+    struct ldo { lb_u32x4 A0, A1, D8, X0, X1; };
+    struct cro { lb_i32x4 s0, s1; lb_u32x4 D8, X0; lb_u32x4 X1; };
+    auto ld = [&](const int n) {
+        const int cg = n / NG, g = n % NG;
+        const uint32_t rg = rec + (uint32_t) g;
+        const uint32_t ya = colb + (uint32_t) cg*cgs + rg*(RS*4);
+        ldo o;
+        o.A0 = mf_lds4(ya); o.A1 = mf_lds4(ya + 16);
+        o.D8 = mf_lds4(d8b + (rg*NCP + 4*cg)*4);
+        if constexpr (MK::NX) { o.X0 = mf_lds4(x0b + (rg*NCP + 4*cg)*4); o.X1 = mf_lds4(x1b + (rg*NCP + 4*cg)*4); }
+        else { o.X0 = lb_u32x4{0, 0, 0, 0}; o.X1 = o.X0; }
+        return o;
+    };
+    auto chain = [&](const ldo & o, const int n) {
+        const int g = n % NG;
+        cro c;
+        c.D8 = o.D8; c.X0 = o.X0; c.X1 = o.X1;
+        lb_i32x4 s0 = {0, 0, 0, 0}, s1 = {0, 0, 0, 0};
+        if constexpr (kind == 0 || kind == 1) {   // s0 = dwords 0..3, s1 = s01 = dwords 0..7
+            s0 = mf4(o.A0.x, w[g][0], s0); s0 = mf4(o.A0.y, w[g][1], s0); s0 = mf4(o.A0.z, w[g][2], s0); s0 = mf4(o.A0.w, w[g][3], s0);
+            s1 = mf4(o.A1.x, w[g][4], s0); s1 = mf4(o.A1.y, w[g][5], s1); s1 = mf4(o.A1.z, w[g][6], s1); s1 = mf4(o.A1.w, w[g][7], s1);
+        } else if constexpr (kind == 2 || kind == 3) {   // one chain of 8
+            s1 = mf4(o.A0.x, w[g][0], s1); s1 = mf4(o.A0.y, w[g][1], s1); s1 = mf4(o.A0.z, w[g][2], s1); s1 = mf4(o.A0.w, w[g][3], s1);
+            s1 = mf4(o.A1.x, w[g][4], s1); s1 = mf4(o.A1.y, w[g][5], s1); s1 = mf4(o.A1.z, w[g][6], s1); s1 = mf4(o.A1.w, w[g][7], s1);
+        } else {   // two chains of 4 started at -16*sum(y)
+            s0 = lb_i32x4{(int) o.X0.x, (int) o.X0.y, (int) o.X0.z, (int) o.X0.w};
+            s1 = lb_i32x4{(int) o.X1.x, (int) o.X1.y, (int) o.X1.z, (int) o.X1.w};
+            s0 = mf4(o.A0.x, w[g][0], s0); s1 = mf4(o.A1.x, w[g][4], s1);
+            s0 = mf4(o.A0.y, w[g][1], s0); s1 = mf4(o.A1.y, w[g][5], s1);
+            s0 = mf4(o.A0.z, w[g][2], s0); s1 = mf4(o.A1.z, w[g][6], s1);
+            s0 = mf4(o.A0.w, w[g][3], s0); s1 = mf4(o.A1.w, w[g][7], s1);
+        }
+        c.s0 = s0; c.s1 = s1;
+        return c;
+    };
+    lb_f2 t0[2], t1[2];   // IQ2 / IQ1_M: item sum; Q2_K: sd, sm (columns 2j, 2j+1) of the current column group
+    auto epi = [&](const cro & c, const int n) {
+        const int cg = n / NG, g = n % NG;
+        const lb_f2 c02 = f2_s(c0[g]), c12 = f2_s(c1[g]);
+#pragma unroll
+        for (int j = 0; j < 2; ++j) {
+            const int i0 = 2*j, i1 = 2*j + 1;
+            const lb_f2 d82 = f2_u(c.D8[i0], c.D8[i1]);
+            if constexpr (kind == 3) {
+                const lb_f2 sd = f2_cvt(c.s1[i0], c.s1[i1]);
+                const lb_f2 sm = f2_fma(c02, f2_u(c.X0[i0], c.X0[i1]), f2_mul(c12, f2_u(c.X1[i0], c.X1[i1])));
+                t0[j] = f2_fma(d82, sd, g == 0 ? f2_s(0.0f) : t0[j]);
+                t1[j] = f2_fma(d82, sm, g == 0 ? f2_s(0.0f) : t1[j]);
+            } else {
+                lb_f2 si;
+                if constexpr (kind == 0 || kind == 1) {
+                    const lb_f2 a0 = f2_cvt(c.s0[i0], c.s0[i1]), a01 = f2_cvt(c.s1[i0], c.s1[i1]);
+                    const lb_f2 hh = f2_trunc(f2_mul(a01, f2_s(0.5f)));
+                    si = f2_trunc(f2_mul(f2_fma(a0, c02, f2_fma(a01, c12, hh)), f2_s(0.25f)));
+                } else if constexpr (kind == 2) {
+                    si = f2_trunc(f2_mul(f2_cvt(c.s1[i0], c.s1[i1]), c02));
+                } else {
+                    si = f2_mul(f2_fma(f2_cvt(c.s0[i0], c.s0[i1]), c02, f2_mul(f2_cvt(c.s1[i0], c.s1[i1]), c12)), f2_s(0.125f));
+                }
+                const lb_f2 x = f2_mul(f2_mul(dw2, d82), si);
+                t0[j] = g == 0 ? x : f2_add(t0[j], x);
+            }
+        }
+        if (g == NG - 1) {
+#pragma unroll
+            for (int j = 0; j < 2; ++j) {
+                const lb_f2 item = kind == 3 ? f2_sub(f2_mul(dw2, t0[j]), f2_mul(dmi, t1[j])) : t0[j];
+                const float n0 = mf_add(acc[cg][2*j], item.x), n1 = mf_add(acc[cg][2*j + 1], item.y);
+                acc[cg][2*j]     = valid ? n0 : acc[cg][2*j];
+                acc[cg][2*j + 1] = valid ? n1 : acc[cg][2*j + 1];
+            }
+        }
+    };
+    if constexpr (kind == 3) {   // Q2_K (4 groups of B words live): no look-ahead, it would exceed the register budget
+#pragma unroll
+        for (int n = 0; n < NI; ++n) {
+            epi(chain(ld(n), n), n);
+#if defined(__HIP_DEVICE_COMPILE__)
+            if constexpr (LB_MF_SCHED_STEP) __builtin_amdgcn_sched_barrier(0);
+#endif
+        }
+    } else {
+        ldo l1 = ld(0), l2;
+        cro c1c = chain(l1, 0), c2c;
+        if constexpr (NI > 1) l1 = ld(1);
+#pragma unroll
+        for (int n = 0; n < NI; ++n) {
+            if (n + 2 < NI) l2 = ld(n + 2);
+            if (n + 1 < NI) c2c = chain(l1, n + 1);
+            epi(c1c, n);
+#if defined(__HIP_DEVICE_COMPILE__)
+            if constexpr (LB_MF_SCHED_STEP) __builtin_amdgcn_sched_barrier(0);   // keeps the pipeline order (bounds live ranges)
+#endif
+            c1c = c2c; l1 = l2;
+        }
+    }
+}
+
+// L = 16*H lanes per row in the N=1 config: H waves form a wave group that shares a unit; wave h of the group takes
+// the item lanes l = b + 16*h (items l, l+L, ...). The group sum: each wave runs the l ^ 8, ^ 4, ^ 2, ^ 1 butterfly on
+// its 16 item lanes, then wave 0 adds the H partial sums as the N=1 shuffles do (^16: v0 + v1; ^32: (v0 + v1) + (v2 + v3)),
+// exchanged through LDS.
+template <class T, int H, int CG, int UM, int NW>
+__launch_bounds__(NW*64, 1)
+__global__ void gemv_mf(const soa s, const block_q8_1 * __restrict__ yg, const int ys, const int nc, float * __restrict__ dst, const int ldd,
+        const int K, const int N, const float * __restrict__ residual, const int ldr, const int KCB, const int colw, const int sw) {
+#pragma clang fp contract(off)
+    extern __shared__ uint32_t smem[];   // [tables (at LDS address 0) | q8 column arrays | d8 [rec][col] | y sums | group sums]
+    typedef mf_k<T> MK;
+    constexpr int L = 16*H, NWG = NW/H, NCP = 4*CG;
+    static_assert(NW % H == 0, "wave groups");
+    const int nrec = KCB*8;
+    uint32_t * tab = smem;
+    uint32_t * yA  = smem + T::TAB_WORDS;
+    float * d8s = (float *) (yA + NCP*colw + sw);
+    float * x0s = d8s + nrec*NCP;
+    float * x1s = x0s + (MK::NX ? nrec*NCP : 0);
+    float * red = x1s + (MK::NX ? nrec*NCP : 0);
+#if LB_TAB0 && defined(__HIP_DEVICE_COMPILE__)
+    if ((uint32_t) (size_t) (__attribute__((address_space(3))) uint32_t *) smem != 0) __builtin_trap();
+#endif
+    const int tid = threadIdx.y*64 + threadIdx.x;
+    const int b = threadIdx.x >> 2, q = threadIdx.x & 3;
+    const int h = threadIdx.y % H, grp = threadIdx.y / H;
+    const int bpr = K / QK_K;
+    const int U = N/4;                        // units of 4 rows
+    const int ustep = gridDim.x*NWG;
+    const int nchunks = (bpr + KCB - 1)/KCB;
+    const int u0 = grp*gridDim.x + blockIdx.x;
+    // LDS byte addresses
+    const uint32_t yAb = (uint32_t) T::TAB_WORDS*4;
+    const uint32_t d8b = yAb + (uint32_t) (NCP*colw + sw)*4;
+    const uint32_t x0b = d8b + (uint32_t) (nrec*NCP)*4;
+    const uint32_t x1b = x0b + (uint32_t) (MK::NX ? nrec*NCP : 0)*4;
+    const uint32_t colb = yAb + (uint32_t) mf_cb(q, colw, sw)*4;   // column 4*cg + q of the A operand: colb + cg*cgs
+    const uint32_t cgs  = (uint32_t) (4*colw)*4;
+    T::stage_tables(tab, tid, NW*64);
+    bool staged = false;
+    // batches of UM units per wave group (one batch unless U > UM*ustep); the batch and chunk loops are uniform over the
+    // workgroup (barriers inside), a wave without a unit in the batch only stages
+    for (int bt = 0; (int) blockIdx.x + bt*UM*ustep < U; ++bt) {
+        const int ub = u0 + bt*UM*ustep;
+        float acc[UM][CG][4];
+#pragma unroll
+        for (int k = 0; k < UM; ++k)
+#pragma unroll
+            for (int cg = 0; cg < CG; ++cg)
+#pragma unroll
+                for (int i = 0; i < 4; ++i) acc[k][cg][i] = 0.0f;
+        for (int kb0 = 0; kb0 < bpr; kb0 += KCB) {
+            const int nkb = min(KCB, bpr - kb0);
+            if (nchunks > 1 || !staged) {
+                __syncthreads();
+                mf_stage<T>(yA, d8s, x0s, x1s, yg + (size_t) kb0*(QK_K/QK8_1), ys, nc, NCP, colw, sw, nkb*8, tid, NW*64);
+                __syncthreads();
+                staged = true;
+            }
+            const uint32_t it_beg = (uint32_t) kb0*T::IPB, it_end = (uint32_t) (kb0 + nkb)*T::IPB;
+            const uint32_t st0 = it_beg - it_beg % L;   // steps cover [st0, it_end); items outside [it_beg, it_end) are dropped
+            const uint32_t l0 = (uint32_t) (b + 16*h);
+#pragma unroll
+            for (int k = 0; k < UM; ++k) {
+                const int u = ub + k*ustep;
+                if (u >= U) break;   // uniform per wave
+                const uint32_t rowb = (uint32_t) (4*u + q)*(uint32_t) bpr;
+                uint32_t it = st0 + l0, itc = it < it_beg ? it_beg : it < it_end ? it : it_end - 1;
+                typename T::raw cur = T::load(s, rowb + itc/T::IPB, itc % T::IPB);
+                for (uint32_t st = st0; st < it_end; st += L) {
+                    const uint32_t itn = st + L + l0 < it_end ? st + L + l0 : it_end - 1;   // next step (clamped, unconditional)
+                    const typename T::raw nxt = T::load(s, rowb + itn/T::IPB, itn % T::IPB);
+                    it = st + l0;
+                    const bool valid = it >= it_beg && it < it_end;
+                    itc = it < it_beg ? it_beg : valid ? it : it_end - 1;
+                    mf_item<T, CG>(tab, cur, itc % T::IPB, (itc - it_beg)*T::SPI, colb, cgs, d8b, x0b, x1b, valid, acc[k]);
+                    cur = nxt;
+                }
+            }
+        }
+#pragma unroll
+        for (int k = 0; k < UM; ++k) {
+            const int u = ub + k*ustep;
+            float v[CG][4];
+#pragma unroll
+            for (int cg = 0; cg < CG; ++cg)
+#pragma unroll
+                for (int i = 0; i < 4; ++i) {   // group_sum<16> over the item lanes b (lane bits 2..5)
+                    float x = acc[k][cg][i];
+                    x += __shfl_xor(x, 32, 64);
+                    x += mf_swz<16>(x);
+                    // ^8, ^4 as row rotations: equal to the xor partners at every lane the stored lanes 0..3 depend on
+                    x += mf_ror<8>(x);
+                    x += mf_ror<4>(x);
+                    v[cg][i] = x;
+                }
+            if constexpr (H > 1) {
+                __syncthreads();   // (uniform: every wave runs all UM slots) previous slot's sums are read
+                if (b == 0) {
+#pragma unroll
+                    for (int cg = 0; cg < CG; ++cg)
+#pragma unroll
+                        for (int i = 0; i < 4; ++i) red[((grp*H + h)*NCP + cg*4 + i)*4 + q] = v[cg][i];
+                }
+                __syncthreads();
+                if (h == 0 && b == 0) {
+#pragma unroll
+                    for (int cg = 0; cg < CG; ++cg)
+#pragma unroll
+                        for (int i = 0; i < 4; ++i) {
+                            const float * rp = red + ((grp*H)*NCP + cg*4 + i)*4 + q;
+                            if constexpr (H == 2) v[cg][i] = v[cg][i] + rp[NCP*4];                                   // ^16
+                            else v[cg][i] = (v[cg][i] + rp[NCP*4]) + (rp[2*NCP*4] + rp[3*NCP*4]);                    // ^16, ^32
+                        }
+                }
+            }
+            if (u >= U || h != 0) continue;
+#pragma unroll
+            for (int cg = 0; cg < CG; ++cg)
+#pragma unroll
+                for (int i = 0; i < 4; ++i) {
+                    const int c = 4*cg + i;
+                    if (b == 0 && c < nc) {
+                        const int row = 4*u + q;
+                        dst[(uint32_t) (c*ldd + row)] = residual ? v[cg][i] + residual[(uint32_t) (c*ldr + row)] : v[cg][i];
+                    }
+                }
+        }
+    }
+}
+
+static inline int mf_env_mfma() {
+    static const int v = nc_env("GGML_MMVQ_NC_LOWBIT_MFMA", 1);
+    return v;
+}
+static inline int mf_min_nc() {
+    static const int v = std::max(2, nc_env("GGML_MMVQ_NC_LB_MF_MIN", 3));
+    return v;
+}
+static inline int mf_gcd(int a, int b) { while (b) { const int t = a % b; a = b; b = t; } return a; }
+
+// column layout of the q8 column arrays: stride colw >= need (multiple of 4 words) and column-pair swizzle sw chosen so
+// that the 16-byte A reads (8 lanes per LDS cycle: blocks 2k, 2k+1 x columns 0..3) spread over the 32 banks
+static inline void mf_layout(int need, int spi_rs, int CG, int & colw, int & sw) {
+    int best = 1 << 30; colw = need; sw = 0;
+    for (int pad = 0; pad < 32; pad += 4) {
+        for (int s = 0; s <= pad; s += 4) {   // s <= pad: shifted columns never overlap the next one
+            const int cw = need + pad;
+            int cost = 0;
+            for (int cg = 0; cg < CG; ++cg) {
+                for (int g8 = 0; g8 < 8; ++g8) {   // 8 groups of 8 lanes
+                    int cnt[32] = {0}, m = 0;
+                    for (int ln = 8*g8; ln < 8*g8 + 8; ++ln) {
+                        const int bb = ln >> 2, i = ln & 3;
+                        const int c = 4*cg + i;
+                        const int a = mf_cb(c, cw, s) + bb*spi_rs;
+                        for (int e = 0; e < 4; ++e) m = std::max(m, ++cnt[(a + e) & 31]);
+                    }
+                    cost += m;
+                }
+            }
+            if (cost < best) { best = cost; colw = cw; sw = s; }
+        }
+    }
+}
+
+template <class T, int H, int CG, int NW>
+static inline bool launch_mf_t(const soa & s, const block_q8_1 * y, int ys, float * dst, int ldd, int K, int N, int nc,
+        hipStream_t st, const float * residual, int ldr) {
+    typedef mf_k<T> MK;
+    constexpr int L = 16*H, NCP = 4*CG;
+    const int bpr = K/QK_K;
+    if (N % 4 != 0) return false;
+    static const int lds_env = nc_env("GGML_MMVQ_NC_LB_MF_LDS", 0);
+    static const int grid_o  = nc_env("GGML_MMVQ_NC_LB_MF_GRID", 0);
+    const int tabb = T::TAB_WORDS*4;
+    int align = L/mf_gcd(L, T::IPB);                      // KCB*IPB % L == 0 preferred (no partial steps at chunk ends)
+    const size_t redb = H > 1 ? (size_t) NW*NCP*4*4 : 0;  // wave group sums
+    // per 256-block of K: q8 dwords of nc columns + d8 (+ sums) of NCP columns (+ column padding, at most 60 words)
+    const size_t per_blk = (size_t) 8*NCP*(MK::RS + 1 + MK::NX)*4;
+    // default LDS cap: two workgroups per CU when the chunks stay large, else one
+    const int lds_cap = lds_env > 0 ? std::min(lds_env, 65536) : 65536;
+    auto lds_of = [&](int kcb) { return (size_t) tabb + (size_t) kcb*per_blk + (size_t) NCP*128 + 128 + redb; };
+    int KCB = bpr;
+    if (lds_of(KCB) > (size_t) lds_cap) {
+        int kmax = (bpr/align)*align;
+        while (kmax > 0 && lds_of(kmax) > (size_t) lds_cap) kmax -= align;
+        if (kmax <= 0) {   // unaligned chunks
+            align = 1; kmax = bpr;
+            while (kmax > 0 && lds_of(kmax) > (size_t) lds_cap) --kmax;
+            if (kmax <= 0) return false;
+        }
+        const int nch = (bpr + kmax - 1)/kmax;
+        KCB = (((bpr + nch - 1)/nch + align - 1)/align)*align;
+        if (KCB > kmax) KCB = kmax;
+    }
+    int colw, sw;
+    mf_layout(KCB*8*MK::RS, MK::NG*MK::RS, CG, colw, sw);
+    const size_t lds = (size_t) tabb + (size_t) (NCP*colw + sw)*4 + (size_t) KCB*8*NCP*(1 + MK::NX)*4 + redb;
+    if (lds > 65536) return false;
+    const int ncu = nc_num_cu();
+    static int occ_lds = -1, occ_n = 1;   // resident workgroups per CU (registers, LDS), per instantiation
+    if (occ_lds != (int) lds) {
+        int n = 0;
+        if (hipOccupancyMaxActiveBlocksPerMultiprocessor(&n, gemv_mf<T, H, CG, 1, NW>, NW*64, lds) != hipSuccess || n < 1) { (void) hipGetLastError(); n = 1; }
+        occ_lds = (int) lds; occ_n = n;
+    }
+    const int wpc = occ_n;
+    int grid = grid_o > 0 ? grid_o : wpc*ncu;
+    const int U = N/4;
+    const int nch = (bpr + KCB - 1)/KCB;
+    const int upw = (U + grid*(NW/H) - 1)/(grid*(NW/H));  // units per wave group
+    // units kept across the K chunks per wave group: bounded by the register budget (spills beyond); more units per wave
+    // than that run as batches (each restages the chunks)
+    static const int um_env = nc_env("GGML_MMVQ_NC_LB_MF_UM", 0);
+    const int umax = um_env > 0 ? std::min(um_env, 3) : MK::kind == 4 ? (CG >= 3 ? 1 : CG == 2 ? 2 : 3) : MK::kind == 3 ? (CG == 1 ? 2 : 3) : CG >= 3 ? 2 : 3;
+    const int um = nch > 1 ? std::min(upw, umax) : 1;
+    static const int dbg = nc_env("GGML_MMVQ_NC_LB_MF_DEBUG", 0);
+    if (dbg) {
+        fprintf(stderr, "[lb mf] type=%d L=%d CG=%d NW=%d K=%d N=%d nc=%d KCB=%d colw=%d sw=%d lds=%zu wpc=%d grid=%d um=%d nch=%d\n",
+                (int) T::type, L, CG, NW, K, N, nc, KCB, colw, sw, lds, wpc, grid, um, nch);
+    }
+    const dim3 blk(64, NW);
+#define LB_MF(UM_) if (um == UM_) { hipLaunchKernelGGL((gemv_mf<T, H, CG, UM_, NW>), dim3(grid), blk, lds, st, s, y, ys, nc, dst, ldd, K, N, residual, ldr, KCB, colw, sw); return true; }
+    LB_MF(1) LB_MF(2) LB_MF(3)
+#undef LB_MF
+    return false;
+}
+
+template <class T, int H>
+static inline bool launch_mf_h(const soa & s, const block_q8_1 * y, int ys, float * dst, int ldd, int K, int N, int nc,
+        hipStream_t st, const float * residual, int ldr) {
+    static const int nwo = nc_env("GGML_MMVQ_NC_LB_MF_NW", 0);   // tuning: 8 or 16 waves per workgroup (0: by config)
+    // 16 waves cap the kernel at 128 VGPRs: enough for every type but Q2_K beyond 4 columns
+    const bool nw8 = nwo == 8 || (nwo != 16 && mf_k<T>::kind == 3 && nc > 4);
+    switch ((nc + 3)/4) {
+        case 1: return nw8 ? launch_mf_t<T, H, 1, 8>(s, y, ys, dst, ldd, K, N, nc, st, residual, ldr) : launch_mf_t<T, H, 1, 16>(s, y, ys, dst, ldd, K, N, nc, st, residual, ldr);
+        case 2: return nw8 ? launch_mf_t<T, H, 2, 8>(s, y, ys, dst, ldd, K, N, nc, st, residual, ldr) : launch_mf_t<T, H, 2, 16>(s, y, ys, dst, ldd, K, N, nc, st, residual, ldr);
+        case 3: return nw8 ? launch_mf_t<T, H, 3, 8>(s, y, ys, dst, ldd, K, N, nc, st, residual, ldr) : launch_mf_t<T, H, 3, 16>(s, y, ys, dst, ldd, K, N, nc, st, residual, ldr);
+        case 4: return nw8 ? launch_mf_t<T, H, 4, 8>(s, y, ys, dst, ldd, K, N, nc, st, residual, ldr) : launch_mf_t<T, H, 4, 16>(s, y, ys, dst, ldd, K, N, nc, st, residual, ldr);
+        default: return false;
+    }
+}
+
+// all nc columns in one MFMA launch; false: not taken (nothing launched)
+static inline bool launch_mf(ggml_type t, const soa & s, const block_q8_1 * y, int ys, float * dst, int ldd, int K, int N, int nc,
+        hipStream_t st, const float * residual, int ldr) {
+    if (nc < 2 || nc > LB_NC_MAX_MF) return false;
+    const launch_cfg c = pick_cfg(t, N, K);   // L and P fix the fp32 accumulation order: keep them
+#define LB_MFT(T, L_) if (c.L == L_) return launch_mf_h<T, L_/16>(s, y, ys, dst, ldd, K, N, nc, st, residual, ldr);
+    switch (t) {
+        case GGML_TYPE_IQ2_S:
+            if (c.P == 1) { LB_MFT(nc_s1, 64) LB_MFT(nc_s1, 32) }
+            else          { LB_MFT(nc_s2, 64) LB_MFT(nc_s2, 16) }
+            break;
+        case GGML_TYPE_IQ2_XS:
+            if (c.P == 1) { LB_MFT(nc_xs1, 64) LB_MFT(nc_xs1, 32) }
+            else          { LB_MFT(nc_xs2, 16) }
+            break;
+        case GGML_TYPE_IQ2_XXS:
+            if (c.P == 1) { LB_MFT(nc_xxs1, 64) LB_MFT(nc_xxs1, 32) }
+            else          { LB_MFT(nc_xxs2, 16) }
+            break;
+        case GGML_TYPE_Q2_K:
+            LB_MFT(q2_K, 16)
+            break;
+        case GGML_TYPE_IQ1_M:
+            LB_MFT(iq1_m_pk, 16)
+            break;
+        default: break;
+    }
+#undef LB_MFT
+    return false;
+}
+// largest column count launch_nc takes (MFMA on: 16, else the dp4a kernels' 6)
+static inline int nc_max_cols() {
+    return mf_env_mfma() ? LB_NC_MAX_MF : LB_NC_MAX;
+}
+// ------------------------------------------------------------------------------------------------ MTP2-C end
+
 // all nc columns (column passes when the y records of all columns do not fit in LDS; a single remaining column runs
 // the N=1 launcher itself). Returns false only for unsupported types / shapes, all checked before anything is launched:
 // launch_ok is exactly the condition under which launch() (the single-column fallback) succeeds, and a pass of 2+
 // columns either launches or reports 0 columns done (then launch() runs that column), so nothing fails mid-way.
 static inline bool launch_nc(ggml_type t, const void * soa_base, const block_q8_1 * y, int ys, float * dst, int ldd, int K, int N, int nc,
         hipStream_t st, const float * residual, int ldr) {
-    if (K % 256 != 0 || N % 64 != 0 || nc < 2 || nc > LB_NC_MAX || !supported(t) || !launch_ok(t, K, N)) return false;
+    if (K % 256 != 0 || N % 64 != 0 || nc < 2 || nc > nc_max_cols() || !supported(t) || !launch_ok(t, K, N)) return false;
     const launch_cfg c = pick_cfg(t, N, K);
     if (c.L == 0) return false;
     const soa s = soa_make(t, soa_base, (size_t) N*(K/QK_K));
+    if (mf_env_mfma() && nc >= mf_min_nc() && launch_mf(t, s, y, ys, dst, ldd, K, N, nc, st, residual, ldr)) return true;   // MTP2-C
     for (int c0 = 0; c0 < nc; ) {
         const float * res = residual ? residual + (size_t) c0*ldr : nullptr;
-        int done = nc - c0 >= 2 ? launch_nc_chunk(t, s, y + (size_t) c0*ys, ys, dst + (size_t) c0*ldd, ldd, K, N, nc - c0, st, res, ldr) : 0;
+        int done = nc - c0 >= 2 ? launch_nc_chunk(t, s, y + (size_t) c0*ys, ys, dst + (size_t) c0*ldd, ldd, K, N, std::min(nc - c0, LB_NC_MAX), st, res, ldr) : 0;
         if (done == 0) {
             if (!launch(t, soa_base, y + (size_t) c0*ys, dst + (size_t) c0*ldd, K, N, st, res)) return false;
             done = 1;

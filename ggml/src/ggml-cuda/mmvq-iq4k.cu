@@ -322,28 +322,87 @@ static bool iq4k_nc_weight_ok(const ggml_tensor * w) {
         GGML_CUDA_CC_IS_CDNA2(ggml_cuda_info().devices[ggml_cuda_get_device()].cc);
 }
 
+// MTP2-B begin: the int8 matrix-core form (iq4k::gemv_mf) for 3 (GGML_MMVQ_NC_IQ4K_MF_MIN) .. 16 columns and the small-N
+// kernel with several rows per workgroup (iq4k::gemv_sn_ncr, rows < 2048) for 2 .. 16 columns.
+// GGML_MMVQ_NC_IQ4K_MFMA=0 restores the previous kernels exactly (dp4a gemv_nc / gemv_sn_nc for 2..6 columns, nothing above).
+// Every column stays bit-identical to the single-token path (see iq4k-gemv-nc.cuh; GGML_MMVQ_NC_VERIFY checks it).
+static bool iq4k_nc_mfma() {
+    static const bool on = [] {
+        const char * v = getenv("GGML_MMVQ_NC_IQ4K_MFMA");
+        return v == nullptr || v[0] != '0';
+    }();
+    return on;
+}
+static int iq4k_nc_mf_min() {
+    static const int v = std::max(2, iq4k_env_int("GGML_MMVQ_NC_IQ4K_MF_MIN", 3));
+    return v;
+}
+// MTP2-merge: optional per-shape column caps of the N-column path (above a cap the call is declined and the MUL_MAT goes
+// to MMQ, which is faster there at 13..16 columns but not bit-identical to the single-token path): the small-N kernel
+// (rows < 2048, K/V) up to GGML_MMVQ_NC_IQ4K_SN_MAX columns, the K-phased IQ4_XS ffn_down (K >= 16384) up to
+// GGML_MMVQ_NC_IQ4K_DOWN_MAX. Both default to 16 (no cap: every column stays exact). Only with the MFMA form on.
+static bool iq4k_nc_cap_ok(const ggml_tensor * w, const int ncols) {
+    static const int sn_max   = iq4k_env_int("GGML_MMVQ_NC_IQ4K_SN_MAX", 16);
+    static const int down_max = iq4k_env_int("GGML_MMVQ_NC_IQ4K_DOWN_MAX", 16);
+    if (!iq4k_nc_mfma()) {
+        return true;
+    }
+    if (w->ne[1] < 2048 && ncols > sn_max) {
+        return false;
+    }
+    if (w->type == GGML_TYPE_IQ4_XS && w->ne[0] >= 16384 && ncols > down_max) {
+        return false;
+    }
+    return true;
+}
+int ggml_cuda_mmvq_iq4k_nc_max();
+// the largest column count family B takes (0: off)
+int ggml_cuda_mmvq_iq4k_nc_max() {
+    if (!iq4k_nc_enabled()) {
+        return 0;
+    }
+    return std::min(ggml_cuda_mmvq_nc_max(), iq4k_nc_mfma() ? 16 : iq4k::NC_MAX_INST);
+}
+// kernel choice of an N-column launch: mf = gemv_mf with plan m (column groups / K phases, iq4k::mf_plan), else dp4a
+// gemv_nc with plan p
+struct iq4k_ncsel { iq4k::cfg c; iq4k::ncplan p; iq4k::mfplan m; bool mf; };
+// MTP2-B end
+
 // the single-token configuration of w (gate: the SwiGLU launcher) and the NC plan; false if no NC kernel applies
-static bool iq4k_nc_plan(const ggml_tensor * w, bool glu, int ncols, iq4k::cfg & c, iq4k::ncplan & p) {
+static bool iq4k_nc_plan(const ggml_tensor * w, bool glu, int ncols, iq4k_ncsel & sl) {   // MTP2-B: + gemv_mf choice
     const ggml_type type = w->type;
     const int K = (int) w->ne[0], N = (int) w->ne[1];
     const int ncu = iq4k_ncu();
+    iq4k::cfg & c = sl.c;
+    iq4k::ncplan & p = sl.p;
     c = glu ? iq4k::pick_cfg_glu(type, N, K, ncu) : iq4k_pick_cfg(type, N, K, ncu);
-    if (!iq4k::nc_cfg_ok(c, type, K, N) || !iq4k::nc_plan(type, c, K, N, ncols, p) || !iq4k::nc_mu_ok(p.mu)) {
+    if (!iq4k::nc_cfg_ok(c, type, K, N)) {
         return false;
     }
     // launch bounds of the NC kernel (iq4k::nc_lb): Q4_K SwiGLU with at most 12 waves per workgroup
     if (c.NW*64 > (glu && type == GGML_TYPE_Q4_K ? 768 : 1024)) {
         return false;
     }
+    // MTP2-B: gemv_mf from 3 columns (2: the dp4a kernel is faster); the LM head (Q4_K, 248320 rows) keeps the dp4a kernel up to
+    // 4 columns (measured faster there: many tiles per wave)
+    const int mf_min = N >= 65536 ? std::max(iq4k_nc_mf_min(), 5) : iq4k_nc_mf_min();
+    if (iq4k_nc_mfma() && ncols >= mf_min && iq4k::mf_plan(type, c, glu, K, N, ncols, ncu, sl.m)) {
+        sl.mf = true;
+        return true;
+    }
+    sl.mf = false;
+    if (ncols > iq4k::NC_MAX_INST || !iq4k::nc_plan(type, c, K, N, ncols, p) || !iq4k::nc_mu_ok(p.mu)) {
+        return false;
+    }
     return !glu || p.mu == 0;
 }
 
 bool ggml_cuda_mmvq_iq4k_nc_route(int64_t ne11) {
-    return iq4k_nc_enabled() && ne11 >= 2 && ne11 <= ggml_cuda_mmvq_nc_max() && ne11 <= iq4k::NC_MAX_INST;
+    return ne11 >= 2 && ne11 <= ggml_cuda_mmvq_iq4k_nc_max();   // MTP2-B: the family maximum
 }
 
 bool ggml_cuda_mmvq_iq4k_nc_ok(const ggml_tensor * w, const ggml_tensor * gate_w, bool residual, int ncols, bool capturing) {
-    if (!iq4k_nc_enabled() || ncols < 2 || ncols > ggml_cuda_mmvq_nc_max() || ncols > iq4k::NC_MAX_INST || !iq4k_nc_weight_ok(w)) {
+    if (!iq4k_nc_enabled() || ncols < 2 || ncols > ggml_cuda_mmvq_iq4k_nc_max() || !iq4k_nc_weight_ok(w) || !iq4k_nc_cap_ok(w, ncols)) {   // MTP2-B
         return false;
     }
     if (w->ne[1] < 2048) {   // small-N kernel: no epilogue (the single-token path of these shapes is stock mmvq)
@@ -355,10 +414,11 @@ bool ggml_cuda_mmvq_iq4k_nc_ok(const ggml_tensor * w, const ggml_tensor * gate_w
     if (gate_w && (gate_w->type != w->type || !ggml_are_same_shape(gate_w, w) || !ggml_is_contiguous(gate_w))) {
         return false;
     }
-    iq4k::cfg c; iq4k::ncplan p;
-    if (!iq4k_nc_plan(w, gate_w != nullptr, ncols, c, p)) {
+    iq4k_ncsel sl;
+    if (!iq4k_nc_plan(w, gate_w != nullptr, ncols, sl)) {
         return false;
     }
+    const iq4k::cfg & c = sl.c;
     // the copies cannot be made during graph capture: a fusion is only promised for tensors whose copy exists (the
     // unfused N-column call creates it in the eager warmup run). Verify mode outside capture: the launcher creates it.
     if (iq4k_nc_verify_left().load() > 0 && !capturing) {
@@ -374,7 +434,7 @@ bool ggml_cuda_mmvq_iq4k_nc_ok(const ggml_tensor * w, const ggml_tensor * gate_w
 
 bool ggml_cuda_mmvq_iq4k_nc(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const block_q8_1 * y, int ncols, ggml_tensor * dst,
         const ggml_cuda_mm_fusion_args_host * fusion) {
-    if (!iq4k_nc_enabled() || ncols < 2 || ncols > ggml_cuda_mmvq_nc_max() || ncols > iq4k::NC_MAX_INST || !iq4k_nc_weight_ok(src0)) {
+    if (!iq4k_nc_enabled() || ncols < 2 || ncols > ggml_cuda_mmvq_iq4k_nc_max() || !iq4k_nc_weight_ok(src0) || !iq4k_nc_cap_ok(src0, ncols)) {   // MTP2-B
         return false;
     }
     if (dst->type != GGML_TYPE_F32 || !ggml_is_contiguous(dst) || dst->ne[0] != src0->ne[1] || dst->ne[1] != ncols ||
@@ -412,16 +472,20 @@ bool ggml_cuda_mmvq_iq4k_nc(ggml_backend_cuda_context & ctx, const ggml_tensor *
         if (gate || res) {
             return false;
         }
-        if (!iq4k::launch_sn_nc(type, ncols, src0->data, y, ys, dst_d, dstr, K, N, stream)) {
+        const bool ok = iq4k_nc_mfma() ? iq4k::launch_sn_ncr(type, ncols, src0->data, y, ys, dst_d, dstr, K, N, stream) :   // MTP2-B: up to 16
+                                         iq4k::launch_sn_nc(type, ncols, src0->data, y, ys, dst_d, dstr, K, N, stream);
+        if (!ok) {
             return false;
         }
         CUDA_CHECK(cudaGetLastError());
         return true;
     }
-    iq4k::cfg c; iq4k::ncplan p;
-    if (!iq4k_nc_plan(src0, gate != nullptr, ncols, c, p)) {
+    iq4k_ncsel sl;
+    if (!iq4k_nc_plan(src0, gate != nullptr, ncols, sl)) {
         return false;
     }
+    const iq4k::cfg & c = sl.c;
+    const iq4k::ncplan & p = sl.p;
     const int kind = iq4k_nc_kind(type, c);
     ggml_cuda_repack_fn fn = gate ? iq4k_repack_glu : iq4k_repack_single;
     const void * up_soa = ggml_cuda_get_repacked(src0, device, stream, kind, ggml_nbytes(src0), fn);
@@ -434,8 +498,14 @@ bool ggml_cuda_mmvq_iq4k_nc(ggml_backend_cuda_context & ctx, const ggml_tensor *
     const iq4k::soa sg = gate ? iq4k::soa_make(type, gate_soa, nb) : s;
     const float * res_d = res ? (const float *) res->data : nullptr;
     const int rstr = res ? (int) (res->nb[1]/sizeof(float)) : 0;
-    bool ok;
-    if (type == GGML_TYPE_IQ4_XS) {
+    bool ok = true;
+    if (sl.mf) {   // MTP2-B: gemv_mf (one launch; column groups are workgroups of the same launch)
+        ok = type == GGML_TYPE_IQ4_XS ?
+            (gate ? iq4k::launch_mf<iq4k::iq4xs_t, true >(c, sl.m, ncols, s, sg, y, ys, dst_d, dstr, nullptr, 0, K, N, stream) :
+                    iq4k::launch_mf<iq4k::iq4xs_t, false>(c, sl.m, ncols, s, sg, y, ys, dst_d, dstr, res_d, rstr, K, N, stream)) :
+            (gate ? iq4k::launch_mf<iq4k::q4k_t, true >(c, sl.m, ncols, s, sg, y, ys, dst_d, dstr, nullptr, 0, K, N, stream) :
+                    iq4k::launch_mf<iq4k::q4k_t, false>(c, sl.m, ncols, s, sg, y, ys, dst_d, dstr, res_d, rstr, K, N, stream));
+    } else if (type == GGML_TYPE_IQ4_XS) {
         ok = gate ? iq4k::launch_nc<iq4k::iq4xs_t, true >(c, p, ncols, s, sg, y, ys, dst_d, dstr, nullptr, 0, K, N, stream) :
                     iq4k::launch_nc<iq4k::iq4xs_t, false>(c, p, ncols, s, sg, y, ys, dst_d, dstr, res_d, rstr, K, N, stream);
     } else {
@@ -522,6 +592,10 @@ bool ggml_cuda_mmvq_iq4k_nc_checked(ggml_backend_cuda_context & ctx, const ggml_
 // MMVQ-NC B end --------------------------------------------------------------------------------------------------------
 #else
 // MMVQ-NC B
+int ggml_cuda_mmvq_iq4k_nc_max();   // MTP2-B
+int ggml_cuda_mmvq_iq4k_nc_max() {
+    return 0;
+}
 bool ggml_cuda_mmvq_iq4k_nc_route(int64_t) {
     return false;
 }

@@ -11371,6 +11371,39 @@ static float ggml_gdn_dec_row_dot(const ggml_tensor * w, int64_t row, const floa
     return sum;
 }
 
+// conv1d + silu of the channels [ch0, ch1) for n_tokens tokens over [state | qkv columns]; out[t*out_stride + ch - ch0]
+// the conv state window ending at token n-1-s goes to slot s for s < min(n+1, K) (slot n = the state before the first
+// token); the source row is read completely first, so a slot row may coincide with it
+static void ggml_gdn_dec_conv_n(const ggml_tensor * cs_t, const float * qkv_d, const float * cw_d, int64_t conv_dim,
+        int64_t d_conv, int64_t ch0, int64_t ch1, int64_t n, int32_t src_row, int dst_row, int K, int slot_stride,
+        float * out, int64_t out_stride) {
+    const float * cs_src = (const float *) ((const char *) cs_t->data + src_row*cs_t->nb[1]);
+    const int64_t Kw = std::min<int64_t>(n + 1, K);
+    std::vector<float> col((size_t) (d_conv - 1 + n));
+    std::vector<std::vector<float>> win((size_t) Kw, std::vector<float>((size_t) (d_conv - 1)));
+    for (int64_t ch = ch0; ch < ch1; ++ch) {
+        for (int64_t j = 0; j < d_conv - 1; ++j) {
+            col[j] = cs_src[ch*(d_conv - 1) + j];
+        }
+        for (int64_t t = 0; t < n; ++t) {
+            col[d_conv - 1 + t] = qkv_d[t*conv_dim + ch];
+        }
+        for (int64_t t = 0; t < n; ++t) {
+            float sum = 0.0f;
+            for (int64_t j = 0; j < d_conv; ++j) {
+                sum += col[t + j]*cw_d[ch*d_conv + j];
+            }
+            out[t*out_stride + ch - ch0] = sum/(1.0f + expf(-sum));
+        }
+        for (int64_t s = 0; s < Kw; ++s) {
+            float * cs_dst = (float *) ((char *) cs_t->data + (dst_row + s*slot_stride)*cs_t->nb[1]);
+            for (int64_t j = 0; j < d_conv - 1; ++j) {
+                cs_dst[ch*(d_conv - 1) + j] = col[n - s + j];
+            }
+        }
+    }
+}
+
 void ggml_compute_forward_gdn_decode_prep(
         const ggml_compute_params * params,
         ggml_tensor * dst) {
@@ -11388,15 +11421,19 @@ void ggml_compute_forward_gdn_decode_prep(
     ggml_tensor       * cs      = dst->src[7];
     const ggml_tensor * s_copy  = dst->src[8];
 
-    const int   dst_row = ggml_get_op_params_i32(dst, 0);
-    const int   H_k     = ggml_get_op_params_i32(dst, 1);
-    const int   H_v     = ggml_get_op_params_i32(dst, 2);
-    const int   S       = ggml_get_op_params_i32(dst, 3);
-    const float eps_l2  = ggml_get_op_params_f32(dst, 4);
+    const int   dst_row     = ggml_get_op_params_i32(dst, 0);
+    const int   H_k         = ggml_get_op_params_i32(dst, 1);
+    const int   H_v         = ggml_get_op_params_i32(dst, 2);
+    const int   S           = ggml_get_op_params_i32(dst, 3);
+    const float eps_l2      = ggml_get_op_params_f32(dst, 4);
+    const int   K           = std::max(1, ggml_get_op_params_i32(dst, 5));
+    const int   slot_stride = ggml_get_op_params_i32(dst, 6);
 
     const int64_t conv_dim = (int64_t) (2*H_k + H_v)*S;
     const int64_t d_conv   = conv_w->ne[0];
     const int64_t n_embd   = x->ne[0];
+    const int64_t n        = qkv->ne[1];
+    const int64_t P        = (int64_t) 2*H_k*S + 3*H_v; // prep column
     const int32_t src_row  = ((const int32_t *) s_copy->data)[0];
     GGML_ASSERT(src_row >= 0 && src_row < cs->ne[1]);
 
@@ -11405,51 +11442,40 @@ void ggml_compute_forward_gdn_decode_prep(
     const float * cw_d  = (const float *) conv_w->data;
     float * out = (float *) dst->data;
 
-    // conv1d over [state | x] + silu of the q/k channels; the state shifts by one (in place safe: each channel is
-    // read before it is written)
-    GGML_UNUSED(conv_dim);
-    const float * cs_src = (const float *) ((const char *) cs->data + src_row*cs->nb[1]);
-    float       * cs_dst = (float       *) ((char       *) cs->data + dst_row*cs->nb[1]);
-    std::vector<float> win(d_conv);
-    for (int64_t ch = 0; ch < (int64_t) 2*H_k*S; ++ch) {
-        for (int64_t j = 0; j < d_conv - 1; ++j) {
-            win[j] = cs_src[ch*(d_conv - 1) + j];
-        }
-        win[d_conv - 1] = qkv_d[ch];
-        float sum = 0.0f;
-        for (int64_t j = 0; j < d_conv; ++j) {
-            sum += win[j]*cw_d[ch*d_conv + j];
-        }
-        out[ch] = sum/(1.0f + expf(-sum));
-        for (int64_t j = 0; j < d_conv - 1; ++j) {
-            cs_dst[ch*(d_conv - 1) + j] = win[j + 1];
-        }
-    }
+    // conv1d over [state | x_0 .. x_{n-1}] + silu of the q/k channels
+    ggml_gdn_dec_conv_n(cs, qkv_d, cw_d, conv_dim, d_conv, 0, (int64_t) 2*H_k*S, n, src_row, dst_row, K, slot_stride,
+            out, P);
 
     // l2 norm of the q and k heads (rms_norm(eps_l2) scaled by 1/sqrt(S))
     const float scale_out = 1.0f/sqrtf((float) S);
-    for (int64_t hd = 0; hd < 2*H_k; ++hd) {
-        float * y = out + hd*S;
-        float sum = 0.0f;
-        for (int i = 0; i < S; ++i) {
-            sum += y[i]*y[i];
-        }
-        const float scale = 1.0f/sqrtf(sum/S + eps_l2);
-        for (int i = 0; i < S; ++i) {
-            y[i] = (scale*y[i])*scale_out;
+    for (int64_t t = 0; t < n; ++t) {
+        for (int64_t hd = 0; hd < 2*H_k; ++hd) {
+            float * y = out + t*P + hd*S;
+            float sum = 0.0f;
+            for (int i = 0; i < S; ++i) {
+                sum += y[i]*y[i];
+            }
+            const float scale = 1.0f/sqrtf(sum/S + eps_l2);
+            for (int i = 0; i < S; ++i) {
+                y[i] = (scale*y[i])*scale_out;
+            }
         }
     }
 
     // gates
     const float * dt_d = (const float *) dt_bias->data;
     const float * a_d  = (const float *) a->data;
-    for (int h = 0; h < H_v; ++h) {
-        const float alpha = ggml_gdn_dec_row_dot(w_alpha, h, x_d, n_embd) + dt_d[h];
-        const float beta  = ggml_gdn_dec_row_dot(w_beta,  h, x_d, n_embd);
-        const float sp    = alpha > 20.0f ? alpha : log1pf(expf(alpha));
-        out[2*H_k*S + h]       = expf(sp*a_d[h]);
-        out[2*H_k*S + H_v + h] = 1.0f/(1.0f + expf(-beta));
-        out[2*H_k*S + 2*H_v + h] = 0.0f; // scratch
+    for (int64_t t = 0; t < n; ++t) {
+        const float * xt = x_d + t*n_embd;
+        float * ot = out + t*P;
+        for (int h = 0; h < H_v; ++h) {
+            const float alpha = ggml_gdn_dec_row_dot(w_alpha, h, xt, n_embd) + dt_d[h];
+            const float beta  = ggml_gdn_dec_row_dot(w_beta,  h, xt, n_embd);
+            const float sp    = alpha > 20.0f ? alpha : log1pf(expf(alpha));
+            ot[2*H_k*S + h]       = expf(sp*a_d[h]);
+            ot[2*H_k*S + H_v + h] = 1.0f/(1.0f + expf(-beta));
+            ot[2*H_k*S + 2*H_v + h] = 0.0f; // scratch
+        }
     }
 }
 
@@ -11469,46 +11495,29 @@ void ggml_compute_forward_gdn_decode_out(
     ggml_tensor       * ss     = dst->src[6];
     const ggml_tensor * s_copy = dst->src[7];
 
-    const int   dst_row = ggml_get_op_params_i32(dst, 0);
-    const int   H_k     = ggml_get_op_params_i32(dst, 1);
-    const int   H_v     = ggml_get_op_params_i32(dst, 2);
-    const int   S       = ggml_get_op_params_i32(dst, 3);
-    const float eps     = ggml_get_op_params_f32(dst, 4);
+    const int   dst_row     = ggml_get_op_params_i32(dst, 0);
+    const int   H_k         = ggml_get_op_params_i32(dst, 1);
+    const int   H_v         = ggml_get_op_params_i32(dst, 2);
+    const int   S           = ggml_get_op_params_i32(dst, 3);
+    const float eps         = ggml_get_op_params_f32(dst, 4);
+    const int   K           = std::max(1, ggml_get_op_params_i32(dst, 5));
+    const int   slot_stride = ggml_get_op_params_i32(dst, 6);
 
     const int32_t src_row = ((const int32_t *) s_copy->data)[0];
     GGML_ASSERT(src_row >= 0 && src_row < ss->ne[1]);
 
-    const float * p   = (const float *) prep->data;
-    const float * q   = p;
-    const float * k   = p + H_k*S;
-    const float * g   = p + 2*H_k*S;
-    const float * b   = g + H_v;
+    const int64_t n        = qkv->ne[1];
+    const int64_t P        = (int64_t) 2*H_k*S + 3*H_v;
+    const int64_t conv_dim = (int64_t) (2*H_k + H_v)*S;
+    const int64_t HVS      = (int64_t) H_v*S;
 
-    // conv1d + silu of the v channels, conv state shifted in place
+    // conv1d + silu of the v channels for every token
     const int64_t d_conv = conv_w->ne[0];
-    std::vector<float> v((size_t) H_v*S);
-    {
-        const float * qkv_d  = (const float *) qkv->data;
-        const float * cw_d   = (const float *) conv_w->data;
-        const float * cs_src = (const float *) ((const char *) cs->data + src_row*cs->nb[1]);
-        float       * cs_dst = (float       *) ((char       *) cs->data + dst_row*cs->nb[1]);
-        std::vector<float> win(d_conv);
-        for (int64_t i = 0; i < (int64_t) H_v*S; ++i) {
-            const int64_t ch = (int64_t) 2*H_k*S + i;
-            for (int64_t j = 0; j < d_conv - 1; ++j) {
-                win[j] = cs_src[ch*(d_conv - 1) + j];
-            }
-            win[d_conv - 1] = qkv_d[ch];
-            float sum = 0.0f;
-            for (int64_t j = 0; j < d_conv; ++j) {
-                sum += win[j]*cw_d[ch*d_conv + j];
-            }
-            v[i] = sum/(1.0f + expf(-sum));
-            for (int64_t j = 0; j < d_conv - 1; ++j) {
-                cs_dst[ch*(d_conv - 1) + j] = win[j + 1];
-            }
-        }
-    }
+    std::vector<float> v((size_t) (HVS*n));
+    ggml_gdn_dec_conv_n(cs, (const float *) qkv->data, (const float *) conv_w->data, conv_dim, d_conv,
+            (int64_t) 2*H_k*S, conv_dim, n, src_row, dst_row, K, slot_stride, v.data(), HVS);
+
+    const float * p   = (const float *) prep->data;
     const float * z_d = (const float *) z->data;
     const float * nw  = (const float *) norm_w->data;
     float * out = (float *) dst->data;
@@ -11519,37 +11528,47 @@ void ggml_compute_forward_gdn_decode_out(
     std::vector<float> o(S);
     for (int h = 0; h < H_v; ++h) {
         const int hk = h % H_k;
-        const float * qh = q + hk*S;
-        const float * kh = k + hk*S;
-        const float * vh = v.data() + (size_t) h*S;
         const float * s_src = (const float *) ((const char *) ss->data + src_row*ss->nb[1]) + (size_t) h*S*S;
-        float       * s_dst = (float       *) ((char       *) ss->data + dst_row*ss->nb[1]) + (size_t) h*S*S;
         memcpy(st.data(), s_src, sizeof(float)*S*S);
-        // transposed state: st[col*S + i] = S[i][col]
-        for (int col = 0; col < S; ++col) {
-            float * m = st.data() + (size_t) col*S;
-            float kv = 0.0f;
-            for (int i = 0; i < S; ++i) {
-                kv += m[i]*kh[i];
+        for (int64_t t = 0; t < n; ++t) {
+            const float * pt = p + t*P;
+            const float * qh = pt + hk*S;
+            const float * kh = pt + H_k*S + hk*S;
+            const float   g  = pt[2*H_k*S + h];
+            const float   b  = pt[2*H_k*S + H_v + h];
+            const float * vh = v.data() + t*HVS + (size_t) h*S;
+            // transposed state: st[col*S + i] = S[i][col]
+            for (int col = 0; col < S; ++col) {
+                float * m = st.data() + (size_t) col*S;
+                float kv = 0.0f;
+                for (int i = 0; i < S; ++i) {
+                    kv += m[i]*kh[i];
+                }
+                const float delta = (vh[col] - g*kv)*b;
+                float attn = 0.0f;
+                for (int i = 0; i < S; ++i) {
+                    m[i] = g*m[i] + kh[i]*delta;
+                    attn += m[i]*qh[i];
+                }
+                o[col] = attn*scale;
             }
-            const float delta = (vh[col] - g[h]*kv)*b[h];
-            float attn = 0.0f;
-            for (int i = 0; i < S; ++i) {
-                m[i] = g[h]*m[i] + kh[i]*delta;
-                attn += m[i]*qh[i];
+            const int64_t s = n - 1 - t; // snapshot slot of the state after token t
+            if (s < K) {
+                float * s_dst = (float *) ((char *) ss->data + (dst_row + s*slot_stride)*ss->nb[1]) + (size_t) h*S*S;
+                memcpy(s_dst, st.data(), sizeof(float)*S*S);
             }
-            o[col] = attn*scale;
-        }
-        memcpy(s_dst, st.data(), sizeof(float)*S*S);
 
-        float sum = 0.0f;
-        for (int i = 0; i < S; ++i) {
-            sum += o[i]*o[i];
-        }
-        const float rs = 1.0f/sqrtf(sum/S + eps);
-        for (int i = 0; i < S; ++i) {
-            const float zz = z_d[h*S + i];
-            out[h*S + i] = (zz/(1.0f + expf(-zz)))*((rs*o[i])*nw[i]);
+            float sum = 0.0f;
+            for (int i = 0; i < S; ++i) {
+                sum += o[i]*o[i];
+            }
+            const float rs = 1.0f/sqrtf(sum/S + eps);
+            const float * zt = z_d + t*HVS;
+            float * ot = out + t*HVS;
+            for (int i = 0; i < S; ++i) {
+                const float zz = zt[h*S + i];
+                ot[h*S + i] = (zz/(1.0f + expf(-zz)))*((rs*o[i])*nw[i]);
+            }
         }
     }
 }

@@ -17,5 +17,10 @@ struct ggml_cuda_fattn_gate_epilogue {
     const float               * gate     = nullptr;
     ggml_tensor               * mul_node = nullptr;
     bool                        applied  = false;
+    // MTP2-O2 begin: dry run (no launch, no stream work): launch_fattn only records its launch configuration in cfg
+    // (kernel, grid, block, shared bytes, parallel blocks, stream-k), so that two calls can be compared
+    bool                        dry_run  = false;
+    uint64_t                    cfg[8]   = {};
+    // MTP2-O2 end
 };
 extern thread_local ggml_cuda_fattn_gate_epilogue * ggml_cuda_fattn_epilogue;

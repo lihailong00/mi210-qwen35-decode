@@ -3361,6 +3361,19 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
             ggml_cuda_mul_mat_f(ctx, src0, src1, nullptr, dst);
             break;
         case GGML_CUDA_MUL_MAT_ROUTE_MMVQ:
+            // MTP2-P0 begin: above MMVQ_MAX_BATCH_SIZE columns only the N-column families run here; a tensor they decline
+            // takes the previous route (MMQ, or cuBLAS for a type MMQ does not support)
+            if (src1->ne[1] > MMVQ_MAX_BATCH_SIZE) {
+                if (!ggml_cuda_mul_mat_vec_q_nc(ctx, src0, src1, dst)) {
+                    if (ggml_cuda_should_use_mmq(src0->type, ggml_cuda_info().devices[ctx.device].cc, src1->ne[1], /*n_experts =*/ 0)) {
+                        ggml_cuda_mul_mat_q(ctx, src0, src1, nullptr, dst);
+                    } else {
+                        ggml_cuda_mul_mat_cublas(ctx, src0, src1, dst);
+                    }
+                }
+                break;
+            }
+            // MTP2-P0 end
             ggml_cuda_mul_mat_vec_q(ctx, src0, src1, nullptr, dst);
             break;
         case GGML_CUDA_MUL_MAT_ROUTE_MMQ:
@@ -5519,10 +5532,14 @@ static int ggml_cuda_try_fattn_gate_fusion(ggml_backend_cuda_context * cuda_ctx,
     }
     ggml_tensor * fa = cgraph->nodes[i];
     const ggml_tensor * Q = fa->src[0];
-    if (Q->ne[1] != 1 || Q->ne[3] != 1 || fa->type != GGML_TYPE_F32 || !ggml_is_contiguous(fa) ||
+    // MTP2-O2 begin: 2..16 query tokens (multi-token verification) only through the N-query fattn-dec kernel below
+    // (every query bit-identical to its single-token call); if that declines, nothing is fused (as before)
+    const bool nq = Q->ne[1] > 1 && ggml_cuda_fattn_dec_nq_wanted(Q->ne[1]);
+    if ((Q->ne[1] != 1 && !nq) || Q->ne[3] != 1 || fa->type != GGML_TYPE_F32 || !ggml_is_contiguous(fa) ||
         (fa->flags & GGML_TENSOR_FLAG_OUTPUT)) {
         return 0;
     }
+    // MTP2-O2 end
     int iu = -1;
     int im = -1;
     for (int j = i + 1; j < cgraph->n_nodes; ++j) {
@@ -5574,6 +5591,12 @@ static int ggml_cuda_try_fattn_gate_fusion(ggml_backend_cuda_context * cuda_ctx,
         (un->flags & GGML_TENSOR_FLAG_OUTPUT)) {
         return 0;
     }
+
+    // MTP2-O2 begin
+    if (nq) {
+        return ggml_cuda_fattn_dec_gate_nq(*cuda_ctx, fa, (const float *) gate->data, mul) ? im - i : 0;
+    }
+    // MTP2-O2 end
 
     // short KV: one-launch split-KV decode with the gate + q8_1 epilogue (fattn-dec.cu)
     if (ggml_cuda_fattn_dec_gate(*cuda_ctx, fa, (const float *) gate->data, mul)) {
@@ -9009,7 +9032,9 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
             return true;
         case GGML_OP_GDN_DECODE_PREP:
         case GGML_OP_GDN_DECODE_OUT:
-            return ggml_cuda_gdn_decode_supported(op);
+            // MTP2-O1 begin: N-token / rollback-slot variants need the device (wave64)
+            return ggml_cuda_gdn_decode_supported(op, dev_ctx->device);
+            // MTP2-O1 end
         case GGML_OP_DSV4_HC_COMB:
             return op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32 &&
                 op->src[2]->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32;

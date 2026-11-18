@@ -1353,6 +1353,20 @@ void launch_fattn(
 
     GGML_ASSERT(block_dim.x % warp_size == 0);
 
+    // MTP2-O2 begin: dry run of the gate fusion (fattn.cuh): record the launch configuration, launch nothing
+    if (ggml_cuda_fattn_epilogue != nullptr && ggml_cuda_fattn_epilogue->dry_run) {
+        uint64_t * c = ggml_cuda_fattn_epilogue->cfg;
+        c[0] = (uint64_t) (uintptr_t) fattn_kernel;
+        c[1] = ((uint64_t) blocks_num.x << 32) | blocks_num.y;
+        c[2] = ((uint64_t) blocks_num.z << 32) | (uint64_t) parallel_blocks;
+        c[3] = ((uint64_t) block_dim.x << 32) | (block_dim.y*block_dim.z);
+        c[4] = nbytes_shared;
+        c[5] = (stream_k ? 1 : 0) | (scan_mask ? 2 : 0) | (use_sparse ? 4 : 0) | (kv_rows ? 8 : 0);
+        c[6] = 1;   // configuration recorded
+        return;
+    }
+    // MTP2-O2 end
+
     ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(blocks_num, block_dim, nbytes_shared, main_stream);
     ggml_cuda_kernel_launch(fattn_kernel, launch_params,
         (const char *) Q->data,
