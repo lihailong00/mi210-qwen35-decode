@@ -5,7 +5,9 @@ Modes (each writes one JSON into --out-dir):
   tpot  : single-stream decode. Prompt = exactly --prompt-tokens tokens (text tokenized by the
           server's /tokenize, sent as a token-id list; a distinct first token per rep so prefix
           caching never helps). Streams --n-out tokens (greedy, ignore_eos, no min_tokens unless
-          --min-tokens), TPOT = (t_last - t_16) / (n - 1 - 16). --reps repeats, median reported.
+          --min-tokens), TPOT = (t_last_chunk - t_first_chunk) / (usage.completion_tokens - 1)
+          (field tpot_ss_ms; token-based, so it is right under MTP where one chunk carries a
+          whole round; tpot_chunk_ss_ms is the old per-chunk number). --reps repeats, median.
   ttft  : prefill time of a --prompt-tokens prompt: max_tokens=1, non-streaming, wall time of the
           request, distinct prompt per rep, 1 warmup + --reps.
   ppl   : prompt_logprobs of a fixed text (PPL_TEXT below, ~700 tokens; or the first

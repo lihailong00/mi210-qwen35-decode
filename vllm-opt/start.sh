@@ -21,6 +21,8 @@
 #                 prefilled in different chunks and the first tokens can differ from MTP=0); 1 = vLLM default
 #   V1=1          run deploy v1 instead (deploy/plugin, its 3 packages, cache_v1) for A/B
 #   PLUGIN        plugin dir to mount (default deploy-mtp/plugin)
+#   FP8_R1=1      previous (r1) FP8 GEMV kernel for A/B: PLUGIN=deploy-mtp/plugin_r1, CACHE=deploy-mtp/cache_r1
+#                 (r1 = deploy-mtp before the opt3-fp8b merge; r2 default = L2-resident split-K slots)
 #   GPU_LOCK      serve mode: 1 = hold $GPU_LOCK_FILE while the server runs (default 1; 0 = skip, only when nobody else uses the GPU)
 #   GPU_LOCK_FILE flock file shared by every GPU user on the host (default /data/tools/mi210-opt/gpu.lock)
 #   MODEL_DIR     official checkpoint dir (default /data/model/Qwen3.8-27B-FP8), mounted read-only at /model
@@ -55,6 +57,7 @@ PKGS=vopt_fp8gemv,vopt_lmhead,vopt_rest
 if [ "${V1:-0}" = 1 ]; then
   PLUGIN=${PLUGIN:-${V1_PLUGIN:-/data/tools/mi210-opt/vllm-opt/deploy/plugin}}; CACHE=${CACHE:-$D/cache_v1}
 else
+  [ "${FP8_R1:-0}" = 1 ] && { PLUGIN=${PLUGIN:-$D/plugin_r1}; CACHE=${CACHE:-$D/cache_r1}; }
   PLUGIN=${PLUGIN:-$D/plugin}; CACHE=${CACHE:-$D/cache}
   [ "${VOPT_SPEC:-1}" = 1 ] && PKGS=$PKGS,vopt_spec
 fi
@@ -123,7 +126,7 @@ echo "[$(date +%T)] waiting for GPU lock"
 exec 9>$LOCKF; flock 9
 T0=$(date +%s)
 echo "[$(date +%T)] lock acquired; starting $NAME on port $PORT"
-echo "MTP=$MTP V1=${V1:-0} PLUGIN=$PLUGIN PKGS=${VOPT_PKGS:-$PKGS} PATCHES=$PATCHES EXTRA_ENV=${EXTRA_ENV:-}" > $OUT/patches.txt
+echo "MTP=$MTP V1=${V1:-0} FP8_R1=${FP8_R1:-0} PLUGIN=$PLUGIN PKGS=${VOPT_PKGS:-$PKGS} PATCHES=$PATCHES EXTRA_ENV=${EXTRA_ENV:-}" > $OUT/patches.txt
 docker rm -f $NAME >/dev/null 2>&1
 "${DOCKER[@]}" --detach "${SERVE[@]}" "$@" > $OUT/cid.txt
 UP=0

@@ -16,9 +16,12 @@
 //
 // Work split: a block = S waves on the same 64*R rows; wave w handles a contiguous range of
 //   128-wide k blocks ("sb"); partials are reduced through LDS. Optionally B blocks share a row
-//   group (split-K across blocks): fp32 partials go to a persistent workspace and the last
-//   arriving block (atomic counter, self-resetting -> graph-replay safe) sums them in a fixed
-//   order (deterministic) and writes bf16.
+//   group (split-K across blocks): fp32 partials go to one of nslot L2-resident workspace slots
+//   (row group rg uses slot rg % nslot, guarded by per-slot use counters) and are summed in a
+//   fixed order (deterministic) by the last arriving block or by a designated reducer (b = B-1).
+//   When a call can wait (slot reuse or designated reducer), blocks take their (rg, b) work item
+//   from an atomic ticket (atomicInc, wraps to 0 on the last draw -> graph-replay safe) instead of
+//   blockIdx, and every wait is on a lower ticket, so progress never depends on dispatch order.
 #pragma once
 #include <hip/hip_runtime.h>
 #include <stdint.h>
@@ -61,8 +64,10 @@ __device__ __forceinline__ uint16_t f2bf(float f) {
 #ifndef VOPT_SB_MAX_M
 #define VOPT_SB_MAX_M 2  // M <= this: sched_barrier between chunks (keeps loads/compute in order)
 #endif
-#ifndef VOPT_BMAJOR
-#define VOPT_BMAJOR 0
+#if defined(VOPT_BMAJOR) && VOPT_BMAJOR
+// b-major block order is gone: the split-K wait protocol (see the kernel) needs every block a block
+// waits on to have a lower logical work index, i.e. the row-group-major order rg * B + b.
+#error "VOPT_BMAJOR=1 is incompatible with the split-K slot / designated-reducer waits"
 #endif
 #ifndef VOPT_NT
 #define VOPT_NT 1
@@ -223,9 +228,88 @@ __device__ __forceinline__ void compute_sb(const v4u (&buf)[R][8], const uint32_
 // output column equals the M=1 call on that row of x. R (rows per wave) does not enter the
 // per-row arithmetic and may differ per M.
 typedef float v4f __attribute__((ext_vector_type(4)));
+#ifndef VOPT_FASTRED
+#define VOPT_FASTRED 1  // split-K partial loads in flight together (same summation order)
+#endif
+#define VOPT_BMAX 17
+// Sum of the B split-K partials of output o in fixed order ((0 + p0) + p1) + ... . The loads are
+// relaxed agent-scope atomics (glc, coherent after the acquire fence / acquire load) issued back to
+// back instead of volatile loads (which LLVM serializes with a vmcnt(0) wait after each one).
+__device__ __forceinline__ float sum_partials(const float* __restrict__ wsr, size_t stride, int B, int o) {
+#if VOPT_FASTRED
+  float t[VOPT_BMAX];
+#pragma unroll
+  for (int i = 0; i < VOPT_BMAX; ++i)
+    if (i < B) t[i] = __hip_atomic_load(wsr + (size_t)i * stride + o, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+  float v = 0.f;
+#pragma unroll
+  for (int i = 0; i < VOPT_BMAX; ++i)
+    if (i < B) v += t[i];
+  return v;
+#else
+  const volatile float* w = wsr;
+  float v = 0.f;
+  for (int i = 0; i < B; ++i) v += w[(size_t)i * stride + o];
+  return v;
+#endif
+}
+#ifndef VOPT_XRED
+#define VOPT_XRED 1  // split-K with a designated reducer when every wave has <= 1 sb (see kernel)
+#endif
+#ifndef VOPT_FR_OFF
+#define VOPT_FR_OFF 2048  // per-slot use counters live at cnt[2048 ..]
+#endif
+// Work-index ticket (cnt[VOPT_TICKET_OFF]) and debug error flag (cnt[VOPT_ERR_OFF]); counters cnt[0 ..
+// nslot) and cnt[VOPT_FR_OFF .. +nslot) stay below them (host checks nslot <= 1024, cnt >= 4096).
+#define VOPT_TICKET_OFF 4064
+#define VOPT_ERR_OFF 4065
+// Debug only: VOPT_SPIN_MAX=n bounds every spin-wait to n polls; on timeout it sets bit 0 of
+// cnt[VOPT_ERR_OFF] and gives up (outputs and counters of that call are then garbage) instead of
+// hanging. 0 (default) = unbounded waits, no extra code.
+#ifndef VOPT_SPIN_MAX
+#define VOPT_SPIN_MAX 0
+#endif
+// Debug only: VOPT_DBG_SHUFFLE=n delays a pseudo-random 7/8 of the blocks by up to 7n s_sleep(8)
+// before they draw their ticket, so work indices are handed out far from blockIdx order (tests that
+// results do not depend on which hardware block gets which work). 0 (default) = no code.
+#ifndef VOPT_DBG_SHUFFLE
+#define VOPT_DBG_SHUFFLE 0
+#endif
+#if VOPT_SPIN_MAX
+#define VOPT_SPIN_UNTIL(ptr, val)                                                                   \
+  for (int it_ = 0; __hip_atomic_load(ptr, __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_AGENT) != (val);) { \
+    __builtin_amdgcn_s_sleep(1);                                                                     \
+    if (++it_ >= VOPT_SPIN_MAX) {                                                                    \
+      __hip_atomic_fetch_or(cnt + VOPT_ERR_OFF, 1, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);       \
+      break;                                                                                         \
+    }                                                                                                \
+  }
+#else
+#define VOPT_SPIN_UNTIL(ptr, val)                                                       \
+  while (__hip_atomic_load(ptr, __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_AGENT) != (val)) \
+    __builtin_amdgcn_s_sleep(1);
+#endif
+#ifndef VOPT_MFMA_ONE
+#define VOPT_MFMA_ONE 1  // single-buffer MFMA variant when K/128/B <= S (45 VGPRs, occupancy 8): with the
+                         // slotted workspace gate_up M=4 139 -> 132 us, M=8 167 -> 149 us (slower before)
+#endif
+
 #ifndef VOPT_MFMA_MIN_M
 #define VOPT_MFMA_MIN_M 3  // M = 2: the M=1 fma_mix chain kernel is faster (and exact with the M=1 (S, B))
 #endif
+
+// designated-reducer split-K (see the kernel), compiled only where it can run: with VOPT_MFMA_ONE the
+// double-buffer MFMA kernels are only launched when waves have > 1 block (keeps their register
+// allocation as before: M=6 down spilled). Shared by the kernel and the host launcher.
+template <int M, bool ONE>
+__host__ __device__ constexpr bool vopt_xr() {
+  return VOPT_XRED && (ONE || M < VOPT_MFMA_MIN_M || !VOPT_MFMA_ONE);
+}
+// A call can wait (and then takes its work items from the ticket, DYN instantiations) iff B > 1 and
+// slots are reused or the designated reducer is used. Shared by the kernel and the host launcher.
+__host__ __device__ inline bool vopt_dyn(bool xr, int K, int B, int S, int ngroups, int nslot) {
+  return B > 1 && (ngroups > nslot || (xr && (K >> 7) / B <= S));
+}
 
 template <int M, int K>
 __device__ __forceinline__ void load_x_mfma(v4u (&xr)[(M + 3) / 4], const uint32_t* __restrict__ x,
@@ -310,28 +394,51 @@ __device__ __forceinline__ void compute_sb_mfma(const v4u (&buf)[R][8], v4u (&xr
 #endif
 // ONE (MFMA path only): every wave has at most one 128-k block (K/128/B <= S) -> single weight
 // buffer, no loop (fewer VGPRs, higher occupancy). Same arithmetic.
-template <int M, int R, int K, bool ONE = false>
+template <int M, int R, int K, bool ONE, bool DYN>
 __global__ __launch_bounds__(512) __attribute__((amdgpu_waves_per_eu(M >= VOPT_MFMA_MIN_M ? VOPT_WPE_MFMA : VOPT_WPE))) void fp8_gemv_kernel(
     const uint32_t* __restrict__ x,                  // [M, K] bf16 contiguous
     const uint8_t* __restrict__ w,                   // tiled [N/64][K/16][64][16]
     const float* __restrict__ s,                     // [N/128, K/128] fp32
     uint16_t* __restrict__ y, int ldy,               // [M, N] bf16
     float* __restrict__ ws, int* __restrict__ cnt,   // split-K workspace / counters (B > 1)
-    int B, int S) {
+    int B, int S, int nslot) {
   extern __shared__ float red[];
   __shared__ int s_last;
+  __shared__ int s_tk;
   constexpr int RW = 64 * R;  // rows per block
   const int lane = threadIdx.x & 63;
   const int wv = __builtin_amdgcn_readfirstlane(threadIdx.x >> 6);
-  // block order: rg-major (default) or b-major (blocks resident together share a K slice)
-#if VOPT_BMAJOR
-  const int ngroups = gridDim.x / B;
-  const int b = blockIdx.x / ngroups, rg = blockIdx.x - b * ngroups;
-#else
-  const int rg = blockIdx.x / B, b = blockIdx.x - rg * B;
-#endif
   constexpr int nsb = K >> 7;
   const int sbb = nsb / B;
+  const bool xred = vopt_xr<M, ONE>() && B > 1 && sbb <= S;
+  // Logical work index t -> (row group rg, split b) = (t / B, t % B), rg-major. Every spin-wait below
+  // is on work of a LOWER index: the reducer of row group rg - nslot (slot reuse) and, on the
+  // designated-reducer path, blocks b < B-1 of the own row group. When the call can wait at all, t is
+  // a ticket drawn by each block at start (one atomic per block, broadcast via LDS) instead of
+  // blockIdx.x, so any block a block waits on drew its ticket earlier, i.e. it is already resident and
+  // running: forward progress no longer depends on the hardware dispatching workgroups in blockIdx
+  // order. atomicInc(p, G-1) returns old and stores (old >= G-1 ? 0 : old+1): the G blocks of the grid
+  // get 0..G-1 and the block drawing G-1 wraps the counter back to 0 in the same atomic, so it is 0
+  // again once every block has started (no separate reset, nothing to race with; the next kernel on
+  // the stream / graph replay starts after this grid has completed). Calls that cannot wait (B == 1,
+  // or every row group has its own slot and there is no designated reducer, see vopt_dyn) run the
+  // !DYN instantiation, which keeps blockIdx.x and has no ticket code at all (the mere presence of the
+  // ticket path changed register allocation / spills of the static kernels: down M=5,6 +9%).
+  const int ngroups = (int)gridDim.x / B;
+  int t = blockIdx.x;
+  if constexpr (DYN) {
+    if (threadIdx.x == 0) {
+#if VOPT_DBG_SHUFFLE
+      unsigned h = blockIdx.x * 2654435761u;
+      h ^= h >> 13;
+      for (unsigned i = 0, n = (h & 7u) * VOPT_DBG_SHUFFLE; i < n; ++i) __builtin_amdgcn_s_sleep(8);
+#endif
+      s_tk = (int)atomicInc(reinterpret_cast<unsigned*>(cnt + VOPT_TICKET_OFF), gridDim.x - 1u);
+    }
+    __syncthreads();
+    t = __builtin_amdgcn_readfirstlane(s_tk);
+  }
+  const int rg = t / B, b = t - rg * B;
   const int sb0 = b * sbb + (wv * sbb) / S, sb1 = b * sbb + ((wv + 1) * sbb) / S;
   const int rb = (rg * RW) >> 7;
   const float* srow = s + (size_t)rb * nsb;
@@ -403,7 +510,84 @@ __global__ __launch_bounds__(512) __attribute__((amdgpu_waves_per_eu(M >= VOPT_M
   }
 
   const int row0 = rg * RW;
-  float* wsb = ws + ((size_t)rg * B + b) * (M * RW);
+  // Split-K workspace slot rg % nslot instead of one slot per row group: only ~nslot row groups'
+  // partials are live, so the workspace stays L2-resident and is not written back to HBM between
+  // calls (one slot per row group meant MBs of dirty lines per call, written back in the middle of
+  // the weight stream). A block whose slot is still used by row group rg - nslot waits until that
+  // group's reducer has read it (fr[slot] = completed uses of the slot in this call). Workgroups
+  // only waits on a lower work index (see t above), i.e. a block that is already running; the
+  // last use of a slot resets its counter (graph-replay safe).
+  const int slot = rg % nslot, use = rg / nslot;
+  int* fr = cnt + VOPT_FR_OFF;
+  float* wsb = ws + ((size_t)slot * B + b) * (M * RW);
+  if (B > 1 && use > 0) {
+    if (threadIdx.x == 0) { VOPT_SPIN_UNTIL(fr + slot, use) }
+    __syncthreads();
+  }
+#if VOPT_XRED
+  // Designated reducer (only when every wave has at most one 128-k block: faster for gate_up, qkvz,
+  // attn_qkv, out; slower for down, whose waves stream 2-3 blocks): block b = B-1, the highest work
+  // index of its row group, keeps its own partial v_{B-1}; every other block writes its partial,
+  // release-fences and bumps the slot counter with a no-return atomic, then exits (no atomic round
+  // trip, no second barrier; waves without workspace outputs exit right after the LDS hand-off).
+  // The reducer waits for the B-1 partials and forms ((0 + v_0) + ... + v_{B-2}) + v_{B-1}, the
+  // same order as the last-arriver sum below.
+  if (xred) {
+    if (S > 1) {
+#pragma unroll
+      for (int r = 0; r < R; ++r)
+#pragma unroll
+        for (int m = 0; m < M; ++m) red[(wv * M + m) * RW + r * 64 + lane] = acc[r][m];
+      __syncthreads();
+    }
+    const int nwr = S > 1 ? (S < M * R ? S : M * R) : 1;  // waves that own workspace outputs
+    if (b != B - 1) {
+      if (wv >= nwr) return;
+      if (S > 1) {
+        for (int o = threadIdx.x; o < M * RW; o += S * 64) {
+          float v = 0.f;
+          for (int i = 0; i < S; ++i) v += red[i * (M * RW) + o];
+          wsb[o] = v;
+        }
+      } else {
+#pragma unroll
+        for (int r = 0; r < R; ++r)
+#pragma unroll
+          for (int m = 0; m < M; ++m) wsb[m * RW + r * 64 + lane] = acc[r][m];
+      }
+      __threadfence();
+      if (lane == 0) __hip_atomic_fetch_add(cnt + slot, 1, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+      return;
+    }
+    if (threadIdx.x == 0) { VOPT_SPIN_UNTIL(cnt + slot, (B - 1) * nwr) }
+    __syncthreads();
+    const float* wsr = ws + (size_t)slot * B * (M * RW);
+    if (S > 1) {
+      for (int o = threadIdx.x; o < M * RW; o += S * 64) {
+        float vo = 0.f;
+        for (int i = 0; i < S; ++i) vo += red[i * (M * RW) + o];
+        const float v = sum_partials(wsr, M * RW, B - 1, o) + vo;
+        const int m = o / RW, rr = o - m * RW;
+        y[(size_t)m * ldy + row0 + rr] = f2bf(v);
+      }
+    } else {
+#pragma unroll
+      for (int r = 0; r < R; ++r)
+#pragma unroll
+        for (int m = 0; m < M; ++m) {
+          const int o = m * RW + r * 64 + lane;
+          y[(size_t)m * ldy + row0 + r * 64 + lane] = f2bf(sum_partials(wsr, M * RW, B - 1, o) + acc[r][m]);
+        }
+    }
+    __syncthreads();  // all partials of this slot consumed
+    if (threadIdx.x == 0) {
+      cnt[slot] = 0;
+      __hip_atomic_store(fr + slot, rg + nslot < ngroups ? use + 1 : 0, __ATOMIC_RELEASE,
+                         __HIP_MEMORY_SCOPE_AGENT);
+    }
+    return;
+  }
+#endif
   if (S == 1) {
 #pragma unroll
     for (int r = 0; r < R; ++r)
@@ -427,24 +611,28 @@ __global__ __launch_bounds__(512) __attribute__((amdgpu_waves_per_eu(M >= VOPT_M
     }
   }
   if (B == 1) return;
-  // split-K across blocks: last block of this row group reduces in fixed order
+  // split-K across blocks: last arriving block of this row group reduces in fixed order
   __threadfence();
   __syncthreads();
   if (threadIdx.x == 0) {
-    const int prev = atomicAdd(&cnt[rg], 1);
+    const int prev = atomicAdd(&cnt[slot], 1);
     s_last = (prev == B - 1);
   }
   __syncthreads();
   if (!s_last) return;
   __threadfence();
-  const volatile float* wsr = ws + (size_t)rg * B * (M * RW);
+  const float* wsr = ws + (size_t)slot * B * (M * RW);
   for (int o = threadIdx.x; o < M * RW; o += S * 64) {
-    float v = 0.f;
-    for (int i = 0; i < B; ++i) v += wsr[(size_t)i * (M * RW) + o];
+    const float v = sum_partials(wsr, M * RW, B, o);
     const int m = o / RW, rr = o - m * RW;
     y[(size_t)m * ldy + row0 + rr] = f2bf(v);
   }
-  if (threadIdx.x == 0) cnt[rg] = 0;
+  __syncthreads();  // every partial of this slot has been read (values consumed above)
+  if (threadIdx.x == 0) {
+    cnt[slot] = 0;
+    __hip_atomic_store(fr + slot, rg + nslot < ngroups ? use + 1 : 0, __ATOMIC_RELEASE,
+                       __HIP_MEMORY_SCOPE_AGENT);
+  }
 }
 
 
@@ -452,14 +640,22 @@ __global__ __launch_bounds__(512) __attribute__((amdgpu_waves_per_eu(M >= VOPT_M
 template <int M>
 void launch_fp8_gemv(dim3 grid, dim3 block, size_t shm, hipStream_t st, const uint32_t* x,
                      const uint8_t* w, const float* s, uint16_t* y, int N, float* ws, int* cnt,
-                     int K, int R, int B, int S) {
-#define L(RR, KK, O)   hipLaunchKernelGGL((fp8_gemv_kernel<M, RR, KK, O>), grid, block, shm, st, x, w, s, y, N, ws, cnt, B, S)
+                     int K, int R, int B, int S, int nslot) {
+#define L(RR, KK, O)                                                                                     \
+  do {                                                                                                      \
+    if (vopt_dyn(vopt_xr<M, O>(), K, B, S, N / (64 * RR), nslot))                                        \
+      hipLaunchKernelGGL((fp8_gemv_kernel<M, RR, KK, O, true>), grid, block, shm, st, x, w, s, y, N, ws, cnt, B, S, nslot); \
+    else                                                                                                 \
+      hipLaunchKernelGGL((fp8_gemv_kernel<M, RR, KK, O, false>), grid, block, shm, st, x, w, s, y, N, ws, cnt, B, S, nslot); \
+  } while (0)
 #define LK(RR, O)   if (K == 5120) L(RR, 5120, O); else if (K == 6144) L(RR, 6144, O); else L(RR, 17408, O);
 #ifndef VOPT_MFMA_ONE
-#define VOPT_MFMA_ONE 0  // 1: single-buffer MFMA variant when K/128/B <= S (45 VGPRs; measured slower on K=5120 shapes)
+#define VOPT_MFMA_ONE 1  // (default is set above the kernel)
 #endif
 #ifndef VOPT_CHAIN_ONE
-#define VOPT_CHAIN_ONE 0  // same for the fma_mix path (M = 1, 2); 0 = deploy-v1 kernel as is
+#define VOPT_CHAIN_ONE 1  // same for the fma_mix path (M = 1, 2): same arithmetic (compute_sb on the one
+                          // k block of each wave), 42 instead of 81 VGPRs -> 4 instead of 2 blocks per CU,
+                          // which hides the work-ticket round trip (opt3-fp8 used 0 = deploy-v1 kernel)
 #endif
   constexpr bool mf = M >= VOPT_MFMA_MIN_M;
   const bool one = (mf ? VOPT_MFMA_ONE : VOPT_CHAIN_ONE) && (K / 128 / B) <= S;

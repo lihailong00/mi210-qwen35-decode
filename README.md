@@ -16,7 +16,7 @@ prefill 的提升来自两处：让 rocBLAS 在 CDNA2 上默认使用 hipBLASLt 
 
 原定目标 90 token/s 未达到：逐节点复核显示，在同一 GGUF、不损失精度、不用 MTP 的约束下 decode 现实可达约 84–86 token/s（交接文档第十三节第 14 小节），因此没有继续；越过 90 要靠 MTP / 投机解码：用模型自带的 MTP 头（`llama-server --spec-type draft-mtp --spec-draft-n-max 3`），配合新的多 token 验证 kernel，单请求 decode 约 143 token/s（JSON、改代码类输出约 170），输出与不开投机逐字节相同，见交接文档第十三节第 15、16 小节。原因分析、全部优化细节、失败的尝试和后续方向见 [docs/HANDOVER.md](docs/HANDOVER.md)。
 
-另一条线是用 **vLLM 跑官方 Qwen3.8-27B-FP8 checkpoint**（不重新量化，代码在 [vllm-opt/](vllm-opt/README.md)）：单流 decode 从原版的 9.9 提升到 **42 token/s**（字节上限约 53）；开模型自带的 MTP（K=3）后为 **105–113 token/s**，输出与不开 MTP 逐字节相同（贪心）；不开 MTP 时并发 64 路约 124 token/s。见交接文档第十四节。
+另一条线是用 **vLLM 跑官方 Qwen3.8-27B-FP8 checkpoint**（不重新量化，代码在 [vllm-opt/](vllm-opt/README.md)）：单流 decode 从原版的 9.9 提升到 **42 token/s**（字节上限约 53）；开模型自带的 MTP（K=3）后为 **106–122 token/s**（5 个测试提示平均 122，新提示 106–112），输出与不开 MTP 逐字节相同（贪心）；不开 MTP 时并发 64 路约 124 token/s。见交接文档第十四节。
 
 ## 分支与标签
 

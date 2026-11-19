@@ -2,8 +2,10 @@
 """Single-stream decode TPOT bench (stdlib only, runs on the host).
 
 Streams one /v1/completions request at a time (greedy, ignore_eos) and timestamps every
-SSE chunk. TPOT = (t_last_chunk - t_first_chunk) / (chunks - 1); first chunk = first token
-(TTFT). Reports per-rep TPOT and the median, plus tok/s = 1000/TPOT.
+SSE chunk. TPOT = (t_last_chunk - t_first_chunk) / (tokens - 1), tokens =
+usage.completion_tokens (falls back to the chunk count). Under MTP one chunk carries a whole
+verify round, so a per-chunk TPOT would be 3-4x too high. First chunk = first token (TTFT).
+Reports per-rep TPOT and the median, plus tok/s = 1000/TPOT.
 usage: bench_tpot.py --base http://127.0.0.1:18100 [--n-out 512] [--reps 3] [--out f.json]
 """
 import argparse, json, statistics, time, urllib.request
@@ -36,12 +38,11 @@ def one(base, model, n_out, prompt, sampling=False, min_tokens=True):
             if d.get("choices"):
                 stamps.append(time.perf_counter())
     n = len(stamps)
-    tpot = (stamps[-1] - stamps[0]) / (n - 1) * 1000 if n > 1 else float("nan")
-    # steady-state: skip first 16 tokens
-    k = min(16, n // 4)
-    tpot_ss = (stamps[-1] - stamps[k]) / (n - 1 - k) * 1000 if n - 1 - k > 0 else float("nan")
-    return {"ttft_ms": (stamps[0] - t0) * 1000, "chunks": n, "tpot_ms": tpot,
-            "tpot_ss_ms": tpot_ss, "usage": usage}
+    ct = (usage or {}).get("completion_tokens") or n
+    tpot = (stamps[-1] - stamps[0]) / (ct - 1) * 1000 if n > 1 and ct > 1 else float("nan")
+    # tpot_ss_ms kept as the reported field (token-based, from the first chunk)
+    return {"ttft_ms": (stamps[0] - t0) * 1000, "chunks": n, "tokens": ct, "tpot_ms": tpot,
+            "tpot_ss_ms": tpot, "usage": usage}
 
 
 def main():
