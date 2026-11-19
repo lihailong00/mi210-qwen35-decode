@@ -407,6 +407,49 @@ static void ggml_cuda_op_gated_delta_net_impl(
             // tail mode: the prefix is long enough for the chunked kernels (2 chunks of 16 tokens)
             const int64_t n_pre = n_tokens - K + 1;
             const bool tail = exact_k1 && keep_rs_tail && K >= 2 && n_pre >= 64;
+            // split mode (one sequence): the chunked call over the whole batch is issued as two calls split at a chunk
+            // boundary n_a (a multiple of 16 with at least 64 tokens on each side and n_a <= n - K + 1), the second
+            // starting from the state the first leaves. The chunks are the same as in the single call (they start at
+            // token 0 in steps of 16 and the scan carries the state from chunk to chunk), so the outputs and the final
+            // state are bit-identical to it (checked against GGML_CUDA_GDN_KEEP_RS_SPLIT=0); the snapshot recurrence then
+            // only runs over the n - n_a tokens after n_a, from that state, instead of a second chunked call over the
+            // first n - K + 1 tokens. GGML_CUDA_GDN_KEEP_RS_SPLIT=0 keeps the two chunked calls of the tail mode.
+            static const bool keep_rs_split = [] {
+                const char * e = getenv("GGML_CUDA_GDN_KEEP_RS_SPLIT");
+                return e == nullptr || atoi(e) != 0;
+            }();
+            const int64_t n_a = ((n_tokens - 64) / 16) * 16 < (n_pre / 16) * 16 ? ((n_tokens - 64) / 16) * 16 : (n_pre / 16) * 16;
+            bool split_done = false;
+            if (tail && keep_rs_split && n_seqs == 1 && n_a >= 64 && n_tokens - n_a >= 64) {
+                ggml_cuda_pool_alloc<float> s_a(ctx.pool(), (size_t) S_v*S_v*H*n_seqs);
+                ggml_cuda_gdn_mma_args a1 = ggml_cuda_gdn_mma_args_from_tensor(dst);
+                a1.state     = s_d;
+                a1.state_out = s_a.get();
+                a1.n_tokens  = n_a;
+                // both halves must take the same chunked kernel as the single call (the WY kernel on CDNA2)
+                ggml_cuda_gdn_mma_args a_full = ggml_cuda_gdn_mma_args_from_tensor(dst);
+                a_full.state = s_d; a_full.state_out = state_d;
+                ggml_cuda_gdn_mma_args a2 = a_full;
+                a2.q = a_full.q + n_a*sq2; a2.k = a_full.k + n_a*sq2; a2.v = a_full.v + n_a*sv2;
+                a2.g = a_full.g + n_a*sb2; a2.beta = a_full.beta + n_a*sb2;
+                a2.dst = a_full.dst + n_a*S_v*H;
+                a2.state = s_a.get();
+                a2.n_tokens = n_tokens - n_a;
+                if (ggml_cuda_gdn_wy_launch(ctx, a1, stream)) {
+                    {   // slots K-1..0 from the tokens after n_a (slot 0 is rewritten by the second chunked call)
+                        ggml_cuda_pool_alloc<float> scratch(ctx.pool(), (size_t) S_v*H*(n_tokens - n_a)*n_seqs);
+                        launch_gated_delta_net<false, true>(q_d + n_a*sq2, k_d + n_a*sq2, v_d + n_a*sv2,
+                            g_d + n_a*sb2, b_d + n_a*sb2, s_a.get(), scratch.get(), state_d,
+                            S_v, H, n_tokens - n_a, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
+                            sb1, sb2, sb3, neqk1, rq3, scale, state_slot_stride, K, stream);
+                    }
+                    if (ggml_cuda_gdn_wy_launch(ctx, a2, stream)) {
+                        return;
+                    }
+                    GGML_ABORT("gated_delta_net: second chunked call declined");   // cannot happen: same checks as the first
+                }
+            }
+            GGML_UNUSED(split_done);
             if (tail) {
                 float * slot_last = state_d + (int64_t) (K - 1) * state_slot_stride;
                 {   // slot K-1 = state after the first n_pre tokens (outputs to scratch)

@@ -1782,6 +1782,22 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     // assign the output layer
     pimpl->dev_output = get_layer_buft_list(n_layer_all);
 
+    // When every layer and the output run on one GPU, the input embedding lookup (GET_ROWS of token_embd) on the CPU is a
+    // CPU split in front of every graph: for a 4096-token prompt ubatch it takes 30-60 ms (dequantizing 4096 rows) while
+    // the GPU waits, and an MTP draft context (which shares token_embd) pays it again per ubatch. With the input layer on
+    // that GPU (token_embd costs its size in VRAM, e.g. 0.4 GB for an IQ2_S 248k x 5120 table) the lookup is a GPU
+    // kernel. The rows are dequantized with the same arithmetic (checked bit-identical for IQ2_S). A type the GPU cannot
+    // GET_ROWS falls back to the next buffer type in the list. LLAMA_INPUT_ON_GPU=0 keeps the input layer on the CPU.
+    {
+        static const bool input_on_gpu = [] {
+            const char * e = getenv("LLAMA_INPUT_ON_GPU");
+            return e == nullptr || atoi(e) != 0;
+        }();
+        if (input_on_gpu && n_devices() == 1 && act_gpu_layers == n_layer_all + 1 && pimpl->dev_output.dev != cpu_dev) {
+            pimpl->dev_input = pimpl->dev_output;
+        }
+    }
+
     const auto TENSOR_NOT_REQUIRED = llama_model_loader::TENSOR_NOT_REQUIRED;
 
     // create tensors for the weights
