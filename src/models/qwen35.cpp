@@ -932,7 +932,26 @@ llama_model_qwen35::graph_mtp::graph_mtp(const llama_model & model, const llm_gr
     ggml_tensor * head_w = layer.nextn.shared_head_head ? layer.nextn.shared_head_head : model.output;
     ggml_tensor * head_s = layer.nextn.shared_head_head ? layer.nextn.shared_head_head_s : model.output_s;
     GGML_ASSERT(head_w && "QWEN35 MTP: missing LM head (nextn.shared_head_head or model.output)");
-    cur = build_lora_mm(head_w, cur, head_s);
+    // Draft vocabulary shortlist (LLAMA_MTP_DRAFT_VOCAB = n, 0 or unset: the full vocabulary): the draft LM head only
+    // computes the logits of the first n token ids (the rows of the head are stored in token id order, and BPE ids
+    // roughly follow merge frequency), the other logits are -inf, so the draft never proposes them. The target model
+    // still verifies every draft token, so the output does not change; only the acceptance can. The full head reads
+    // 0.7 GB per draft step (about 0.5 ms on an MI210).
+    static const int64_t draft_vocab = [] {
+        const char * e = getenv("LLAMA_MTP_DRAFT_VOCAB");
+        return e ? (int64_t) atoll(e) : (int64_t) 0;
+    }();
+    const int64_t n_vocab_head = head_w->ne[1];
+    if (draft_vocab > 0 && draft_vocab < n_vocab_head && head_s == nullptr && ggml_is_contiguous(head_w)) {
+        ggml_tensor * head_short = ggml_view_2d(ctx0, head_w, head_w->ne[0], draft_vocab, head_w->nb[1], 0);
+        ggml_tensor * logits_short = build_lora_mm(head_short, cur, nullptr);
+        // a [n_vocab - n, n_outputs] tensor of -inf: pad a one-column view of the logits, then fill
+        ggml_tensor * col  = ggml_view_2d(ctx0, logits_short, 1, logits_short->ne[1], logits_short->nb[1], 0);
+        ggml_tensor * tail = ggml_fill(ctx0, ggml_pad(ctx0, col, (int) (n_vocab_head - draft_vocab - 1), 0, 0, 0), -INFINITY);
+        cur = ggml_concat(ctx0, logits_short, tail, 0);
+    } else {
+        cur = build_lora_mm(head_w, cur, head_s);
+    }
     cb(cur, "result_output", -1);
 
     res->t_logits = cur;
