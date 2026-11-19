@@ -835,6 +835,94 @@ llama-server，5 个 prompt（写代码、写故事、JSON 各 384 token，改�
   - 开 MTP 时 prompt 预填充多跑一次递推，比不开 MTP 慢；写快照的分块 kernel 可以去掉这部分。
   - N 列注意力假设一个 KV cache 只有一个序列（`-np 1`）。
 
+## 十四、vLLM 部署：官方 FP8 checkpoint 的单流 decode 与 MTP
+
+前面各节针对 llama.cpp 和 IQ3_S GGUF。这一节是另一条线：用 vLLM 跑官方的 Qwen3.8-27B-FP8 checkpoint（自带 MTP 层），不重新量化，只做无损的权重重排。代码在本仓库的 `vllm-opt/` 目录，说明见 [vllm-opt/README.md](../vllm-opt/README.md)。运行环境是 vLLM 镜像 `2e7da1ad1c66`（vllm 0.30.0+rocm723）和单卡 MI210。镜像本身不做任何修改：插件目录以只读方式挂载，通过 `PYTHONPATH` 和 `usercustomize.py` 的 post-import hook 给 vLLM 打补丁；HIP 扩展用 `torch.utils.cpp_extension` 编译。
+
+### 1. 上限与原版的瓶颈
+
+- **每 token 要读的字节数**：FP8 权重 24.33 GB，bf16 LM head 2.54 GB，DeltaNet 状态 0.3 GB，合计 27.2 GB。按 1446 GB/s 算，单流 decode 上限约 53 token/s；算上 kernel 启动开销，现实上限约 50。
+- **原版只有 9.9 token/s**，原因有两个：
+  - gfx90a 没有 FP8 硬件，vLLM 走 Triton 的 FP8 block-scaled 矩阵乘，只跑到 0.2–0.4 TB/s；
+  - 每 token 约 2700 个原生 norm 等小 kernel，整张 graph 共 2989 个 kernel。
+
+### 2. 第一版（deploy v1）：不开 MTP，42 token/s
+
+- **weight-only FP8 GEMV**：权重无损重排成 [N/64][K/16][64][16] 的 tile，每个 lane 负责一行；e4m3 转 f16 只要 3 条 VALU 指令。带宽 1.21 TB/s。
+- **LM head**：bf16 GEMV（M≤8），尾部融合 argmax；另有融合的 top-k/top-p 采样器。
+- **融合小算子**：GemmaRMSNorm、SiLU、DeltaNet decode、注意力相关算子都做成融合 kernel。每 token 的 graph 从 2989 个 kernel 降到 628 个。
+- **结果**：
+  - 单流 9.9 → 42 token/s，达到字节上限 53 的 79%；
+  - 剩下约 5 ms 中，FP8 GEMV 比字节下限多 3.2 ms，其他 kernel 多 1.7 ms；
+  - 并发吞吐 c4 71、c16 90、c64 124 token/s；
+  - 与原版的差异在引擎自身的噪声范围内。
+
+### 3. 第二版（deploy-mtp）：MTP 投机解码
+
+**在 v1 上直接开 MTP 的情况**：K=3 只有 81 token/s，而且输出与不开 MTP 不同。原因如下：
+
+- 一轮 42.7 ms，其中验证（4 个 token）的 graph 占 33.2 ms：
+  - FP8 GEMV 在 M=4 时 27.2 ms（M=1 时 20.1 ms）；
+  - DeltaNet 回退到原版 Triton 投机路径，约 4.0 ms（我们的 M=1 融合 kernel 只要 0.48 ms）。
+- 3 次草稿约 7.1 ms，其中每步 1.8 ms 的 2.54 GB LM head 占了 5.4 ms。
+- 输出逐层对比，第一处分歧是 FP8 GEMV：M≥2 时用了不同的 split-K 配置，M≥3 时用了成对 FMA 累加。之后依次是 DeltaNet 原版路径和注意力：Triton unified attention 对 4 个 query 走 2D 路径，对 1 个 query 走 3D split-softmax，两者结果不同。
+- deploy v1 在 MTP 下还有两个潜在 bug：
+  - `--enforce-eager` 时，vLLM 传入的是带步长的列视图，GDN kernel 因此报错；
+  - MTP 下卷积状态宽 3+K 列，v1 的 kernel 读第 0–2 列，而原版读最后 3 列。
+
+**这一轮的改动（每个 token 的结果都与单 token 路径逐位相同）：**
+
+- **FP8 GEMV 逐列精确**：M=1..8 全部沿用 M=1 的 split-K 配置和累加顺序，速度基本不变。M>8（prefill、大并发）仍走 Triton 回退。
+- **验证路径的 DeltaNet**（`gdn_spec`）：多 token 的融合 kernel，与逐 token 的 gdn_decode 逐位相同，并写 MTP 拒绝草稿后回滚用的状态槽。1.4 ms，原版路径约 4 ms。
+- **验证注意力**：把 4 个验证 query 当成 4 个共享 block table 的单 query 序列（seqused_k = L+1..L+4），与单 token 路径走同一个 kernel，逐位相同，而且不更慢。
+- **草稿一侧**：
+  - 草稿 LM head 只用词表前 151552 行加 33 个 added token，加载时生成 int4 副本（393 MiB）。kernel 先选出 top-4，再用原 bf16 LM head 对候选重算，所以草稿等于 bf16 子集上的 argmax。每步从 1.8 ms 降到 0.35 ms。
+  - 贪心验证直接用验证 LM head 尾部融合的 argmax，1 个 kernel 代替 5 个 Triton kernel。
+  - GDN metadata 的约 19 个小 op 合成 1 个 kernel。
+  - 草稿近似只影响接受率，不影响最终输出。
+- **两个引擎层面的原因**（不在我们的 kernel 里；原版 vLLM 开 MTP 时输出也会因此变化）：
+  - vLLM 按 K 自动选 block size（784/800/816）。前缀缓存对齐模式下，DeltaNet 的 prefill 按 block 边界分块，block size 不同，数值就不同。改为所有 K 固定 `--block-size 816`。
+  - 开 MTP 时调度器会把可缓存位置回退一个 block（eagle block drop），长 prompt 的 prefill 分块因此不同。改为在 speculative config 里设 `disable_eagle_block_drop: true`。
+
+**一轮的时间**：42.7 ms → 30.4 ms。
+
+| 部分 | v1 | deploy-mtp |
+| --- | --- | --- |
+| 验证 graph（M=4） | 33.18 ms | 25.67 ms（其中 FP8 22.70，gdn_spec 1.44，注意力 0.26） |
+| 验证后 eager（LM head M=4 + 判定） | 2.04 | 1.99 |
+| 草稿 prefill graph | 2.55 | 0.97 |
+| 草稿 decode graph | 4.51 | 1.64 |
+| 验证前 eager | 0.46 | 0.12 |
+
+### 4. 结果
+
+单流 decode，`mtp_bench.py`（5 个对话提示，贪心，最多 384 token，关 thinking），各提示 tok/s 的算术平均，每个配置都在新启动的服务上测，与 v1 交替：
+
+| K | deploy-mtp | v1 |
+| --- | --- | --- |
+| 0 | 42.2 | 42.2 |
+| 1 | 73.5 | 62.9 |
+| 2 | 96 | 76.5 |
+| 3（默认） | 112.5–113.4 | 80.4–81.3 |
+| 4 | 115–116 | 81.5 |
+
+- K=3 各提示：code 111、story 80、json 122、edit 122、repeat 130。接受率分别为 0.79、0.48、0.92、0.90、1.00。
+- 5 个提示里有两个短输出（128、132 token），按 token 加权为 104.8。独立复核另外加了 5 个新提示（sql、中文、数学、表格、5.1k token 长文摘要），K=3 为 106–108 token/s；12 个 0.8k–7k token 的长上下文请求平均约 105。所以**更普遍的数字是 105–108 token/s**，相对 v1 的约 1.40 倍在各组上都成立。
+- **输出**：贪心时开 MTP 与同一部署 MTP=0 逐字节相同。K=1..4、长 prompt（最长 6.5k token）、1500 token 长输出、thinking 模式、带前缀缓存的多轮对话都成立，logprobs 差为 0。v1 开 MTP 时只有 2–3/5 个提示相同。
+- **MTP=0 不退步**：TPOT 23.8 ms、4096 token prefill 5.44 s 都与 v1 持平；并发 c4 80（v1 72）、c16 91、c64 124 token/s。
+- **并发 ≥4 时 MTP 更慢**：c4 61 对 80，c64 90 对 124；c2 时更快（62–75 对 53）。vLLM 按 batch 大小动态改 K 的选项在这个版本上启动即失败，所以 K 只能在启动时选：交互式单用户用默认的 `MTP=3`，多路吞吐用 `MTP=0`。
+- **复核**：两个独立复核都通过。
+  - 正确性：4600 多次 GEMV 逐位抽查（含 NaN/Inf 邻行），各位置拒绝时的状态回滚，各种请求参数，采样分布检验（无偏差），300 s 压力测试（0 错误）。
+  - 速度：从零构建、重测，与上表的差距在 1% 以内。
+
+### 5. 限制与教训
+
+- **逐字节相同的前提**：贪心采样；每步每个请求不超过 8 行，且不与 prefill 混在同一步（否则走 M>8 的 Triton 回退，与 M=1 不是逐位相同，v1 和原版的 batch 噪声也一样）；复用的前缀缓存块须由没有其他请求的 prefill 写入。
+- **开 MTP 时 `min_p` 和 `logit_bias` 请求会被 vLLM 拒绝**（HTTP 400）。另外，带 stop 字符串时 usage 的 completion_tokens 会多计 1，原版 vLLM 也是这样。
+- **block size 816 的代价**：KV cache 小约 4%（MTP=0 时 28.0 万 token，自选时 29.2 万）；长 prompt 的 MTP=0 输出与 v1 不再逐位相同，但仍在引擎噪声内。`BLOCK_SIZE=auto` 可以恢复自选。
+- **剩余空间**：验证中的 FP8 GEMV 为 22.7 ms，字节下限 16.8 ms，gdn_out 和 attn_o 的带宽偏低（750–820 GB/s）。验证 LM head 1.99 ms，下限 1.76 ms。这两处都受“逐行沿用 M=1 运算顺序”的约束。
+- **测量教训**：开 MTP 时，一个流式 SSE chunk 带一整轮（最多 K+1 个）token。按 chunk 间隔算 TPOT 会把 MTP 低估 3–4 倍，早先版本曾据此误判“随机文本上 MTP 更慢”（实际快 2–3 倍）。每 token 时间要按 `usage.completion_tokens` 计算。`bench_deploy.py` 已经改正。
+
 ## 附录：开关、文件、分支
 
 代码在服务器仓库 `/data/tools/mi210-opt/src`，最终版本为标签 `mi210-final`；相对保留版改动 39 个文件、+12,493/−79 行、86 个提交，完整补丁为 `deliver/mi210-final-vs-retained.patch`。

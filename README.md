@@ -16,6 +16,8 @@ prefill 的提升来自两处：让 rocBLAS 在 CDNA2 上默认使用 hipBLASLt 
 
 原定目标 90 token/s 未达到：逐节点复核显示，在同一 GGUF、不损失精度、不用 MTP 的约束下 decode 现实可达约 84–86 token/s（交接文档第十三节第 14 小节），因此没有继续；越过 90 要靠 MTP / 投机解码：用模型自带的 MTP 头（`llama-server --spec-type draft-mtp --spec-draft-n-max 3`），配合新的多 token 验证 kernel，单请求 decode 约 143 token/s（JSON、改代码类输出约 170），输出与不开投机逐字节相同，见交接文档第十三节第 15、16 小节。原因分析、全部优化细节、失败的尝试和后续方向见 [docs/HANDOVER.md](docs/HANDOVER.md)。
 
+另一条线是用 **vLLM 跑官方 Qwen3.8-27B-FP8 checkpoint**（不重新量化，代码在 [vllm-opt/](vllm-opt/README.md)）：单流 decode 从原版的 9.9 提升到 **42 token/s**（字节上限约 53）；开模型自带的 MTP（K=3）后为 **105–113 token/s**，输出与不开 MTP 逐字节相同（贪心）；不开 MTP 时并发 64 路约 124 token/s。见交接文档第十四节。
+
 ## 分支与标签
 
 - `main`：最终版本的代码（= 标签 `mi210-final`）加本说明、交接文档和实验脚本。
@@ -59,6 +61,19 @@ export CODEX_IQ3_PREPACK=1 CODEX_IQ3_XXS_PREPACK=1
 - 只优化 HIP / CDNA2（gfx90a）上的单 token、单序列解码；其他 GPU 和多序列批次走原代码路径。
 - 融合 DeltaNet 算子只用于 qwen35 架构、单序列、未开启投机回滚的情况，其余自动回退。
 - CUDA/MUSA 构建的修复只做过 clang 语法检查，未在 NVIDIA 平台编译测试。
+
+## vLLM 部署（`vllm-opt/`）
+
+不改镜像（vLLM `2e7da1ad1c66`，vllm 0.30.0+rocm723），以只读挂载的插件给 vLLM 打补丁：逐列精确的 weight-only FP8 GEMV、bf16 LM head GEMV 与融合采样、融合的 norm/DeltaNet/注意力，以及 MTP 验证用的多 token kernel 和 int4 草稿头。
+
+```bash
+cd vllm-opt
+./build.sh                     # 预编译 4 个 HIP 扩展（不用 GPU）
+./start.sh serve               # 默认 MTP=3，端口 18340，模型名 qwen38
+MTP=0 ./start.sh serve         # 多路并发服务用这个
+```
+
+模型目录用 `MODEL_DIR` 指定（默认 `/data/model/Qwen3.8-27B-FP8`），GPU 锁文件用 `GPU_LOCK_FILE` 指定。完整的开关、结果和限制见 [vllm-opt/README.md](vllm-opt/README.md)。
 
 ## 实验工具
 
