@@ -832,7 +832,7 @@ llama-server，5 个 prompt（写代码、写故事、JSON 各 384 token，改�
 - **还没做到的**：
   - N=16 一步 37 ms，目标约 21 ms。各类 GEMV 的 N=4 / N=16 相对 N=1：IQ3 1.47 / 3.06，IQ4 1.28 / 2.82，低比特 1.58 / 4.56，混合配对 1.37 / 3.09。
   - KV 超过 1024 时精确注意力每层每轮多约 0.2 ms（`GGML_CUDA_FA_DEC_NQ_LONG=0` 用精度换速度）。
-  - 开 MTP 时 prompt 预填充多跑一次递推，比不开 MTP 慢；写快照的分块 kernel 可以去掉这部分。
+  - 开 MTP 时 prompt 预填充仍比不开 MTP 慢约 9%（10k token 的 prompt：约 1800 vs 1970 token/s，server、4096 token 分块；硬件上限约 2980）。原先慢 17%（约 1640）：快照递推对整块每个 token 逐个计算，每层每块约 3.8 ms。现在分块 kernel 先算前 n−K+1 个 token 得到最老的快照，递推只跑最后 K−1 个 token（`GGML_CUDA_GDN_KEEP_RS_TAIL`），输出不变。剩下的差距主要是草稿层要把整个 prompt 过一遍。
   - N 列注意力假设一个 KV cache 只有一个序列（`-np 1`）。
 
 ## 十四、vLLM 部署：官方 FP8 checkpoint 的单流 decode 与 MTP
@@ -964,6 +964,7 @@ llama-server，5 个 prompt（写代码、写故事、JSON 各 384 token，改�
 | `GGML_CUDA_FA_DEC_NQ` / `GGML_CUDA_FA_DEC_NQ_LONG` | 开 | N 个 query 的 fattn-dec（带 gate、q8）/ KV > 1024 时逐 query 精确（0 更快但不逐位相同） |
 | `GGML_Q8P_NC` | 开 | norm、SwiGLU 等为 N 行直接产出 q8 |
 | `GGML_CUDA_GDN_KEEP_RS_EXACT` | 开 | 开 MTP 时 prompt 预填充的输出与不开 MTP 逐位相同（0 回到逐 token 递推） |
+| `GGML_CUDA_GDN_KEEP_RS_TAIL` | 开 | 开 MTP 时预填充的快照递推只跑每块最后 K−1 个 token（0 回到对整块递推） |
 | `GGML_MMVQ_NC_IQ4K_SN_MAX` / `_IQ4K_DOWN_MAX` / `_LB_Q2K_MAX` | 16 | 个别形状超过该列数改走 MMQ（更快但不精确） |
 | `GGML_MMVQ_NC_VERIFY`、`GGML_GDN_DECODE_N_VERIFY`、`GGML_CUDA_FA_DEC_NQ_VERIFY`、`GGML_Q8P_NC_VERIFY` | 关 | 逐列与单 token 路径逐位比较（调试用） |
 | `GGML_SCHED_SYNC_UPLOADS` / `GGML_CUDA_NO_UPLOAD_BATCH` | 关 | 设 1 回到同步上传 / 不合并小上传 |

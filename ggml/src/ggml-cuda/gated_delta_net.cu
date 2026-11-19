@@ -359,8 +359,16 @@ static void ggml_cuda_op_gated_delta_net_impl(
     // runs from a copy of the input state, then the chunked kernel the K = 1 call would take recomputes the outputs and
     // slot 0 from that copy, so both are bit-identical to the call without snapshots (slots 1..K-1 come from the
     // recurrence). 0 restores the previous behaviour exactly.
+    // GGML_CUDA_GDN_KEEP_RS_TAIL (default 1): slots 1..K-1 only need the states after the last K-1 tokens, so for a long
+    // batch the chunked kernel runs over the first n - K + 1 tokens (giving slot K-1) and the per-token recurrence only
+    // over the last K - 1 tokens (slots K-2..1; slot 0 is rewritten by the full chunked call). The outputs and slot 0 are
+    // unchanged; slots 1..K-1 now come from the chunked prefix state instead of a recurrence over the whole batch.
     static const bool keep_rs_exact = [] {
         const char * e = getenv("GGML_CUDA_GDN_KEEP_RS_EXACT");
+        return e == nullptr || atoi(e) != 0;
+    }();
+    static const bool keep_rs_tail = [] {
+        const char * e = getenv("GGML_CUDA_GDN_KEEP_RS_TAIL");
         return e == nullptr || atoi(e) != 0;
     }();
     const bool exact_k1 = keep_rs && keep_rs_exact && !kda && n_tokens >= 2;
@@ -396,17 +404,50 @@ static void ggml_cuda_op_gated_delta_net_impl(
         }
     } else {
         if (keep_rs) {
-            launch_gated_delta_net<false, true>(q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d,
-                S_v, H, n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
-                sb1, sb2, sb3, neqk1, rq3, scale, state_slot_stride, K, stream);
+            // tail mode: the prefix is long enough for the chunked kernels (2 chunks of 16 tokens)
+            const int64_t n_pre = n_tokens - K + 1;
+            const bool tail = exact_k1 && keep_rs_tail && K >= 2 && n_pre >= 64;
+            if (tail) {
+                float * slot_last = state_d + (int64_t) (K - 1) * state_slot_stride;
+                {   // slot K-1 = state after the first n_pre tokens (outputs to scratch)
+                    ggml_cuda_pool_alloc<float> scratch(ctx.pool(), (size_t) S_v*H*n_pre*n_seqs);
+                    ggml_cuda_gdn_mma_args ap = ggml_cuda_gdn_mma_args_from_tensor(dst);
+                    ap.state     = s_d;
+                    ap.state_out = slot_last;
+                    ap.dst       = scratch.get();
+                    ap.n_tokens  = n_pre;
+                    if (!ggml_cuda_gdn_mma_launch(ctx.device, ap, stream) && !ggml_cuda_gdn_wy_launch(ctx, ap, stream) &&
+                        !ggml_cuda_gdn_mfma_launch(ctx.device, ap, stream)) {
+                        launch_gated_delta_net<false, false>(q_d, k_d, v_d, g_d, b_d, s_d, scratch.get(), slot_last,
+                            S_v, H, n_pre, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
+                            sb1, sb2, sb3, neqk1, rq3, scale, state_slot_stride, K, stream);
+                    }
+                }
+                {   // slots K-2..0 from the last K-1 tokens, starting at slot K-1 (slot 0 is rewritten below)
+                    ggml_cuda_pool_alloc<float> scratch(ctx.pool(), (size_t) S_v*H*(K - 1)*n_seqs);
+                    launch_gated_delta_net<false, true>(q_d + n_pre*sq2, k_d + n_pre*sq2, v_d + n_pre*sv2,
+                        g_d + n_pre*sb2, b_d + n_pre*sb2, slot_last, scratch.get(), state_d,
+                        S_v, H, K - 1, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
+                        sb1, sb2, sb3, neqk1, rq3, scale, state_slot_stride, K, stream);
+                }
+            } else {
+                launch_gated_delta_net<false, true>(q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d,
+                    S_v, H, n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
+                    sb1, sb2, sb3, neqk1, rq3, scale, state_slot_stride, K, stream);
+            }
             if (exact_k1) {   // MTP2-merge: outputs + slot 0 as the call without snapshots computes them
                 ggml_cuda_gdn_mma_args args = ggml_cuda_gdn_mma_args_from_tensor(dst);
                 args.state     = s_d;
                 args.state_out = state_d;
-                if (!ggml_cuda_gdn_mma_launch(ctx.device, args, stream) && !ggml_cuda_gdn_wy_launch(ctx, args, stream)) {
-                    ggml_cuda_gdn_mfma_launch(ctx.device, args, stream);
+                if (!ggml_cuda_gdn_mma_launch(ctx.device, args, stream) && !ggml_cuda_gdn_wy_launch(ctx, args, stream) &&
+                    !ggml_cuda_gdn_mfma_launch(ctx.device, args, stream) && tail) {
+                    // the K = 1 call runs the recurrence; in tail mode the outputs are not written yet
+                    launch_gated_delta_net<false, false>(q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d,
+                        S_v, H, n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
+                        sb1, sb2, sb3, neqk1, rq3, scale, state_slot_stride, K, stream);
                 }
-                // none taken: the K = 1 call runs the same recurrence, whose outputs and last state are the ones above
+                // none taken outside tail mode: the K = 1 call runs the same recurrence, whose outputs and last state
+                // are the ones above
             }
         } else {
             launch_gated_delta_net<false, false>(q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d,
