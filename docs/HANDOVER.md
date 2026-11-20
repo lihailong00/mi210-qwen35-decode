@@ -832,8 +832,68 @@ llama-server，5 个 prompt（写代码、写故事、JSON 各 384 token，改�
 - **还没做到的**：
   - N=16 一步 37 ms，目标约 21 ms。各类 GEMV 的 N=4 / N=16 相对 N=1：IQ3 1.47 / 3.06，IQ4 1.28 / 2.82，低比特 1.58 / 4.56，混合配对 1.37 / 3.09。
   - KV 超过 1024 时精确注意力每层每轮多约 0.2 ms（`GGML_CUDA_FA_DEC_NQ_LONG=0` 用精度换速度）。
-  - 开 MTP 时 prompt 预填充仍比不开 MTP 慢约 9%（10k token 的 prompt：约 1800 vs 1970 token/s，server、4096 token 分块；硬件上限约 2980）。原先慢 17%（约 1640）：快照递推对整块每个 token 逐个计算，每层每块约 3.8 ms。现在分块 kernel 先算前 n−K+1 个 token 得到最老的快照，递推只跑最后 K−1 个 token（`GGML_CUDA_GDN_KEEP_RS_TAIL`），输出不变。剩下的差距主要是草稿层要把整个 prompt 过一遍。
+  - （第 17 小节已继续处理，现在约差 5%）开 MTP 时 prompt 预填充仍比不开 MTP 慢约 9%（10k token 的 prompt：约 1800 vs 1970 token/s，server、4096 token 分块；硬件上限约 2980）。原先慢 17%（约 1640）：快照递推对整块每个 token 逐个计算，每层每块约 3.8 ms。现在分块 kernel 先算前 n−K+1 个 token 得到最老的快照，递推只跑最后 K−1 个 token（`GGML_CUDA_GDN_KEEP_RS_TAIL`），输出不变。剩下的差距主要是草稿层要把整个 prompt 过一遍。
   - N 列注意力假设一个 KV cache 只有一个序列（`-np 1`）。
+
+### 17. MTP 第三轮：prefill 的 CPU 开销、验证与草稿 kernel、单 token 小算子
+
+目标是把开 / 不开 MTP 的 prefill 和 decode 都压到接近硬件能做到的程度。输出约束不变：开 MTP 的输出与不开逐字节相同，单 token logits 和 prefill 结果与之前逐位相同。
+
+**prefill**（llama-server，`-ub 4096`，token/s；括号内为开 MTP K=3）：
+
+| prompt | 第 16 小节 | 本节 |
+|---|---|---|
+| 约 0.9k token | 1410（1200） | 1435（1339） |
+| 约 3k token | 1910（1590） | 1930（1835） |
+| 约 10k token | 1970（1636） | 2010（1897） |
+
+- **token embedding 查表放到 GPU。** llama.cpp 默认把输入层（token_embd 的 GET_ROWS）放在 CPU，它是每个计算图前面的一个 CPU split：4096 token 的块要 30–60 ms，GPU 在等；开 MTP 时草稿上下文每块还要再做一次。全部层都在一块 GPU 上时，输入层也放到这块 GPU（IQ2_S 的 token_embd 多占 0.4 GB 显存），GPU 反量化的行与 CPU 逐位相同。`LLAMA_INPUT_ON_GPU=0` 关闭。
+- **快照递推只跑尾部，分块 kernel 只跑一遍。** 开 MTP 时（n_rs_seq > 0），每个 prompt 块原来对全部 token 逐个递推，只为写回滚快照（每层每块约 3.8 ms）。现在把对整块的分块 WY 调用在 16 token 对齐处拆成两次（分块边界与一次调用相同，输出和最终状态逐位相同），递推只从拆分点跑到块尾写快照。`GGML_CUDA_GDN_KEEP_RS_TAIL`、`GGML_CUDA_GDN_KEEP_RS_SPLIT` 设 0 分别退回。
+- server 与 llama-bench 的差距只有 2.5–5%。第一次遇到 2048–4095 和 4096 以上这两个长度区间时，GEMM 选核各多花约 1.25 s（每个进程一次）。
+- 开 MTP 时剩下约 5% 的差距：草稿层本身的计算，以及草稿上下文每块约 20–30 ms 的 CPU 准备（把 hidden state 拷回主机再上传）。要去掉后者，需要在 server 里让草稿与下一块的目标计算重叠。
+- 物理上限约 2980 token/s（300 W 功耗限制下的真实算力），GEMM 已接近库 kernel 在该限制下的水平（第 6、12 小节）。
+
+**MTP decode**（K=3，每轮约 22.2 → 20.7 ms）：
+
+- **验证 GEMV**：
+  - IQ3 的 N 列 MFMA kernel 新增第二种形式（MFMA 操作数互换，每个 lane 直接得到自己行的 4 列和，去掉 DPP 广播；buffer resource 取址，主循环 208 → 160 条指令），网格用满全部 CU，小行数和 N=2 按形状选 dp4a。
+  - 低比特 ffn_down 每组 4 个单元。
+  - attn_k + attn_v 在 N=2–16 时合成一次 launch。
+  - 每列仍与单 token 路径逐位相同。验证一步（逐节点合计）N=4 17.2 → 16.3 ms，其中 IQ3 类 6.67 → 5.88 ms。
+- **草稿一步 1.06 → 0.92 ms**：
+  - 草稿层的 Q6_K 用新的单 token GEMV（同尺寸的无损 SoA 副本，约 1.23 TB/s，原版约 0.92）。
+  - 每轮对已接受 token 的追赶解码只算 KV（0.77 → 0.17 ms）。
+  - 草稿的 top-k（k ≤ 32、248k 列）用新的选择 kernel。
+  - 草稿数值可以变化，只影响接受率；实测接受数与之前相同。
+- **单 token 小算子**（逐位相同）：
+  - 定形的 rms_norm+q8；
+  - attention 预处理的 cos/sin 表；
+  - FA 解码展开；
+  - DeltaNet prep 提前取数。
+  - 逐节点 −0.26 ms；端到端 +0.4–0.9%，在噪声边缘。
+- **草稿词表截短**（`LLAMA_MTP_DRAFT_VOCAB=n`，默认关）：
+  - 草稿 LM head 只算前 n 个 token id，其余为 −inf；输出不变，只影响接受率。
+  - 5 个英文 / 代码 prompt：n=65536 时 +3%。
+  - 中文 prompt：n=65536 时 124 → 72 token/s（常用汉字的 id 大多在 65536 以上），比不开 MTP 还慢；n=131072 时不亏也不赚。
+  - 只适合纯英文 / 代码负载。
+- **GPU 采样**（`-bs`、`--spec-draft-backend-sampling`）实测没有收益。
+
+结果（llama-server，贪心，token/s；5 个 prompt：写代码、写故事、JSON、改代码、复述）：
+
+| 配置 | 写代码 | 写故事 | JSON | 改代码 | 复述 | 总体 | 中文 4 个 prompt |
+|---|---|---|---|---|---|---|---|
+| 不开投机 | 79.5 | 79.5 | 79.4 | 78.1 | 79.7 | 79.1 | 79.4 |
+| MTP K=3，第 16 小节 | 154.1 | 97.8 | 168.4 | 172.3 | 158.0 | 143.7 | 123.8 |
+| **MTP K=3，本节** | **166.4** | **106.1** | **180.9** | **185.1** | **170.4** | **154.3–155.0** | **133.3** |
+| MTP K=2 / K=4，本节 | | | | | | 138.8 / 135.9 | 124.9 / 110.8 |
+
+- 所有投机配置的输出与不开投机逐字节相同（9 个 prompt）。逐位检查覆盖 test-backend-ops（全部 VERIFY 开关，0 不一致）、test-mtp-nq、各 ubatch 和快照数下的 logits md5。
+- 单 token decode 与 prefill 不退步：tg128 +0.4%，pp512 / pp2048 在 ±0.1% 内。
+- 新开关全部关掉时，与第 16 小节版本的输出、草稿数和速度完全相同。
+- **还没做到的**：
+  - N=4 时各类 GEMV 相对 N=1：IQ3 1.30、IQ4 1.29、低比特 1.54、混合配对 1.37（目标约 1.25）。IQ3 剩下的是 K 分段的 barrier 偏差和每步指令数；混合配对可改为每个 lane 持有自己的行。
+  - 草稿与下一块 prompt 计算的重叠（见上）。
+  - 逐节点每轮省了约 2.1 ms，端到端只少了约 1.5 ms，差额原因未查。
 
 ## 十四、vLLM 部署：官方 FP8 checkpoint 的单流 decode 与 MTP
 
@@ -998,6 +1058,14 @@ r1 是第一次合入的 deploy-mtp，r2 是第 5 小节换了 FP8 GEMV 之后�
 | `GGML_Q8P_NC` | 开 | norm、SwiGLU 等为 N 行直接产出 q8 |
 | `GGML_CUDA_GDN_KEEP_RS_EXACT` | 开 | 开 MTP 时 prompt 预填充的输出与不开 MTP 逐位相同（0 回到逐 token 递推） |
 | `GGML_CUDA_GDN_KEEP_RS_TAIL` | 开 | 开 MTP 时预填充的快照递推只跑每块最后 K−1 个 token（0 回到对整块递推） |
+| `GGML_CUDA_GDN_KEEP_RS_SPLIT` | 开 | 开 MTP 时预填充的分块 kernel 拆成两次、只跑一遍（0 回到两遍） |
+| `LLAMA_INPUT_ON_GPU` | 开 | 全部层在一块 GPU 上时，token_embd 查表也在 GPU 上（0 放回 CPU） |
+| `LLAMA_MTP_DRAFT_VOCAB` | 0 | MTP 草稿 LM head 只算前 n 个 token id（只适合纯英文 / 代码负载） |
+| `GGML_MMVQ_NC_IQ3_MF2` / `GGML_MMVQ_NC_IQ3_MF_GRID` | 开 | IQ3 N 列 MFMA 第二种形式 / 网格用满全部 CU |
+| `GGML_MMVQ_NC_LB_MF_UM4` / `GGML_MMVQ_NC_IQ4K_GROUP` | 开 | 低比特 ffn_down 每组 4 单元 / N 列时 attn_k+attn_v 合并 launch |
+| `GGML_MMVQ_Q6K` / `GGML_MMVQ_Q6K_NC` | 开 / 关 | MTP 草稿层的 Q6_K 单 token GEMV / 2–4 列 Q6_K kernel（只用于草稿，默认关） |
+| `GGML_CUDA_TOP_K_FAST` / `LLAMA_MTP_KV_ONLY` | 开 | 大词表小 k 的 top-k 选择 kernel（改变并列时的顺序，贪心不受影响）/ 草稿追赶解码只算 KV |
+| `GGML_Q8_NORM_SHAPED` / `GGML_CUDA_ATTN_PREP_CS` / `GGML_CUDA_FA_DEC_UNROLL` / `GGML_GDN_PREP_EARLY` | 开 | 单 token 小算子：定形 rms_norm+q8 / cos·sin 表 / FA 解码展开 / DeltaNet prep 提前取数 |
 | `GGML_MMVQ_NC_IQ4K_SN_MAX` / `_IQ4K_DOWN_MAX` / `_LB_Q2K_MAX` | 16 | 个别形状超过该列数改走 MMQ（更快但不精确） |
 | `GGML_MMVQ_NC_VERIFY`、`GGML_GDN_DECODE_N_VERIFY`、`GGML_CUDA_FA_DEC_NQ_VERIFY`、`GGML_Q8P_NC_VERIFY` | 关 | 逐列与单 token 路径逐位比较（调试用） |
 | `GGML_SCHED_SYNC_UPLOADS` / `GGML_CUDA_NO_UPLOAD_BATCH` | 关 | 设 1 回到同步上传 / 不合并小上传 |
