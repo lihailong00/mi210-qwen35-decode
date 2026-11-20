@@ -185,6 +185,173 @@ static __global__ void __launch_bounds__(1024) rms_norm_mul_q8_kernel(const floa
     }
 }
 
+// ------------------------------------------------------------------------------------- N1: shaped 5120-column norm
+// rms_norm_mul_q8_kernel<2, true> for exactly 5120 columns with 256 threads (4 waves) instead of 1024, and less code
+// on the critical path. Bit-identical outputs (fp32 row and q8_1 blocks + sums) by construction:
+//  - reduction: thread t holds the partial sums of the virtual lanes v = t + 256*k (k < 4) of the 1024-lane kernel
+//    (v < 256 also adds element v + 1024, as there). The 32-lane butterflies of the four values are the same as in
+//    q8p_sum32 (lanes t and v have the same index within their 32-lane group, so the partner values are the same);
+//    xor 8 and xor 4 use DPP row rotations: after the xor 16 step lanes congruent mod 16 hold equal values, after xor 8
+//    those congruent mod 8, and row_ror:8 / row_ror:4 read a lane of the same class as lane^8 / lane^4. Float
+//    addition is commutative, so every add sees bitwise the same operands. The 32 group sums go through LDS in the
+//    same order as before (group t/32 + 8k), and the second butterfly is unchanged.
+//  - the squares are rounded on their own and summed ((xx + yy) + zz) + ww, as the compiled 1024-thread kernel does
+//    (v_pk_mul_f32 products, no contraction).
+//  - x / 5120 and amax / 127 are correctly rounded divisions computed as q0 = x*r, q = fma(fma(-q0, b, x), r, q0)
+//    with r = 1/b: checked equal to the IEEE quotient for all 2^32 inputs on gfx90a (infinities keep q0), for 5120
+//    only for |x| >= 1e-30 (tiny sums take the IEEE division; amax / 127 differs only for -0, and amax >= +0).
+//  - roundf(r / d) is taken as rintf(r * rcp(d)) unless the product is within 4e-5 of a half-integer (the error of
+//    the product is below 2.8e-5 for |r / d| <= 127.0001), in which case the whole group of 4 recomputes roundf(r / d).
+// GGML_Q8_NORM_SHAPED=0 disables (previous kernel). For 5120 columns the shaped kernel replaces both previous variants,
+// so GGML_Q8_NORM_SMALL=0 has no effect there unless GGML_Q8_NORM_SHAPED=0 (same bits either way). The multi-row
+// shaped kernel is compared with the single-row path by GGML_Q8P_NC_VERIFY, the single-row one by
+// GGML_Q8_NORM_SHAPED_VERIFY.
+#define Q8P_SHAPED_NCOLS 5120
+#define Q8P_SHAPED_NT    256
+
+static __device__ __forceinline__ float q8p_div_const(const float x, const float b, const float r) {
+    const float q0 = x * r;
+    const float e  = fmaf(-q0, b, x);
+    const float q  = fmaf(e, r, q0);
+    return e == e ? q : q0;
+}
+
+static __device__ __forceinline__ float q8p_rmul(const float a, const float b) {
+    float p = a * b;
+    asm volatile("" : "+v"(p));
+    return p;
+}
+
+static __device__ __forceinline__ float q8p_sumsq4(const float4 v) {
+    return ((q8p_rmul(v.x, v.x) + q8p_rmul(v.y, v.y)) + q8p_rmul(v.z, v.z)) + q8p_rmul(v.w, v.w);
+}
+
+template <int CTRL>
+static __device__ __forceinline__ float q8p_dpp(const float v) {
+    return __int_as_float(__builtin_amdgcn_update_dpp(0, __float_as_int(v), CTRL, 0xF, 0xF, false));
+}
+
+// == q8p_sum32 (xor 16 swizzle; xor 8 = row_ror:8, xor 4 = row_ror:4 on the equal-value classes; xor 2, xor 1)
+static __device__ __forceinline__ float q8p_sum32_dpp(float v) {
+    v += __int_as_float(__builtin_amdgcn_ds_swizzle(__float_as_int(v), 0x401F)); // xor 16
+    v += q8p_dpp<0x128>(v); // row_ror:8
+    v += q8p_dpp<0x124>(v); // row_ror:4
+    v += q8p_dpp<0x4E>(v);  // xor 2
+    v += q8p_dpp<0xB1>(v);  // xor 1
+    return v;
+}
+
+template <bool MR>
+static __global__ void __launch_bounds__(Q8P_SHAPED_NT) rms_norm_mul_q8_shaped_kernel(const float * __restrict__ x,
+        const float * __restrict__ w, float * __restrict__ dst, block_q8_1 * __restrict__ y, int * __restrict__ ysum,
+        const float eps) {
+    constexpr int ncols4 = Q8P_SHAPED_NCOLS / 4;      // 1280
+    constexpr int per_wg = 64;                        // float4 of the output slice of a workgroup
+    constexpr int NV     = 1024 / Q8P_SHAPED_NT;      // virtual lanes per thread
+    constexpr int NL     = ncols4 / Q8P_SHAPED_NT;    // float4 loads per thread (5)
+    static_assert(NL == NV + 1 && ncols4 - 1024 == Q8P_SHAPED_NT, "thread mapping");
+    __shared__ float s_sum[32];
+    const int tid = threadIdx.x;
+    if constexpr (MR) {
+        x    += (int64_t) blockIdx.y*Q8P_SHAPED_NCOLS;
+        dst  += (int64_t) blockIdx.y*Q8P_SHAPED_NCOLS;
+        y    += blockIdx.y*(Q8P_SHAPED_NCOLS/QK8_1);
+        ysum += blockIdx.y*(Q8P_SHAPED_NCOLS/QK8_1);
+    }
+    const float4 * x4 = (const float4 *) x;
+    const int  io  = blockIdx.x*per_wg + tid;
+    const bool out = tid < per_wg;
+    float4 xo = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+    float4 mo = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+    if (out) {
+        xo = x4[io];
+        mo = ((const float4 *) w)[io];
+    }
+    float4 xs[NL];
+#pragma unroll
+    for (int k = 0; k < NL; ++k) {
+        xs[k] = x4[tid + k*Q8P_SHAPED_NT];
+    }
+    float v[NV];
+#pragma unroll
+    for (int k = 0; k < NV; ++k) {
+        v[k] = q8p_sumsq4(xs[k]);
+    }
+    v[0] = v[0] + q8p_sumsq4(xs[NV]); // virtual lane tid also holds element tid + 1024
+#pragma unroll
+    for (int k = 0; k < NV; ++k) {
+        v[k] = q8p_sum32_dpp(v[k]);
+    }
+    if (tid % 32 == 0) {
+#pragma unroll
+        for (int k = 0; k < NV; ++k) {
+            s_sum[tid/32 + k*(Q8P_SHAPED_NT/32)] = v[k];
+        }
+    }
+    __syncthreads();
+    if (!out) {
+        return;
+    }
+    const float tmp   = q8p_sum32_dpp(s_sum[tid % 32]);
+    // (the fma-corrected quotient by 5120 is exact for |tmp| >= 1e-30; below that the IEEE division, uniform branch)
+    const float mean  = tmp >= 1.0e-30f ? q8p_div_const(tmp, (float) Q8P_SHAPED_NCOLS, 1.0f/Q8P_SHAPED_NCOLS) : tmp / Q8P_SHAPED_NCOLS;
+    const float scale = rsqrtf(mean + eps);
+
+    float4 r = make_float4(scale*xo.x, scale*xo.y, scale*xo.z, scale*xo.w);
+    r.x *= mo.x;
+    r.y *= mo.y;
+    r.z *= mo.z;
+    r.w *= mo.w;
+    ((float4 *) dst)[io] = r;
+
+    float amax = fmaxf(fmaxf(fabsf(r.x), fabsf(r.y)), fmaxf(fabsf(r.z), fabsf(r.w)));
+    amax = q8p_max8(amax);
+    const float d     = q8p_div_const(amax, 127.0f, 1.0f/127.0f);
+    const float inv_d = __builtin_amdgcn_rcpf(d);
+    float t0 = r.x * inv_d;
+    float t1 = r.y * inv_d;
+    float t2 = r.z * inv_d;
+    float t3 = r.w * inv_d;
+    const float m0 = fabsf(__builtin_amdgcn_fractf(fabsf(t0)) - 0.5f);
+    const float m1 = fabsf(__builtin_amdgcn_fractf(fabsf(t1)) - 0.5f);
+    const float m2 = fabsf(__builtin_amdgcn_fractf(fabsf(t2)) - 0.5f);
+    const float m3 = fabsf(__builtin_amdgcn_fractf(fabsf(t3)) - 0.5f);
+    // NaN products (d = 0 or NaN) and denormal d (v_rcp_f32 range) take the IEEE formula as well
+    if (!(fminf(fminf(m0, m1), fminf(m2, m3)) > 4.0e-5f) || !(m0 == m0 && m1 == m1 && m2 == m2 && m3 == m3) ||
+            !(d >= 1.17549435e-38f)) {
+        t0 = roundf(r.x / d);
+        t1 = roundf(r.y / d);
+        t2 = roundf(r.z / d);
+        t3 = roundf(r.w / d);
+    } else {
+        t0 = rintf(t0);
+        t1 = rintf(t1);
+        t2 = rintf(t2);
+        t3 = rintf(t3);
+    }
+    const int8_t q0 = amax == 0.0f ? 0 : (int8_t) t0;
+    const int8_t q1 = amax == 0.0f ? 0 : (int8_t) t1;
+    const int8_t q2 = amax == 0.0f ? 0 : (int8_t) t2;
+    const int8_t q3 = amax == 0.0f ? 0 : (int8_t) t3;
+    int sum = (int) q0 + (int) q1 + (int) q2 + (int) q3;
+    sum = q8p_sum8(sum);
+    const uint32_t packed = (uint32_t) (uint8_t) q0 | ((uint32_t) (uint8_t) q1 << 8) |
+                            ((uint32_t) (uint8_t) q2 << 16) | ((uint32_t) (uint8_t) q3 << 24);
+    ((uint32_t *) y[io/8].qs)[io%8] = packed;
+    if (io % 8 == 0) {
+        y[io/8].ds = make_half2(d, d * sum);
+        ysum[io/8] = sum;
+    }
+}
+
+static bool q8p_norm_shaped() {
+    static const bool shaped = [] {
+        const char * v = getenv("GGML_Q8_NORM_SHAPED");
+        return v == nullptr || v[0] != '0';
+    }();
+    return shaped;
+}
+
 // In-place variant of rms_norm_mul_q8_kernel (dst overlaps x, e.g. the output norm that ggml-alloc places over l_out):
 // a single workgroup loads the whole row into registers before the reduction barrier and only then stores, so no load
 // can observe an already normalized element (the multi-workgroup kernel re-reads x in every workgroup while others
@@ -451,7 +618,9 @@ static void q8p_norm_launch(ggml_backend_cuda_context & ctx, const bool inplace,
         }
     } else {
         const dim3 grid(ncols / 256, nrows, 1);
-        if (ncols <= 8192) {
+        if (ncols == Q8P_SHAPED_NCOLS && q8p_norm_shaped()) {
+            rms_norm_mul_q8_shaped_kernel<true><<<grid, Q8P_SHAPED_NT, 0, ctx.stream()>>>(x, w, dst, y, ysum, eps);
+        } else if (ncols <= 8192) {
             if (small) {
                 rms_norm_mul_q8_kernel<2, true, true><<<grid, 1024, 0, ctx.stream()>>>(x, w, dst, y, ysum, ncols, eps);
             } else {
@@ -545,6 +714,42 @@ static bool ggml_cuda_rms_norm_mul_q8_rows(ggml_backend_cuda_context & ctx, cons
 }
 // ------------------------------------------------------------------------------------------------- MTP2-O2 end
 
+// GGML_Q8_NORM_SHAPED_VERIFY=<n> (debug): the first n single-row shaped launches outside graph capture are compared
+// bit for bit (fp32 row, q8_1 blocks, sums) with rms_norm_mul_q8_kernel<2, true> run into scratch buffers
+static void q8p_shaped_verify(ggml_backend_cuda_context & ctx, const float * x, const float * w, const float * dst,
+        const block_q8_1 * y, const int * ysum, const float eps) {
+    static int left = getenv("GGML_Q8_NORM_SHAPED_VERIFY") ? atoi(getenv("GGML_Q8_NORM_SHAPED_VERIFY")) : 0;
+    if (left <= 0) {
+        return;
+    }
+    hipStreamCaptureStatus status;
+    CUDA_CHECK(hipStreamIsCapturing(ctx.stream(), &status));
+    if (status != hipStreamCaptureStatusNone) {
+        return;
+    }
+    left--;
+    constexpr int n = Q8P_SHAPED_NCOLS, nb = n/QK8_1;
+    ggml_cuda_pool_alloc<float>      rd(ctx.pool(), n);
+    ggml_cuda_pool_alloc<block_q8_1> rq(ctx.pool(), nb);
+    ggml_cuda_pool_alloc<int>        rs(ctx.pool(), nb);
+    rms_norm_mul_q8_kernel<2, true><<<n/256, 1024, 0, ctx.stream()>>>(x, w, rd.ptr, rq.ptr, rs.ptr, n, eps);
+    std::vector<float> a(n), b(n);
+    std::vector<block_q8_1> qa(nb), qb(nb);
+    std::vector<int> sa(nb), sb(nb);
+    CUDA_CHECK(cudaMemcpyAsync(a.data(), dst, n*sizeof(float), cudaMemcpyDeviceToHost, ctx.stream()));
+    CUDA_CHECK(cudaMemcpyAsync(b.data(), rd.ptr, n*sizeof(float), cudaMemcpyDeviceToHost, ctx.stream()));
+    CUDA_CHECK(cudaMemcpyAsync(qa.data(), y, nb*sizeof(block_q8_1), cudaMemcpyDeviceToHost, ctx.stream()));
+    CUDA_CHECK(cudaMemcpyAsync(qb.data(), rq.ptr, nb*sizeof(block_q8_1), cudaMemcpyDeviceToHost, ctx.stream()));
+    CUDA_CHECK(cudaMemcpyAsync(sa.data(), ysum, nb*sizeof(int), cudaMemcpyDeviceToHost, ctx.stream()));
+    CUDA_CHECK(cudaMemcpyAsync(sb.data(), rs.ptr, nb*sizeof(int), cudaMemcpyDeviceToHost, ctx.stream()));
+    CUDA_CHECK(cudaStreamSynchronize(ctx.stream()));
+    const int md = memcmp(a.data(), b.data(), n*sizeof(float)) != 0;
+    const int mq = memcmp(qa.data(), qb.data(), nb*sizeof(block_q8_1)) != 0;
+    const int ms = memcmp(sa.data(), sb.data(), nb*sizeof(int)) != 0;
+    fprintf(stderr, "q8p_shaped verify: dst %s q8 %s sums %s%s\n", md ? "DIFF" : "ok", mq ? "DIFF" : "ok", ms ? "DIFF" : "ok",
+            md || mq || ms ? " MISMATCH" : "");
+}
+
 bool ggml_cuda_rms_norm_mul_q8(ggml_backend_cuda_context & ctx, const ggml_tensor * rms_norm, ggml_tensor * mul_node) {
     if (!q8p_enabled() || !q8p_norm_enabled() || ggml_cuda_info().devices[ctx.device].warp_size != 64) {
         return false;
@@ -589,6 +794,13 @@ bool ggml_cuda_rms_norm_mul_q8(ggml_backend_cuda_context & ctx, const ggml_tenso
     // VPT only bounds the per-thread loop (elements beyond ncols are skipped), so 2 and 4 give identical results;
     // one workgroup per 64 float4 (ne0 % 512 == 0)
     const int nwg = (int) (x->ne[0] / 256);
+    if (x->ne[0] == Q8P_SHAPED_NCOLS && q8p_norm_shaped()) {
+        rms_norm_mul_q8_shaped_kernel<false><<<nwg, Q8P_SHAPED_NT, 0, ctx.stream()>>>((const float *) x->data,
+                (const float *) w->data, (float *) mul_node->data, y, ysum, eps);
+        CUDA_CHECK(cudaGetLastError());
+        q8p_shaped_verify(ctx, (const float *) x->data, (const float *) w->data, (const float *) mul_node->data, y, ysum, eps);
+        return true;
+    }
     static const bool small = [] {
         const char * v = getenv("GGML_Q8_NORM_SMALL");
         return v == nullptr || v[0] != '0';

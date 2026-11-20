@@ -126,6 +126,7 @@ const void * ggml_cuda_mmvq_iq4k_soa_il4(const ggml_tensor * w, int device, cuda
     return ggml_cuda_get_repacked(w, device, stream, kind, ggml_nbytes(w), iq4k_repack_il4);
 }
 
+static bool iq4k_group_nc_ok(const ggml_tensor * mm);   // MTP3-BCD (MMVQ-NC B section)
 bool ggml_cuda_mmvq_iq4k_group_ok(const ggml_tensor * mm) {
     if (!iq4k_group_enabled() || mm->op != GGML_OP_MUL_MAT) {
         return false;
@@ -135,6 +136,9 @@ bool ggml_cuda_mmvq_iq4k_group_ok(const ggml_tensor * mm) {
     if ((w->type != GGML_TYPE_IQ4_XS && w->type != GGML_TYPE_Q4_K) || x->type != GGML_TYPE_F32 || mm->type != GGML_TYPE_F32) {
         return false;
     }
+    if (x->ne[1] > 1) {
+        return iq4k_group_nc_ok(mm);
+    }
     const int64_t K = w->ne[0], N = w->ne[1];
     return K % QK_K == 0 && K <= 8192 && N % 64 == 0 && ggml_is_matrix(w) && ggml_is_contiguous(w) &&
         x->ne[0] == K && x->ne[1] == 1 && x->ne[2] == 1 && x->ne[3] == 1 && ggml_is_contiguous(x) &&
@@ -143,9 +147,13 @@ bool ggml_cuda_mmvq_iq4k_group_ok(const ggml_tensor * mm) {
         GGML_CUDA_CC_IS_CDNA2(ggml_cuda_info().devices[ggml_cuda_get_device()].cc);
 }
 
+static bool iq4k_group_nc(ggml_backend_cuda_context & ctx, ggml_tensor * const * mm, int n);   // MTP3-BCD
 bool ggml_cuda_mmvq_iq4k_group(ggml_backend_cuda_context & ctx, ggml_tensor * const * mm, int n) {
     if (n < 2 || n > iq4k::G_MAXJ) {
         return false;
+    }
+    if (mm[0]->src[1]->ne[1] > 1) {
+        return iq4k_group_nc(ctx, mm, n);
     }
     const ggml_tensor * src1 = mm[0]->src[1];
     const int K = (int) mm[0]->src[0]->ne[0];
@@ -587,6 +595,103 @@ bool ggml_cuda_mmvq_iq4k_nc_checked(ggml_backend_cuda_context & ctx, const ggml_
     fprintf(stderr, "MMVQ-NC verify iq4k %s %s [%lld x %lld] n=%d %s: %lld mismatches%s\n", ggml_type_name(src0->type), dst->name,
         (long long) src0->ne[0], (long long) src0->ne[1], ncols,
         fusion ? (fusion->gate ? "glu" : xb ? "residual" : "fused") : "plain", (long long) bad, where.c_str());
+    return true;
+}
+
+// MTP3-BCD: N-column groups of small-N GEMVs (attn_k + attn_v on the same activation, 2..16 columns): one launch of the
+// multi-job small-N kernel (iq4k::launch_sn_ncr_multi), every job exactly the per-tensor launch_sn_ncr (bit-identical;
+// GGML_MMVQ_NC_VERIFY compares every member column with the single-token path). GGML_MMVQ_NC_IQ4K_GROUP=0: off (the
+// members run one by one as before). Reached through ggml_cuda_mmvq_iq4k_group_ok, so the single-token group switch
+// (GGML_MMVQ_IQ4K_GROUP=0) turns this off as well (exact either way: the members fall back to per-tensor launches).
+static bool iq4k_group_nc_enabled() {
+    static const bool on = [] {
+        const char * v = getenv("GGML_MMVQ_NC_IQ4K_GROUP");
+        return v == nullptr || v[0] != '0';
+    }();
+    return on;
+}
+static bool iq4k_group_nc_ok(const ggml_tensor * mm) {
+    const ggml_tensor * w = mm->src[0];
+    const ggml_tensor * x = mm->src[1];
+    const int ncols = (int) x->ne[1];
+    // exactly the tensors ggml_cuda_mmvq_iq4k_nc runs on launch_sn_ncr (rows < 2048, no epilogue, MFMA form on)
+    return iq4k_group_nc_enabled() && iq4k_nc_enabled() && iq4k_nc_mfma() && ncols >= 2 && ncols <= ggml_cuda_mmvq_iq4k_nc_max() &&
+        iq4k_nc_weight_ok(w) && iq4k_nc_cap_ok(w, ncols) && w->ne[1] < 2048 && w->ne[1] > 0 &&
+        x->ne[0] == w->ne[0] && x->ne[2] == 1 && x->ne[3] == 1 && ggml_is_contiguous(x) &&
+        ggml_is_contiguous(mm) && mm->ne[0] == w->ne[1] && mm->ne[1] == ncols && mm->ne[2] == 1 && mm->ne[3] == 1;
+}
+// compare the columns of dst (written by an N-column launch) with the single-token path on every column; returns mismatches
+static int64_t iq4k_nc_compare(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * dst,
+        int ncols, int64_t * first) {
+    cudaStream_t stream = ctx.stream();
+    const int64_t nrows = dst->ne[0];
+    ggml_cuda_pool_alloc<float> ref(ctx.pool(), nrows);
+    std::vector<float> a(nrows), b(nrows);
+    int64_t bad = 0;
+    *first = -1;
+    for (int64_t j = 0; j < ncols; ++j) {
+        ggml_tensor x1 = *src1;
+        x1.ne[1] = 1; x1.nb[2] = x1.nb[1]; x1.nb[3] = x1.nb[1];
+        x1.data = (char *) src1->data + j*src1->nb[1];
+        x1.view_src = nullptr; x1.view_offs = 0;
+        ggml_tensor d1 = *dst;
+        d1.ne[1] = 1; d1.nb[2] = d1.nb[1]; d1.nb[3] = d1.nb[1];
+        d1.data = ref.get();
+        d1.view_src = nullptr; d1.view_offs = 0;
+        ggml_cuda_mul_mat_vec_q(ctx, src0, &x1, nullptr, &d1, nullptr);
+        CUDA_CHECK(cudaMemcpyAsync(a.data(), ref.get(), nrows*sizeof(float), cudaMemcpyDeviceToHost, stream));
+        CUDA_CHECK(cudaMemcpyAsync(b.data(), (const char *) dst->data + j*dst->nb[1], nrows*sizeof(float), cudaMemcpyDeviceToHost, stream));
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+        for (int64_t r = 0; r < nrows; ++r) {
+            if (memcmp(&a[r], &b[r], sizeof(float)) != 0) {
+                if (*first < 0) {
+                    *first = j*nrows + r;
+                }
+                ++bad;
+            }
+        }
+    }
+    return bad;
+}
+static bool iq4k_group_nc(ggml_backend_cuda_context & ctx, ggml_tensor * const * mm, int n) {
+    const ggml_tensor * src1 = mm[0]->src[1];
+    const int ncols = (int) src1->ne[1];
+    const int K = (int) mm[0]->src[0]->ne[0];
+    iq4k::snrjob_h jobs[iq4k::G_MAXJ];
+    for (int k = 0; k < n; ++k) {
+        if (!iq4k_group_nc_ok(mm[k]) || mm[k]->src[1] != src1) {
+            return false;
+        }
+        const ggml_tensor * w = mm[k]->src[0];
+        jobs[k] = { w->type, w->data, (float *) mm[k]->data, (int) (mm[k]->nb[1]/sizeof(float)), (int) w->ne[1] };
+    }
+    const block_q8_1 * q8 = nullptr;
+    const int * sums = nullptr;
+    if (!ggml_cuda_mmvq_q8_cached_nc(ctx, src1, &q8, &sums)) {
+        return false;
+    }
+    const int ys = (int) (GGML_PAD(K, MATRIX_ROW_PADDING)/QK8_1);
+    cudaStream_t stream = ctx.stream();
+    if (!iq4k::launch_sn_ncr_multi(jobs, n, ncols, q8, ys, K, stream)) {
+        return false;
+    }
+    CUDA_CHECK(cudaGetLastError());
+    std::atomic<int> & left = iq4k_nc_verify_left();
+    if (left.load() > 0) {
+        hipStreamCaptureStatus status;
+        CUDA_CHECK(hipStreamIsCapturing(stream, &status));
+        if (status == hipStreamCaptureStatusNone) {
+            --left;
+            for (int k = 0; k < n; ++k) {
+                int64_t first = -1;
+                const int64_t bad = iq4k_nc_compare(ctx, mm[k]->src[0], src1, mm[k], ncols, &first);
+                const int64_t nrows = mm[k]->ne[0];
+                const std::string where = bad ? " (first at col " + std::to_string(first/nrows) + " row " + std::to_string(first%nrows) + ")" : "";
+                fprintf(stderr, "MMVQ-NC verify iq4k %s %s [%lld x %lld] n=%d group%d: %lld mismatches%s\n", ggml_type_name(mm[k]->src[0]->type),
+                    mm[k]->name, (long long) mm[k]->src[0]->ne[0], (long long) nrows, ncols, n, (long long) bad, where.c_str());
+            }
+        }
+    }
     return true;
 }
 // MMVQ-NC B end --------------------------------------------------------------------------------------------------------

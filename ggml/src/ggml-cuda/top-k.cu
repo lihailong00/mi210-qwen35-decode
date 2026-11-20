@@ -250,6 +250,240 @@ static void top_k_radix_cuda(
     }
 }
 
+// ---- TOPK-FAST: one launch for a few long rows and a small k (the backend top-k sampler of an MTP draft head: one row
+// of 248320 logits, k = 10). Total order on (value, index): the larger value first (ordered-integer key), equal values:
+// the lower index first, so the result is deterministic; the k indices are written in that order (a valid "unsorted"
+// top-k). Every wave reads 1024 consecutive elements and writes its maximum (64-bit key = value key << 32 | ~index).
+// The last workgroup of a row (atomic counter, reset afterwards: graph replay safe) takes the k largest wave maxima: the
+// k-th of them, T, is <= the k-th largest element, so the top k are among the elements >= T of those k waves. They are
+// gathered into LDS and the top k selected among them by k rounds of a wave arg-max. If more than TOPK_FAST_CMAX
+// elements pass (many equal values) each of the k waves is reduced to its own top k first (exact as well).
+// Replaces the 10-launch radix path (~95 us on MI210 for 248320 x 1). GGML_CUDA_TOP_K_FAST=0 disables.
+// Note: this applies to every TOP_K with ncols >= 8192, k <= 32, nrows <= 64 (not only the MTP draft head). The set of
+// indices is the same, but their order (value desc, index asc) and the choice among equal values at the k-th place can
+// differ from the radix path, so a backend sampler chain that walks the candidates in order (e.g. top_k then dist
+// with temperature > 0) can draw other tokens than before for the same seed. Greedy results are unaffected.
+#if defined(GGML_USE_HIP)
+#include <mutex>
+#include <map>
+#define TOPK_FAST_WS    64                     // wave64 (CDNA / GCN) only
+#define TOPK_FAST_EPL   16                     // elements per lane
+#define TOPK_FAST_EPW   (TOPK_FAST_EPL*TOPK_FAST_WS)
+#define TOPK_FAST_WPB   4                      // waves per workgroup
+#define TOPK_FAST_NT    (TOPK_FAST_WPB*TOPK_FAST_WS)
+#define TOPK_FAST_KMAX  32
+#define TOPK_FAST_WMAXL 8                      // wave maxima per lane in the last workgroup: waves per row <= 512
+#define TOPK_FAST_CMAX  1024                   // gathered candidates (>= TOPK_FAST_KMAX^2 for the fallback)
+#define TOPK_FAST_RMAX  64                     // rows (counters)
+
+static __device__ __forceinline__ unsigned long long top_k_fast_key(const float v, const int idx) {
+    return ((unsigned long long) top_k_float_to_ordered(v) << 32) | (unsigned long long) (uint32_t) ~(uint32_t) idx;
+}
+static __device__ __forceinline__ int top_k_fast_idx(const unsigned long long key) {
+    return (int) ~(uint32_t) (key & 0xFFFFFFFFull);
+}
+// wave maximum of a 32-bit value (DPP within rows of 16 lanes, then the four row results by readlane), uniform result
+static __device__ __forceinline__ uint32_t top_k_fast_wmax32(uint32_t v) {
+    v = max(v, (uint32_t) __builtin_amdgcn_mov_dpp((int) v, 0xB1,  0xF, 0xF, false));   // quad_perm 1,0,3,2
+    v = max(v, (uint32_t) __builtin_amdgcn_mov_dpp((int) v, 0x4E,  0xF, 0xF, false));   // quad_perm 2,3,0,1
+    v = max(v, (uint32_t) __builtin_amdgcn_mov_dpp((int) v, 0x141, 0xF, 0xF, false));   // row_half_mirror
+    v = max(v, (uint32_t) __builtin_amdgcn_mov_dpp((int) v, 0x140, 0xF, 0xF, false));   // row_mirror
+    const uint32_t a = (uint32_t) __builtin_amdgcn_readlane((int) v, 0),  b = (uint32_t) __builtin_amdgcn_readlane((int) v, 16);
+    const uint32_t c = (uint32_t) __builtin_amdgcn_readlane((int) v, 32), d = (uint32_t) __builtin_amdgcn_readlane((int) v, 48);
+    return max(max(a, b), max(c, d));
+}
+// wave maximum of the 64-bit keys: the largest value key, then among those the largest low word (= the lowest index)
+static __device__ __forceinline__ unsigned long long top_k_fast_wave_max(const unsigned long long x) {
+    const uint32_t hi = (uint32_t) (x >> 32);
+    const uint32_t mh = top_k_fast_wmax32(hi);
+    const uint32_t ml = top_k_fast_wmax32(hi == mh ? (uint32_t) x : 0u);
+    return ((unsigned long long) mh << 32) | ml;
+}
+// the k largest of the keys v[] of all lanes (0 = empty; keys are unique): lane r < k returns the r-th, in order
+template <int NPL>
+static __device__ __forceinline__ unsigned long long top_k_fast_wave_select(unsigned long long (&v)[NPL], const int k, const int lane) {
+    auto lmax = [&]() {
+        unsigned long long m = v[0];
+#pragma unroll
+        for (int j = 1; j < NPL; ++j) m = v[j] > m ? v[j] : m;
+        return m;
+    };
+    unsigned long long lb = lmax(), mine = 0;
+    for (int r = 0; r < k; ++r) {
+        const unsigned long long wb = top_k_fast_wave_max(lb);
+        if (lane == r) mine = wb;
+        if (lb == wb) {   // the owner lane drops it
+#pragma unroll
+            for (int j = 0; j < NPL; ++j) v[j] = v[j] == wb ? 0ull : v[j];
+            lb = lmax();
+        }
+    }
+    return mine;
+}
+// the 16 keys of lane `lane` of the wave chunk w (padding beyond the row: key 0x80000000, below every real element)
+static __device__ __forceinline__ void top_k_fast_load(const float * __restrict__ rs, const int ncols, const int w, const int lane,
+        unsigned long long (&v)[TOPK_FAST_EPL]) {
+#pragma unroll
+    for (int j = 0; j < TOPK_FAST_EPL; ++j) {
+        const int i = w*TOPK_FAST_EPW + j*TOPK_FAST_WS + lane;
+        v[j] = i < ncols ? top_k_fast_key(rs[i], i) : (unsigned long long) 0x80000000u;
+    }
+}
+// select from the C keys in LDS list[] with one wave; lane r < k writes the r-th index
+template <int NPL>
+static __device__ __forceinline__ void top_k_fast_final(const unsigned long long * list, const int C, const int k, const int lane, int * __restrict__ out) {
+    unsigned long long v[NPL];
+#pragma unroll
+    for (int j = 0; j < NPL; ++j) v[j] = lane + TOPK_FAST_WS*j < C ? list[lane + TOPK_FAST_WS*j] : 0ull;
+    const unsigned long long m = top_k_fast_wave_select<NPL>(v, k, lane);
+    if (lane < k) out[lane] = top_k_fast_idx(m);
+}
+
+static __global__ void __launch_bounds__(TOPK_FAST_NT) top_k_fast_kernel(
+        const float * __restrict__ src, int * __restrict__ dst, unsigned long long * __restrict__ wmax,
+        unsigned int * __restrict__ cnt, const int ncols, const int k, const int wpr) {
+    const int row  = blockIdx.y;
+    const int lane = threadIdx.x % TOPK_FAST_WS;
+    const int wl   = threadIdx.x / TOPK_FAST_WS;
+    const int wave = blockIdx.x*TOPK_FAST_WPB + wl;
+    const float * rs = src + (size_t) row*ncols;
+    unsigned long long * rw = wmax + (size_t) row*wpr;
+
+    if (wave < wpr) {
+        unsigned long long v[TOPK_FAST_EPL];
+        top_k_fast_load(rs, ncols, wave, lane, v);
+        unsigned long long m = v[0];
+#pragma unroll
+        for (int j = 1; j < TOPK_FAST_EPL; ++j) m = v[j] > m ? v[j] : m;
+        m = top_k_fast_wave_max(m);
+        if (lane == 0) rw[wave] = m;
+    }
+    __threadfence();
+    __syncthreads();
+    __shared__ unsigned int last;
+    if (threadIdx.x == 0) {
+        last = atomicAdd(cnt + row, 1u) == gridDim.x - 1;
+    }
+    __syncthreads();
+    if (!last) {
+        return;
+    }
+    __threadfence();
+
+    // (a) the k largest wave maxima (every wave computes the same, no barrier); lane r of each wave holds the r-th
+    unsigned long long sel;
+    {
+        unsigned long long v[TOPK_FAST_WMAXL];
+#pragma unroll
+        for (int j = 0; j < TOPK_FAST_WMAXL; ++j) {
+            const int i = lane + TOPK_FAST_WS*j;
+            v[j] = i < wpr ? __hip_atomic_load(rw + i, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT) : 0ull;
+        }
+        sel = top_k_fast_wave_select<TOPK_FAST_WMAXL>(v, k, lane);
+    }
+    const unsigned long long T = __shfl(sel, k - 1, TOPK_FAST_WS);
+
+    // (b) gather the elements >= T of the k selected waves (all k*1024 loads of a thread independent)
+    __shared__ unsigned long long list[TOPK_FAST_CMAX];
+    __shared__ unsigned int lcnt;
+    __shared__ int selw[TOPK_FAST_KMAX];
+    if (threadIdx.x == 0) lcnt = 0;
+    if (wl == 0 && lane < k) selw[lane] = top_k_fast_idx(sel) / TOPK_FAST_EPW;
+    __syncthreads();
+#pragma unroll 8
+    for (int j = (int) threadIdx.x; j < k*TOPK_FAST_EPW; j += TOPK_FAST_NT) {
+        const int e = selw[j / TOPK_FAST_EPW]*TOPK_FAST_EPW + j % TOPK_FAST_EPW;
+        if (e < ncols) {
+            const unsigned long long key = top_k_fast_key(rs[e], e);
+            if (key >= T) {
+                const unsigned int p = atomicAdd(&lcnt, 1u);
+                if (p < TOPK_FAST_CMAX) list[p] = key;
+            }
+        }
+    }
+    __syncthreads();
+    const int C = (int) lcnt;
+    int * out = dst + (size_t) row*k;
+    if (C > TOPK_FAST_CMAX) {
+        // fallback (many equal values): the top k of each selected wave, then the top k of those k*k
+        __syncthreads();
+        for (int r = wl; r < k; r += TOPK_FAST_WPB) {
+            const int w = selw[r];
+            unsigned long long v[TOPK_FAST_EPL];
+            top_k_fast_load(rs, ncols, w, lane, v);
+            const unsigned long long m = top_k_fast_wave_select<TOPK_FAST_EPL>(v, k, lane);
+            if (lane < k) list[r*k + lane] = m;
+        }
+        __syncthreads();
+        if (wl == 0) top_k_fast_final<TOPK_FAST_CMAX/TOPK_FAST_WS>(list, k*k, k, lane, out);
+    } else if (wl == 0) {
+        if      (C <= 1*TOPK_FAST_WS) top_k_fast_final<1>(list, C, k, lane, out);
+        else if (C <= 2*TOPK_FAST_WS) top_k_fast_final<2>(list, C, k, lane, out);
+        else if (C <= 4*TOPK_FAST_WS) top_k_fast_final<4>(list, C, k, lane, out);
+        else                          top_k_fast_final<TOPK_FAST_CMAX/TOPK_FAST_WS>(list, C, k, lane, out);
+    }
+    if (threadIdx.x == 0) {
+        cnt[row] = 0;
+    }
+}
+
+static bool top_k_fast_enabled() {
+    static const bool on = [] {
+        const char * v = getenv("GGML_CUDA_TOP_K_FAST");
+        return v == nullptr || v[0] != '0';
+    }();
+    return on;
+}
+
+// zeroed row counters per (device, stream), allocated outside stream capture: launches on different streams (two
+// contexts, concurrent graph branches) never share a counter; launches on one stream are ordered, and each kernel
+// leaves its counters at zero
+static unsigned int * top_k_fast_counters(const int device, cudaStream_t stream) {
+    static std::mutex mtx;
+    static std::map<std::pair<int, cudaStream_t>, unsigned int *> bufs;
+    std::lock_guard<std::mutex> lock(mtx);
+    auto it = bufs.find({device, stream});
+    if (it == bufs.end()) {
+        hipStreamCaptureStatus status;
+        CUDA_CHECK(hipStreamIsCapturing(stream, &status));
+        if (status != hipStreamCaptureStatusNone) {
+            return nullptr;
+        }
+        unsigned int * p = nullptr;
+        CUDA_CHECK(cudaMalloc(&p, TOPK_FAST_RMAX*sizeof(unsigned int)));
+        CUDA_CHECK(cudaMemset(p, 0, TOPK_FAST_RMAX*sizeof(unsigned int)));
+        CUDA_CHECK(cudaDeviceSynchronize());
+        it = bufs.emplace(std::make_pair(device, stream), p).first;
+    }
+    return it->second;
+}
+
+static bool top_k_fast_cuda(ggml_cuda_pool & pool, const float * src, int * dst, const int64_t ncols, const int64_t nrows, const int k,
+        cudaStream_t stream) {
+    if (!top_k_fast_enabled() || ggml_cuda_info().devices[ggml_cuda_get_device()].warp_size != TOPK_FAST_WS || k < 1 || k > TOPK_FAST_KMAX ||
+            ncols < 8192 || nrows < 1 || nrows > TOPK_FAST_RMAX) {
+        return false;
+    }
+    const int wpr = (int) ((ncols + TOPK_FAST_EPW - 1)/TOPK_FAST_EPW);
+    if (wpr > TOPK_FAST_WMAXL*TOPK_FAST_WS || k > wpr) {
+        return false;
+    }
+    unsigned int * cnt = top_k_fast_counters(ggml_cuda_get_device(), stream);
+    if (!cnt) {
+        return false;
+    }
+    ggml_cuda_pool_alloc<unsigned long long> wmax(pool, (size_t) nrows*wpr);
+    const dim3 grid((wpr + TOPK_FAST_WPB - 1)/TOPK_FAST_WPB, (unsigned int) nrows);
+    top_k_fast_kernel<<<grid, TOPK_FAST_NT, 0, stream>>>(src, dst, wmax.get(), cnt, (int) ncols, k, wpr);
+    CUDA_CHECK(cudaGetLastError());
+    return true;
+}
+#else
+static bool top_k_fast_cuda(ggml_cuda_pool &, const float *, int *, const int64_t, const int64_t, const int, cudaStream_t) {
+    return false;
+}
+#endif // defined(GGML_USE_HIP)
+
 static void top_k_argsort_cuda(
         ggml_cuda_pool & pool,
         const float * src, int * dst, int ncols, int64_t nrows, int k, bool use_cub, cudaStream_t stream) {
@@ -295,6 +529,10 @@ void ggml_cuda_op_top_k(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     ggml_cuda_pool & pool  = ctx.pool();
 
     const int device = ggml_cuda_get_device();
+
+    if (top_k_fast_cuda(pool, src0_d, dst_d, ncols, nrows, (int) k, stream)) {   // TOPK-FAST
+        return;
+    }
 
 #ifdef CUB_TOP_K_AVAILABLE
     // a single row always uses DeviceTopK if available

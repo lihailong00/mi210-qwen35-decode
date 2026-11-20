@@ -2912,6 +2912,66 @@ struct test_rope_set_rows : public test_case {
 // multi-section), gate half of the joint q|gate projection made contiguous, k/v rows stored into f16/f32 caches.
 // order 1 = current model order (projections, q chain, gate cont, k chain, k store, v store: fused into one CUDA kernel),
 // order 0 = the previous order (q chain, v proj, k chain, k store, v store, gate cont).
+// N1: single-query flash attention with the qwen3.5 sigmoid gate, as the decode graph has it (FLASH_ATTN_EXT, RESHAPE,
+// SIGMOID(gate), MUL): on CUDA/ROCm the fused fattn-dec kernel handles KV lengths that are multiples of 256 up to 1024
+struct test_fa_dec_gate : public test_case {
+    const int64_t hd;
+    const int64_t nh;
+    const int64_t nkv;
+    const int64_t kv;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "FA_DEC_GATE";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    std::string vars() override {
+        return VARS_TO_STR4(hd, nh, nkv, kv);
+    }
+
+    test_fa_dec_gate(int64_t hd = 256, int64_t nh = 24, int64_t nkv = 4, int64_t kv = 256)
+        : hd(hd), nh(nh), nkv(nkv), kv(kv) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * q_in = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, hd, nh, 1);
+        ggml_tensor * q    = ggml_permute(ctx, ggml_scale(ctx, q_in, 1.0f), 0, 2, 1, 3); // [hd, 1, nh]
+        ggml_tensor * k    = ggml_new_tensor_3d(ctx, GGML_TYPE_F16, hd, kv, nkv);
+        ggml_tensor * v    = ggml_new_tensor_3d(ctx, GGML_TYPE_F16, hd, kv, nkv);
+        ggml_tensor * m    = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, kv, 1, 1, 1);
+        ggml_set_name(m, "m");
+        // the gate is a plain input: a computed gate would be scheduled between the FA reshape and the sigmoid, and the
+        // fusion (FLASH_ATTN_EXT, views, SIGMOID, MUL in this order) would not match
+        ggml_tensor * gate = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hd*nh, 1);
+        ggml_tensor * fa   = ggml_flash_attn_ext(ctx, q, k, v, m, 1.0f/sqrtf((float) hd), 0.0f, 0.0f);
+        ggml_prec_set_acc(fa, GGML_PREC_F32);
+        ggml_tensor * out  = ggml_mul(ctx, ggml_reshape_2d(ctx, fa, hd*nh, 1), ggml_sigmoid(ctx, gate));
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (strcmp(t->name, "m") == 0) {
+                // the decode mask: the first cells visible, the rest of the KV view masked
+                std::vector<ggml_fp16_t> data(ggml_nelements(t));
+                const int64_t n_vis = kv - 1 - rand() % 200;
+                for (int64_t i = 0; i < ggml_nelements(t); ++i) {
+                    data[i] = ggml_fp32_to_fp16(i < n_vis ? 0.0f : -INFINITY);
+                }
+                ggml_backend_tensor_set(t, data.data(), 0, ggml_nbytes(t));
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+
+    double max_nmse_err() override {
+        return 5e-4;
+    }
+};
+
 struct test_attn_prep : public test_case {
     const int64_t hd;
     const int64_t nh;
@@ -2921,6 +2981,7 @@ struct test_attn_prep : public test_case {
     const int     mode;
     const int     order;
     const ggml_type cache_type;
+    const int fixed_pos;
     std::vector<ggml_tensor *> outs;
 
     std::string op_desc(ggml_tensor * t) override {
@@ -2933,12 +2994,12 @@ struct test_attn_prep : public test_case {
     std::vector<ggml_tensor *> fusion_test_nodes() override { return outs; }
 
     std::string vars() override {
-        return VARS_TO_STR8(hd, nh, nkv, nt, n_rot, mode, order, cache_type);
+        return VARS_TO_STR9(hd, nh, nkv, nt, n_rot, mode, order, cache_type, fixed_pos);
     }
 
     test_attn_prep(int64_t hd = 256, int64_t nh = 24, int64_t nkv = 4, int64_t nt = 1, int n_rot = 64,
-                   int mode = GGML_ROPE_TYPE_IMROPE, int order = 1, ggml_type cache_type = GGML_TYPE_F16)
-        : hd(hd), nh(nh), nkv(nkv), nt(nt), n_rot(n_rot), mode(mode), order(order), cache_type(cache_type) {}
+                   int mode = GGML_ROPE_TYPE_IMROPE, int order = 1, ggml_type cache_type = GGML_TYPE_F16, int fixed_pos = -1)
+        : hd(hd), nh(nh), nkv(nkv), nt(nt), n_rot(n_rot), mode(mode), order(order), cache_type(cache_type), fixed_pos(fixed_pos) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         const int64_t kv_size = 2*nt + 3;
@@ -3019,7 +3080,7 @@ struct test_attn_prep : public test_case {
             } else if (t->type == GGML_TYPE_I32) {
                 std::vector<int32_t> data(ggml_nelements(t));
                 for (int64_t i = 0; i < nt; ++i) {
-                    const int32_t p = rand() % 4096;
+                    const int32_t p = fixed_pos >= 0 ? fixed_pos + (int32_t) i : rand() % 4096;
                     for (int64_t s = 0; s < ggml_nelements(t)/nt; ++s) {
                         data[s*nt + i] = s == 3 ? 0 : p + (int32_t) s * (rand() % 3);
                     }
@@ -7955,6 +8016,26 @@ struct test_top_k : public test_case {
     }
 };
 
+// top_k over rows with only nlev distinct values (many ties: the TOPK-FAST fallback branch)
+struct test_top_k_flat : public test_top_k {
+    int nlev;
+    test_top_k_flat(std::array<int64_t, 4> ne, int k, int nlev) : test_top_k(GGML_TYPE_F32, ne, k, true), nlev(nlev) {}
+    std::string vars() override { return test_top_k::vars() + ",flat=" + std::to_string(nlev); }
+    void initialize_tensors(ggml_context * ctx) override {
+        std::default_random_engine rng(1234);
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            for (int64_t r = 0; r < ggml_nrows(t); r++) {
+                std::vector<float> data(t->ne[0]);
+                for (int i = 0; i < t->ne[0]; i++) {
+                    data[i] = (float) (i % nlev);
+                }
+                std::shuffle(data.begin(), data.end(), rng);
+                ggml_backend_tensor_set(t, data.data(), r * t->nb[1], t->ne[0] * sizeof(float));
+            }
+        }
+    }
+};
+
 // top_k over rows like log-probabilities: distinct negative values, fewer
 // than k +inf (none for k = 1, so the expected indices are unique) and many
 // -inf (masked tokens)
@@ -8686,6 +8767,46 @@ struct test_mix_pair : public test_case {
         ggml_tensor * r1 = ggml_mul_mat(ctx, a1, y);
         ggml_tensor * r2 = ggml_mul_mat(ctx, a2, y);
         ggml_tensor * out = glu ? ggml_swiglu_split(ctx, r1, r2) : ggml_concat(ctx, r1, r2, 0);
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
+// MTP3-BCD: several GEMVs (2..5) on the same normed n-column activation, outputs concatenated (their MUL_MATs are
+// consecutive graph nodes: the multi-job small-N group, at most iq4k::G_MAXJ members per launch)
+struct test_kv_group : public test_case {
+    const std::vector<ggml_type> types;
+    const std::vector<int64_t> ms;
+    const int64_t n;
+    const int64_t k;
+    test_kv_group(std::vector<ggml_type> types, std::vector<int64_t> ms, int64_t n, int64_t k) : types(types), ms(ms), n(n), k(k) {}
+    std::string vars() override {
+        std::string t, m;
+        for (size_t i = 0; i < types.size(); ++i) {
+            t += std::string(i ? "/" : "") + ggml_type_name(types[i]);
+            m += std::string(i ? "/" : "") + std::to_string(ms[i]);
+        }
+        return "types=" + t + ",ms=" + m + ",n=" + std::to_string(n) + ",k=" + std::to_string(k);
+    }
+    std::string op_desc(ggml_tensor * t) override { GGML_UNUSED(t); return "KV_GROUP"; }
+    bool run_whole_graph() override { return true; }
+    bool use_weight_context() override { return true; }
+    double max_nmse_err() override { return 5e-4; }
+    ggml_tensor * build_graph(ggml_context * ctx) override { return build_graph(ctx, ctx); }
+    ggml_tensor * build_graph(ggml_context * ctx, ggml_context * ctx_weights) override {
+        ggml_tensor * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, n);
+        ggml_tensor * w = ggml_new_tensor_1d(ctx_weights, GGML_TYPE_F32, k);
+        ggml_tensor * y = ggml_mul(ctx, ggml_rms_norm(ctx, x, 1e-6f), w);
+        std::vector<ggml_tensor *> r;
+        for (size_t i = 0; i < types.size(); ++i) {
+            ggml_tensor * a = ggml_new_tensor_2d(ctx_weights, types[i], k, ms[i]);
+            ggml_set_name(a, ("a" + std::to_string(i)).c_str());
+            r.push_back(ggml_mul_mat(ctx, a, y));
+        }
+        ggml_tensor * out = r[0];
+        for (size_t i = 1; i < r.size(); ++i) {
+            out = ggml_concat(ctx, out, r[i], 0);
+        }
         ggml_set_name(out, "out");
         return out;
     }
@@ -12048,6 +12169,19 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 
     test_cases.emplace_back(new test_rms_norm_mul_rope({128, 4, 7, 2}));
     // qwen3.5 attention prep chain: fused (order 1) and unfused (order 0) graph orders, rope modes, cache types
+    // N1: the same rope parameters and positions twice in a row (the fused kernel reuses its cos/sin table)
+    for (int rep = 0; rep < 2; ++rep) {
+        test_cases.emplace_back(new test_attn_prep(256, 24, 4, 1, 64, GGML_ROPE_TYPE_IMROPE, 1, rep ? GGML_TYPE_F32 : GGML_TYPE_F16, 77));
+        test_cases.emplace_back(new test_attn_prep(256, 24, 4, 3, 64, GGML_ROPE_TYPE_IMROPE, 1, rep ? GGML_TYPE_F32 : GGML_TYPE_F16, 77));
+    }
+    // N1: gated single-query flash attention of the decode graph (G = 6 as in the model, G = 4 / 8; kv 2048: generic path)
+    for (int64_t kv : {256, 512, 1024, 2048}) {
+        test_cases.emplace_back(new test_fa_dec_gate(256, 24, 4, kv));
+    }
+    for (int64_t kv : {256, 768}) {
+        test_cases.emplace_back(new test_fa_dec_gate(256, 16, 4, kv));
+        test_cases.emplace_back(new test_fa_dec_gate(256, 32, 4, kv));
+    }
     for (int order : {1, 0}) {
         for (int64_t nt : {1, 3, 17}) {
             test_cases.emplace_back(new test_attn_prep(256, 24, 4, nt, 64, GGML_ROPE_TYPE_IMROPE, order));
@@ -12257,6 +12391,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_gemm_fusion(t, 36,    n, 768,   GEMM_FUSION_NORM_SHARED_IQ3MIX, true));
         }
     }
+    // MMVQ-NC A, second MFMA form (iq3gemv-mf2.cuh, one column group at >= 4096 rows): the unit-major layout (K/128 not a
+    // multiple of 8) with K phases whose last one ends inside a 16-item step (masked lanes, clamped record addresses)
+    test_cases.emplace_back(new test_gemm_fusion(GGML_TYPE_IQ3_S,   4096, 3, 17152, GEMM_FUSION_ADD, true));
+    test_cases.emplace_back(new test_gemm_fusion(GGML_TYPE_IQ3_S,   4096, 4, 17152, GEMM_FUSION_ADD, true));
+    test_cases.emplace_back(new test_gemm_fusion(GGML_TYPE_IQ3_XXS, 4096, 4, 17152, GEMM_FUSION_ADD, true));
     // MMVQ-NC B: Q4_K small-N (rows < 2048) with K < 2048, where the single-token stock kernel uses its small_k variant
     // (the N-column path must leave these to the old path), and the first K above it
     for (int64_t k : {256, 1024, 1792, 2048}) {
@@ -12294,6 +12433,39 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_gemm_fusion(GGML_TYPE_IQ4_XS,  2048, n, 8448,  GEMM_FUSION_MM));
         test_cases.emplace_back(new test_gemm_fusion(GGML_TYPE_IQ3_XXS, 16,   n, 256,   GEMM_FUSION_MM));
         test_cases.emplace_back(new test_gemm_fusion(GGML_TYPE_Q4_K,    2050, n, 9216,  GEMM_FUSION_ADD));
+    }
+
+    // Q6K: single-token Q6_K GEMVs on the q6k SoA re-layout (HIP CDNA2; the qwen35 MTP draft layer): the draft layer
+    // shapes (eh_proj 5120x10240, q 12288, k/v 1024, attn_output + residual 5120x6144, SwiGLU gate/up 17408 + ffn_down
+    // + residual, K = 17408) and small / odd ones (64 rows, a single 256 block, K % 512 != 0); n = 2..4 stay on the
+    // previous paths (MTP catch-up batches)
+    for (int64_t n : {1, 2, 4}) {
+        test_cases.emplace_back(new test_gemm_fusion(GGML_TYPE_Q6_K, 5120,  n, 17408, GEMM_FUSION_FFN_ADD));
+        test_cases.emplace_back(new test_gemm_fusion(GGML_TYPE_Q6_K, 5120,  n, 6144,  GEMM_FUSION_ADD));
+        test_cases.emplace_back(new test_gemm_fusion(GGML_TYPE_Q6_K, 5120,  n, 10240, GEMM_FUSION_GLU));
+        for (int64_t m : {1024, 12288}) {
+            test_cases.emplace_back(new test_gemm_fusion(GGML_TYPE_Q6_K, m, n, 5120, GEMM_FUSION_NORM_SHARED));
+        }
+        test_cases.emplace_back(new test_gemm_fusion(GGML_TYPE_Q6_K, 64,  n, 256,  GEMM_FUSION_ADD));
+        test_cases.emplace_back(new test_gemm_fusion(GGML_TYPE_Q6_K, 192, n, 768,  GEMM_FUSION_NORM_SHARED));
+        test_cases.emplace_back(new test_gemm_fusion(GGML_TYPE_Q6_K, 512, n, 1280, GEMM_FUSION_FFN_ADD));
+    }
+
+    // Q6K: n = 3 (the K = 2 catch-up batch), n = 5 / 8 (the N-column path declines), odd shapes and K-split ffn_down
+    // shapes (run with GGML_MMVQ_Q6K_NC=1 to cover the opt-in N-column kernel)
+    for (int64_t n : {3, 5, 8}) {
+        test_cases.emplace_back(new test_gemm_fusion(GGML_TYPE_Q6_K, 5120,  n, 17408, GEMM_FUSION_FFN_ADD));
+        test_cases.emplace_back(new test_gemm_fusion(GGML_TYPE_Q6_K, 5120,  n, 6144,  GEMM_FUSION_ADD));
+        test_cases.emplace_back(new test_gemm_fusion(GGML_TYPE_Q6_K, 5120,  n, 10240, GEMM_FUSION_GLU));
+        test_cases.emplace_back(new test_gemm_fusion(GGML_TYPE_Q6_K, 1024,  n, 5120,  GEMM_FUSION_NORM_SHARED));
+        test_cases.emplace_back(new test_gemm_fusion(GGML_TYPE_Q6_K, 64,    n, 256,   GEMM_FUSION_ADD));
+    }
+    for (int64_t n : {1, 2, 3, 4}) {
+        test_cases.emplace_back(new test_gemm_fusion(GGML_TYPE_Q6_K, 512, n, 20480, GEMM_FUSION_FFN_ADD));
+        test_cases.emplace_back(new test_gemm_fusion(GGML_TYPE_Q6_K, 128, n, 9472,  GEMM_FUSION_ADD));
+        test_cases.emplace_back(new test_gemm_fusion(GGML_TYPE_Q6_K, 96,  n, 2304,  GEMM_FUSION_GLU));
+        test_cases.emplace_back(new test_gemm_fusion(GGML_TYPE_Q6_K, 200, n, 4096,  GEMM_FUSION_ADD));
+        test_cases.emplace_back(new test_gemm_fusion(GGML_TYPE_Q6_K, 256, n, 32768, GEMM_FUSION_FFN_ADD));
     }
 
     // MMVQ-NC lowbit: few-column GEMVs of the low-bit types (HIP: one weight pass for all columns, per column the same
@@ -12345,6 +12517,27 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_mix_pair(GGML_TYPE_Q4_K,    GGML_TYPE_IQ3_XXS, 10240, 6144, 3, 5120, false));
         test_cases.emplace_back(new test_mix_pair(GGML_TYPE_IQ3_XXS, GGML_TYPE_IQ4_XS, 17408, 17408, 4, 5120, true));
         test_cases.emplace_back(new test_mix_pair(GGML_TYPE_Q4_K,    GGML_TYPE_IQ3_S,  17408, 17408, 2, 5120, true));
+    }
+    {   // MTP3-BCD: multi-job small-N groups of 3..5 members, odd IQ4_XS rows at n > 4 (R = 2 -> R = 1), K = 256 / 17408,
+        // 2047 rows (grouped) and 2048 rows (declined), n = 17 (declined)
+        const ggml_type X = GGML_TYPE_IQ4_XS, Q = GGML_TYPE_Q4_K;
+        for (int64_t n : {2, 3, 4, 5, 7, 8, 16}) test_cases.emplace_back(new test_kv_group({X, Q, X}, {1024, 1024, 512}, n, 5120));
+        for (int64_t n : {2, 5, 9, 16})          test_cases.emplace_back(new test_kv_group({Q, X, Q, X}, {256, 1000, 64, 1024}, n, 5120));
+        for (int64_t n : {3, 5, 6, 12})          test_cases.emplace_back(new test_kv_group({X, X}, {1001, 999}, n, 2048));
+        for (int64_t n : {2, 6, 16})             test_cases.emplace_back(new test_kv_group({X, Q}, {512, 512}, n, 256));
+        for (int64_t n : {4, 8})                 test_cases.emplace_back(new test_kv_group({X, Q}, {1024, 1024}, n, 17408));
+        for (int64_t n : {4, 8})                 test_cases.emplace_back(new test_kv_group({X, Q}, {2047, 1024}, n, 5120));
+        for (int64_t n : {4, 8})                 test_cases.emplace_back(new test_kv_group({Q, X}, {1024, 2048}, n, 5120));
+        for (int64_t n : {4, 6})                 test_cases.emplace_back(new test_kv_group({X, Q, X, Q, X}, {1024, 1024, 512, 256, 1000}, n, 5120));
+        for (int64_t n : {4, 17})                test_cases.emplace_back(new test_kv_group({X, Q}, {1024, 1024}, n, 5120));
+    }
+    // MTP3-BCD: attn_k + attn_v (rows < 2048) of an N-column activation as one multi-job small-N launch
+    // (iq4k::launch_sn_ncr_multi), mixed and equal types (odd rows: KV_GROUP cases above)
+    for (int64_t n : {2, 3, 4, 5, 6, 8, 12, 16}) {
+        test_cases.emplace_back(new test_mix_pair(GGML_TYPE_IQ4_XS, GGML_TYPE_Q4_K,   1024, 1024, n, 5120, false));
+        test_cases.emplace_back(new test_mix_pair(GGML_TYPE_Q4_K,   GGML_TYPE_IQ4_XS, 1024, 512,  n, 5120, false));
+        test_cases.emplace_back(new test_mix_pair(GGML_TYPE_IQ4_XS, GGML_TYPE_IQ4_XS, 1000, 1024, n, 5120, false));
+        test_cases.emplace_back(new test_mix_pair(GGML_TYPE_Q4_K,   GGML_TYPE_Q4_K,   1024, 1024, n, 2048, false));
     }
 
     // MTP2-D: mixed pairs on the matrix cores (gemv_pair_mf, GGML_MMVQ_NC_MIX_MFMA) at n = 7..16 columns (n <= 6: block
@@ -13243,6 +13436,23 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     for (int n = 1; n < 5; ++n) {
         for (int k = 1; k <= n; ++k) {
             test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {n, 2, 1, 3}, k, true));
+        }
+    }
+    // TOPK-FAST (one launch for ncols >= 8192, k <= 32, rows <= 64): row counts around the limit, ties, long rows, 3-d,
+    // flat rows (fallback branch)
+    for (int k : {1, 10, 32}) {
+        for (int nrows : {17, 33, 64, 65}) {
+            test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {248320, nrows, 1, 1}, k));
+        }
+        test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {248320, 1, 1, 1}, k, true));
+        test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {248320, 3, 1, 1}, k));
+        test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {524288, 1, 1, 1}, k));
+        test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {524289, 1, 1, 1}, k));
+        test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {9000, 2, 1, 1}, k, true));
+        test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {248320, 2, 2, 1}, k));
+        for (int nlev : {1, 2, 100}) {
+            test_cases.emplace_back(new test_top_k_flat({248320, 1, 1, 1}, k, nlev));
+            test_cases.emplace_back(new test_top_k_flat({8192, 4, 1, 1}, k, nlev));
         }
     }
     for (int k : {1, 10, 40}) {

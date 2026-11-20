@@ -1049,15 +1049,14 @@ static inline bool launch_mf(const cfg & c, const mfplan & p, int nc, const soa 
 // words are read once (global / L2) and used for all R rows, so the activation traffic is 1/R of the per-row kernel
 // (the limit beyond 4 columns). Per (row, column) the thread's work, the fp32 sequence of the stock kernel and the
 // reduction (wave 1 -> LDS, wave 0 adds, warp_reduce_sum<64>) are exactly those of gemv_sn_nc / mul_mat_vec_q.
+// (MTP3-BCD: the body is a device function, so the multi-job launch below runs exactly the same per-row code)
 template <ggml_type type, int NC, int R>
-__launch_bounds__(128, 1)
-static __global__ void gemv_sn_ncr(const void * __restrict__ vx, const block_q8_1 * __restrict__ y, const int ys,
-        float * __restrict__ dst, const int dstr, const int bpr) {
+static __device__ __forceinline__ void sn_ncr_rows_dev(const void * __restrict__ vx, const block_q8_1 * __restrict__ y, const int ys,
+        float * __restrict__ dst, const int dstr, const int bpr, const int row0) {
 #pragma clang fp contract(off)
     constexpr int qk  = ggml_cuda_type_traits<type>::qk, qi = ggml_cuda_type_traits<type>::qi;
     constexpr int vdr = type == GGML_TYPE_Q4_K ? VDR_Q4_K_Q8_1_MMVQ : VDR_IQ4_XS_Q8_1_MMVQ;
     constexpr int bpi = vdr*2*64/qi;
-    const int row0 = R*blockIdx.x;
     const int tid = threadIdx.y*64 + threadIdx.x;
     float tmp[R][NC];
 #pragma unroll
@@ -1165,6 +1164,12 @@ static __global__ void gemv_sn_ncr(const void * __restrict__ vx, const block_q8_
         }
     }
 }
+template <ggml_type type, int NC, int R>
+__launch_bounds__(128, 1)
+static __global__ void gemv_sn_ncr(const void * __restrict__ vx, const block_q8_1 * __restrict__ y, const int ys,
+        float * __restrict__ dst, const int dstr, const int bpr) {
+    sn_ncr_rows_dev<type, NC, R>(vx, y, ys, dst, dstr, bpr, R*(int) blockIdx.x);
+}
 template <ggml_type type, int NC>
 static inline bool launch_sn_ncr_r(int R, const void * w, const block_q8_1 * y, int ys, float * dst, int dstr, int bpr, int N, hipStream_t st) {
     const dim3 b(64, 2);
@@ -1186,6 +1191,37 @@ static inline bool launch_sn_ncr_t(int NC, int R, const void * w, const block_q8
         default: return false;
     }
 }
+// MTP3-BCD: up to G_MAXJ small-N jobs (IQ4_XS and/or Q4_K, rows < 2048) on the same NC-column activation in one launch
+// (attn_k + attn_v of a verification batch; the single-token path groups them the same way, gemv_sn). The jobs are
+// concatenated over blockIdx.x; per workgroup the job, its type and its rows per workgroup are uniform, and the rows run
+// exactly sn_ncr_rows_dev of the per-job launch (launch_sn_ncr with the default rows): bit-identical outputs.
+struct snrjob { const void * w; float * dst; int dstr; int b0; int q4k; int R; };
+struct snrargs { snrjob j[G_MAXJ]; const block_q8_1 * y; int ys, bpr, nj; };
+template <int NC>
+__launch_bounds__(128, 1)
+static __global__ void gemv_sn_ncr_multi(const snrargs a) {
+    const int b = blockIdx.x;
+    const int j = (a.nj > 1 && b >= a.j[1].b0 ? 1 : 0) + (a.nj > 2 && b >= a.j[2].b0 ? 1 : 0) + (a.nj > 3 && b >= a.j[3].b0 ? 1 : 0);
+    const void * w0 = sreg(a.j[0].w), * w1 = sreg(a.j[1].w), * w2 = sreg(a.j[2].w), * w3 = sreg(a.j[3].w);
+    float * d0 = sreg(a.j[0].dst), * d1 = sreg(a.j[1].dst), * d2 = sreg(a.j[2].dst), * d3 = sreg(a.j[3].dst);
+    const int s0 = sreg(a.j[0].b0), s1 = sreg(a.j[1].b0), s2 = sreg(a.j[2].b0), s3 = sreg(a.j[3].b0);
+    const int t0 = sreg(a.j[0].q4k + 2*a.j[0].R), t1 = sreg(a.j[1].q4k + 2*a.j[1].R), t2 = sreg(a.j[2].q4k + 2*a.j[2].R), t3 = sreg(a.j[3].q4k + 2*a.j[3].R);
+    const int r0 = sreg(a.j[0].dstr), r1 = sreg(a.j[1].dstr), r2 = sreg(a.j[2].dstr), r3 = sreg(a.j[3].dstr);
+    const void * w   = j == 0 ? w0 : j == 1 ? w1 : j == 2 ? w2 : w3;
+    float      * dst = j == 0 ? d0 : j == 1 ? d1 : j == 2 ? d2 : d3;
+    const int    bb  = j == 0 ? s0 : j == 1 ? s1 : j == 2 ? s2 : s3;
+    const int    tk  = j == 0 ? t0 : j == 1 ? t1 : j == 2 ? t2 : t3;   // q4k + 2*R
+    const int    ds  = j == 0 ? r0 : j == 1 ? r1 : j == 2 ? r2 : r3;
+    const int lb = b - bb;
+    if (tk & 1) {
+        sn_ncr_rows_dev<GGML_TYPE_Q4_K, NC, 1>(w, a.y, a.ys, dst, ds, a.bpr, lb);
+    } else if (tk == 4) {
+        sn_ncr_rows_dev<GGML_TYPE_IQ4_XS, NC, 2>(w, a.y, a.ys, dst, ds, a.bpr, 2*lb);
+    } else {
+        sn_ncr_rows_dev<GGML_TYPE_IQ4_XS, NC, 1>(w, a.y, a.ys, dst, ds, a.bpr, lb);
+    }
+}
+struct snrjob_h { ggml_type type; const void * w; float * dst; int dstr; int N; };
 // R = 0: the default rows per workgroup for NC columns
 // (measured, K = 5120, 1024 rows: IQ4_XS 2 rows from 5 columns, Q4_K 1 row: more rows leave too few waves)
 static inline int sn_ncr_rows(ggml_type t, int NC) { return t == GGML_TYPE_IQ4_XS && NC > 4 ? 2 : 1; }
@@ -1197,6 +1233,29 @@ static inline bool launch_sn_ncr(ggml_type t, int NC, const void * w, const bloc
     if (t == GGML_TYPE_Q4_K)   return launch_sn_ncr_t<GGML_TYPE_Q4_K>(NC, R, w, y, ys, dst, dstr, K/QK_K, N, st);
     if (t == GGML_TYPE_IQ4_XS) return launch_sn_ncr_t<GGML_TYPE_IQ4_XS>(NC, R, w, y, ys, dst, dstr, K/QK_K, N, st);
     return false;
+}
+// the jobs of one multi-job launch: rows per workgroup as launch_sn_ncr picks them (Q4_K 1, IQ4_XS sn_ncr_rows)
+static inline bool launch_sn_ncr_multi(const snrjob_h * jobs, int nj, int NC, const block_q8_1 * y, int ys, int K, hipStream_t st) {
+    if (nj < 1 || nj > G_MAXJ || K % QK_K != 0 || NC < 2 || NC > 16) return false;
+    snrargs a{};
+    int nb = 0;
+    for (int k = 0; k < nj; ++k) {
+        const snrjob_h & J = jobs[k];
+        if ((J.type != GGML_TYPE_IQ4_XS && J.type != GGML_TYPE_Q4_K) || J.N <= 0 || (int64_t) J.N*(K/QK_K) >= (1ll << 31)) return false;
+        int R = sn_ncr_rows(J.type, NC);
+        if (J.N % R != 0) R = 1;
+        if (J.type == GGML_TYPE_Q4_K && R != 1) return false;
+        a.j[k] = { J.w, J.dst, J.dstr, nb, J.type == GGML_TYPE_Q4_K ? 1 : 0, R };
+        nb += J.N/R;
+    }
+    a.y = y; a.ys = ys; a.bpr = K/QK_K; a.nj = nj;
+    switch (NC) {
+#define IQ4K_SNM(n) case n: hipLaunchKernelGGL((gemv_sn_ncr_multi<n>), dim3(nb), dim3(64, 2), 0, st, a); return true;
+        IQ4K_SNM(2) IQ4K_SNM(3) IQ4K_SNM(4) IQ4K_SNM(5) IQ4K_SNM(6) IQ4K_SNM(7) IQ4K_SNM(8) IQ4K_SNM(9)
+        IQ4K_SNM(10) IQ4K_SNM(11) IQ4K_SNM(12) IQ4K_SNM(13) IQ4K_SNM(14) IQ4K_SNM(15) IQ4K_SNM(16)
+#undef IQ4K_SNM
+        default: return false;
+    }
 }
 
 } // namespace iq4k

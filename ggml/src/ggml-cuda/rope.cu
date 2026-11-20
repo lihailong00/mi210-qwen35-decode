@@ -1040,6 +1040,7 @@ struct ggml_cuda_attn_prep {
     float theta_scale;
     const float * freq_factors;
     const float * pow_table; // theta_scale^i, i < n_dims/2 (nullptr: the kernel calls powf)
+    int2 * cs_table;         // N1: tagged cos/sin of the last position per rotary pair (nullptr: not used)
 };
 
 // Table of theta_scale^i for attn_prep_f32, one immutable device buffer per (device, theta_scale, n_pairs). It is
@@ -1110,6 +1111,31 @@ static __device__ __forceinline__ void attn_prep_store(D * dst, const float * x)
     }
 }
 
+// N1: cs_table (GGML_CUDA_ATTN_PREP_CS=0 disables) holds, per rotary pair i < 64, the cos and sin of the latest position
+// as two 64-bit words {p, bits(cos)}, {p, bits(sin)} (single-copy atomic stores). Every launch loads the words of its
+// pairs together with its other inputs; a word whose tag equals the position the pair needs is the value rope_yarn
+// returns for it (the table belongs to one set of rope parameters, and the computation is deterministic), so it is
+// used directly; otherwise the lane computes cos/sin as before, and block (0, 0) stores the new words. In the decode
+// graph the first full-attention layer of a token computes and the other layers reuse: bit-identical results.
+// A word is one aligned 64-bit access (tag in the low half, value bits in the high half), so a reader never pairs a new
+// tag with an old value. The table key (attn_prep_cs_table) covers the rope parameters, the head size and the cache
+// types (kernel instantiation); launches with freq_factors do not use a table (the key cannot cover their contents).
+static __device__ __forceinline__ int2 attn_prep_cs_load(const int2 * w) {
+#if defined(GGML_USE_HIP)
+    const unsigned long long u = __hip_atomic_load((const unsigned long long *) w, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+#else
+    const unsigned long long u = *(const volatile unsigned long long *) w;
+#endif // defined(GGML_USE_HIP)
+    return make_int2((int) (uint32_t) u, (int) (uint32_t) (u >> 32));
+}
+static __device__ __forceinline__ void attn_prep_cs_store(int2 * w, const int tag, const int bits) {
+    const unsigned long long u = ((unsigned long long) (uint32_t) bits << 32) | (unsigned long long) (uint32_t) tag;
+#if defined(GGML_USE_HIP)
+    __hip_atomic_store((unsigned long long *) w, u, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+#else
+    *(volatile unsigned long long *) w = u;
+#endif // defined(GGML_USE_HIP)
+}
 template <int HD, bool has_ff, typename DK, typename DV>
 __launch_bounds__(64, 1)
 static __global__ void attn_prep_f32(
@@ -1128,7 +1154,7 @@ static __global__ void attn_prep_f32(
         const mrope_sections sections,
         const float freq_scale, const float ext_factor, const float attn_factor,
         const rope_corr_dims corr_dims, const float theta_scale,
-        const float * __restrict__ freq_factors, const float * __restrict__ pow_table) {
+        const float * __restrict__ freq_factors, const float * __restrict__ pow_table, int2 * cs_table) {
     constexpr int EPT = HD / 64;
     static_assert(HD % 64 == 0, "bad head size");
 
@@ -1148,6 +1174,12 @@ static __global__ void attn_prep_f32(
         const int64_t krow = is_q ? 0 : k_idx[t]; // uniform, issued early
         // early load of the tabulated theta_scale^i of this lane (first pass); the table is complete before launch
         const float pw_pref = pow_table ? pow_table[tid] : 0.0f;
+        int2 cs_c = make_int2(INT_MIN, 0);
+        int2 cs_s = make_int2(INT_MIN, 0);
+        if (cs_table != nullptr && tid < n_dims / 2) {
+            cs_c = attn_prep_cs_load(cs_table + 2*tid);
+            cs_s = attn_prep_cs_load(cs_table + 2*tid + 1);
+        }
 
         float wv[EPT];
         attn_prep_load<EPT>(src + e0, x);
@@ -1177,6 +1209,11 @@ static __global__ void attn_prep_f32(
             } else {
                 p = p4[0];
             }
+            if (i == tid && cs_c.x == p && cs_s.x == p) {
+                s_cos[i] = __int_as_float(cs_c.y);
+                s_sin[i] = __int_as_float(cs_s.y);
+                continue;
+            }
             const int   iw          = 2*i;
             const float pw          = pow_cached ? (i == tid ? pw_pref : pow_table[i]) : powf(theta_scale, iw/2.0f);
             const float theta_base  = p*pw;
@@ -1186,6 +1223,10 @@ static __global__ void attn_prep_f32(
             rope_yarn<true>(theta_base/freq_factor, freq_scale, corr_dims, 2*i, ext_factor, attn_factor, cos_theta, sin_theta);
             s_cos[i] = cos_theta;
             s_sin[i] = sin_theta;
+            if (cs_table != nullptr && i == tid && b == 0 && t == 0) {
+                attn_prep_cs_store(cs_table + 2*i,     p, __float_as_int(cos_theta));
+                attn_prep_cs_store(cs_table + 2*i + 1, p, __float_as_int(sin_theta));
+            }
         }
 
         // sum of squares in the order of rms_norm_f32<128, 1, true> for 256 columns (float4 per thread, 32-lane
@@ -1301,7 +1342,7 @@ static void attn_prep_launch(const ggml_cuda_attn_prep & p, cudaStream_t stream)
             (DK *) p.k_dst, p.kd_s1, p.k_idx, (DV *) p.v_dst, p.vd_s1, p.v_idx,
             p.n_head, p.n_head_kv, p.n_tokens, p.eps_q, p.eps_k,
             p.n_dims, p.pos, p.rope_kind, p.is_imrope, p.sections,
-            p.freq_scale, p.ext_factor, p.attn_factor, p.corr_dims, p.theta_scale, p.freq_factors, p.pow_table);
+            p.freq_scale, p.ext_factor, p.attn_factor, p.corr_dims, p.theta_scale, p.freq_factors, p.pow_table, p.cs_table);
     } else {
         attn_prep_f32<HD, true, DK, DV><<<block_nums, block_dims, 0, stream>>>(
             p.q_src, p.q_s1, p.q_s2, p.g_src, p.g_s1, p.g_s2, p.k_src, p.k_s1, p.k_s2, p.v_src, p.v_s1,
@@ -1309,7 +1350,7 @@ static void attn_prep_launch(const ggml_cuda_attn_prep & p, cudaStream_t stream)
             (DK *) p.k_dst, p.kd_s1, p.k_idx, (DV *) p.v_dst, p.vd_s1, p.v_idx,
             p.n_head, p.n_head_kv, p.n_tokens, p.eps_q, p.eps_k,
             p.n_dims, p.pos, p.rope_kind, p.is_imrope, p.sections,
-            p.freq_scale, p.ext_factor, p.attn_factor, p.corr_dims, p.theta_scale, p.freq_factors, p.pow_table);
+            p.freq_scale, p.ext_factor, p.attn_factor, p.corr_dims, p.theta_scale, p.freq_factors, p.pow_table, p.cs_table);
     }
 }
 
@@ -1363,6 +1404,65 @@ static const float * attn_prep_pow_table(const int device, cudaStream_t stream, 
     // once per key and device: the table is complete before any launch (on any stream) can be handed the pointer
     CUDA_CHECK(cudaStreamSynchronize(stream));
     attn_prep_pow_tables.emplace(std::make_pair(device, key), table);
+    return table;
+}
+
+static __global__ void attn_prep_cs_init(int2 * table) {
+    table[threadIdx.x] = make_int2(INT_MIN, 0); // no position matches
+}
+
+static std::mutex attn_prep_cs_mutex;
+static std::map<std::pair<int, std::vector<uint32_t>>, int2 *> attn_prep_cs_tables;
+
+// the cos/sin table of one set of rope parameters on one device, created on first use outside graph capture (nullptr
+// while capturing before it exists, or when disabled)
+static int2 * attn_prep_cs_table(const int device, cudaStream_t stream, const ggml_cuda_attn_prep & p, const int head_dim,
+        const ggml_type k_type, const ggml_type v_type) {
+    static const bool enabled = [] {
+        const char * e = getenv("GGML_CUDA_ATTN_PREP_CS");
+        return e == nullptr || e[0] != '0';
+    }();
+    if (!enabled || p.n_dims / 2 > 64 || p.n_dims <= 0 || p.freq_factors != nullptr) {
+        return nullptr;
+    }
+    std::vector<uint32_t> key;
+    auto put = [&](const void * v, size_t n) {
+        for (size_t i = 0; i < n; i += 4) {
+            uint32_t u = 0;
+            memcpy(&u, (const char *) v + i, 4);
+            key.push_back(u);
+        }
+    };
+    put(&p.n_dims, 4); put(&p.rope_kind, 4); put(&p.freq_scale, 4); put(&p.ext_factor, 4); put(&p.attn_factor, 4);
+    put(&p.theta_scale, 4); put(p.corr_dims.v, 8); put(p.sections.v, 16);
+    const int imr = p.is_imrope ? 1 : 0;
+    put(&imr, 4);
+    const int inst[3] = { head_dim, (int) k_type, (int) v_type };   // the attn_prep_f32 instantiation
+    put(inst, 12);
+    std::lock_guard<std::mutex> lock(attn_prep_cs_mutex);
+    const auto it = attn_prep_cs_tables.find({device, key});
+    if (it != attn_prep_cs_tables.end()) {
+        return it->second;
+    }
+#if defined(GGML_USE_HIP)
+    hipStreamCaptureStatus status;
+    CUDA_CHECK(hipStreamIsCapturing(stream, &status));
+    if (status != hipStreamCaptureStatusNone) {
+        return nullptr;
+    }
+#else
+    cudaStreamCaptureStatus status;
+    CUDA_CHECK(cudaStreamIsCapturing(stream, &status));
+    if (status != cudaStreamCaptureStatusNone) {
+        return nullptr;
+    }
+#endif // defined(GGML_USE_HIP)
+    int2 * table = nullptr;
+    CUDA_CHECK(cudaMalloc(&table, 128*sizeof(int2)));
+    attn_prep_cs_init<<<1, 128, 0, stream>>>(table);
+    CUDA_CHECK(cudaGetLastError());
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    attn_prep_cs_tables.emplace(std::make_pair(device, key), table);
     return table;
 }
 
@@ -1429,6 +1529,7 @@ void ggml_cuda_op_attn_prep_fused(ggml_backend_cuda_context & ctx, ggml_tensor *
 
     cudaStream_t stream = ctx.stream();
     p.pow_table = attn_prep_pow_table(ctx.device, stream, p.theta_scale, p.n_dims / 2);
+    p.cs_table  = attn_prep_cs_table(ctx.device, stream, p, (int) q->ne[0], p.k_type, p.v_type);
     switch (q->ne[0]) {
         case 128: attn_prep_launch_types<128>(p, stream); break;
         case 256: attn_prep_launch_types<256>(p, stream); break;

@@ -57,10 +57,17 @@ bool iq3nc_launch_multi(const iq3nc_multi_args & a, cudaStream_t stream) {
             return false;
         }
     }
-    if (iq3mf_use(a.ncols)) {
+    int rows = 0;
+    for (int i = 0; i < a.n; ++i) {
+        rows += a.N[i];
+    }
+    if (iq3mf_use_shape(a.ncols, rows, a.K)) {
         // MFMA form: one launch (mixed types: both tables, per-job type) if a full K phase fits next to the tables,
         // else one launch per type (the jobs keep their own rows, outputs and arithmetic)
-        const bool one = !(hs && hx) || ((a.ncols + 3)/4 <= 2 && iq3mf_fit8(GGML_TYPE_IQ3_S, GGML_TYPE_IQ3_XXS, a.ncols));
+        // second form, one column group: one launch per type (no K phases next to the two tables; measured faster
+        // than one launch with phases)
+        const bool split2 = iq3mf2_enabled() && (a.ncols + 3)/4 == 1;
+        const bool one = !(hs && hx) || (!split2 && (a.ncols + 3)/4 <= 2 && iq3mf_fit8(GGML_TYPE_IQ3_S, GGML_TYPE_IQ3_XXS, a.ncols));
         for (int pass = 0; pass < (one ? 1 : 2); ++pass) {
             iq3mf_desc d{};
             for (int j = 0; j < 3; ++j) {

@@ -1837,8 +1837,13 @@ static inline bool launch_mf_t(const soa & s, const block_q8_1 * y, int ys, floa
     // units kept across the K chunks per wave group: bounded by the register budget (spills beyond); more units per wave
     // than that run as batches (each restages the chunks)
     static const int um_env = nc_env("GGML_MMVQ_NC_LB_MF_UM", 0);
-    const int umax = um_env > 0 ? std::min(um_env, 3) : MK::kind == 4 ? (CG >= 3 ? 1 : CG == 2 ? 2 : 3) : MK::kind == 3 ? (CG == 1 ? 2 : 3) : CG >= 3 ? 2 : 3;
-    const int um = nch > 1 ? std::min(upw, umax) : 1;
+    constexpr int um_cap = (CG == 1 && MK::kind <= 2) ? 4 : 3;   // UM = 4 is instantiated only there (LB_MF(4) below)
+    const int umax = um_env > 0 ? std::min(um_env, um_cap) : MK::kind == 4 ? (CG >= 3 ? 1 : CG == 2 ? 2 : 3) : MK::kind == 3 ? (CG == 1 ? 2 : 3) : CG >= 3 ? 2 : 3;
+    // MTP3-BCD: one more unit per wave group when that saves a whole batch (the IQ2 ffn_down at 3..4 columns: 1280 units on
+    // 416 wave groups; um = 3 left a second batch of 32 units that restaged every K chunk). GGML_MMVQ_NC_LB_MF_UM4=0: off
+    static const int um4_env = nc_env("GGML_MMVQ_NC_LB_MF_UM4", 1);
+    int um = nch > 1 ? std::min(upw, umax) : 1;
+    if (nch > 1 && um_env == 0 && um4_env && um == 3 && upw == 4 && CG == 1 && MK::kind <= 2) um = 4;
     static const int dbg = nc_env("GGML_MMVQ_NC_LB_MF_DEBUG", 0);
     if (dbg) {
         fprintf(stderr, "[lb mf] type=%d L=%d CG=%d NW=%d K=%d N=%d nc=%d KCB=%d colw=%d sw=%d lds=%zu wpc=%d grid=%d um=%d nch=%d\n",
@@ -1847,6 +1852,7 @@ static inline bool launch_mf_t(const soa & s, const block_q8_1 * y, int ys, floa
     const dim3 blk(64, NW);
 #define LB_MF(UM_) if (um == UM_) { hipLaunchKernelGGL((gemv_mf<T, H, CG, UM_, NW>), dim3(grid), blk, lds, st, s, y, ys, nc, dst, ldd, K, N, residual, ldr, KCB, colw, sw); return true; }
     LB_MF(1) LB_MF(2) LB_MF(3)
+    if constexpr (CG == 1 && MK::kind <= 2) { LB_MF(4) }
 #undef LB_MF
     return false;
 }

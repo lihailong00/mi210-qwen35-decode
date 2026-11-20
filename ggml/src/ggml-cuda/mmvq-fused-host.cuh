@@ -81,6 +81,17 @@ bool ggml_cuda_mmvq_iq3_multi(ggml_backend_cuda_context & ctx, const ggml_tensor
 bool ggml_cuda_mmvq_iq4k(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const block_q8_1 * src1_q8_1, ggml_tensor * dst,
         const ggml_cuda_mm_fusion_args_host * fusion);
 bool ggml_cuda_mmvq_iq4k_wants(const ggml_tensor * src0);
+// Single-token GEMV for Q6_K on the q6k SoA re-layout (mmvq-q6k.cu, q6k-gemv.cuh; activation already q8_1): plain,
+// residual (x_bias) and same-type SwiGLU gate/up. Not bit-identical to the stock Q6_K kernels (only the MTP draft head
+// uses Q6_K in the target model). GGML_MMVQ_Q6K=0 disables. _wants: will it take this weight (keeps mmvqf away).
+bool ggml_cuda_mmvq_q6k(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const block_q8_1 * src1_q8_1, ggml_tensor * dst,
+        const ggml_cuda_mm_fusion_args_host * fusion);
+bool ggml_cuda_mmvq_q6k_wants(const ggml_tensor * src0);
+// N-column (2..4) unfused Q6_K GEMVs on the same copy (y column c at y + c*GGML_PAD(K, 512)/32); false: nothing launched.
+// Opt-in: GGML_MMVQ_Q6K_NC=1 (_enabled); columns are not bit-identical to the single-token kernel (draft head only).
+bool ggml_cuda_mmvq_q6k_nc_enabled();
+bool ggml_cuda_mmvq_q6k_nc(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const block_q8_1 * y, int ncols, ggml_tensor * dst,
+        const ggml_cuda_mm_fusion_args_host * fusion);
 // iq4k-r3: one launch for 2..4 single-token MUL_MATs that read the same activation (IQ4_XS/Q4_K weights, may be mixed).
 // Default: only groups of small GEMVs (attn_k + attn_v, N <= 2048; bit-identical); groups with a large member
 // (q/k/v, qkv/z, mixed-type gate/up) only with GGML_MMVQ_IQ4K_GROUP_BIG=1. group_ok: can this node be a member;

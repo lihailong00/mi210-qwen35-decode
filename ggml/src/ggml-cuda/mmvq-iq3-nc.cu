@@ -66,17 +66,42 @@ bool iq3mf_enabled() {
     static const bool enabled = [] { const char * v = getenv("GGML_MMVQ_NC_IQ3_MFMA"); return v == nullptr || v[0] != '0'; }();
     return enabled;
 }
-int iq3mf_min() {
-    static const int m = [] { const char * v = getenv("GGML_MMVQ_NC_IQ3_MFMA_MIN"); return v ? std::max(2, atoi(v)) : 4; }();   // N = 2..3: the dp4a form is faster
+static int iq3mf_min_env() {   // GGML_MMVQ_NC_IQ3_MFMA_MIN, 0 if not set
+    static const int m = [] { const char * v = getenv("GGML_MMVQ_NC_IQ3_MFMA_MIN"); return v ? std::max(2, atoi(v)) : 0; }();
     return m;
+}
+int iq3mf_min() {
+    // N = 2..3: the dp4a form is faster than the first MFMA form; with the second form the choice is per shape
+    // (iq3mf_use_shape), 2 is the smallest column count that can take it
+    return iq3mf_min_env() ? iq3mf_min_env() : (iq3mf2_enabled() ? 2 : 4);
 }
 bool iq3mf_use(const int ncols) {
     // above the dp4a form's range the MFMA form is the only one (whatever the minimum says)
     return iq3mf_enabled() && ncols >= 2 && ncols <= IQ3MF_MAX && (ncols >= iq3mf_min() || ncols > IQ3NC_MAX);
 }
+bool iq3mf_use_shape(const int ncols, const int rows, const int K) {
+    if (!iq3mf_use(ncols)) {
+        return false;
+    }
+    if (ncols > IQ3NC_MAX || iq3mf_min_env() || !iq3mf2_enabled()) {
+        return true;
+    }
+    // second form, measured in the model (verification step, per node): the dp4a form stays faster for the small
+    // matrices (K/V projections, 1024 rows) and at 2 columns except for the K-phased ffn_down (K = 17408)
+    if (rows < 4096) {
+        return false;
+    }
+    return ncols >= 3 || K >= 16384;
+}
+bool iq3mf2_enabled() {
+    static const bool enabled = [] { const char * v = getenv("GGML_MMVQ_NC_IQ3_MF2"); return v == nullptr || v[0] != '0'; }();
+    return enabled;
+}
 bool iq3mf_glu_split(const ggml_type tgate, const ggml_type tup, const int ncols) {
     // one launch keeps two accumulator sets: up to 2 column groups; and a full K phase must fit next to both tables
-    return (ncols + 3)/4 > 2 || !iq3mf_fit8(tgate, tup, ncols);
+    // (the gate/up launch runs the second form at one column group, and at two for an IQ3_XXS pair: see launch_t)
+    const bool mf2 = iq3mf2_enabled() && ((ncols + 3)/4 == 1 || (tgate == GGML_TYPE_IQ3_XXS && tup == GGML_TYPE_IQ3_XXS));
+    return (ncols + 3)/4 > 2 || !iq3mf_fit8(tgate, tup, ncols, mf2);
 }
 static void iq3mf_job_init(iq3mf_desc & d) {
     for (int j = 0; j < 3; ++j) {
@@ -118,7 +143,7 @@ static bool iq3mf_launch_single(const iq3nc_single_args & a, cudaStream_t stream
 }
 
 bool iq3nc_launch_single(const iq3nc_single_args & a, cudaStream_t stream) {
-    if (iq3mf_use(a.ncols)) {
+    if (iq3mf_use_shape(a.ncols, a.N, a.K)) {
         return iq3mf_launch_single(a, stream);
     }
     switch (a.ta) {

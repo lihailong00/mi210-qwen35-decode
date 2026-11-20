@@ -1,5 +1,6 @@
 #include "models.h"
 #include "llama-memory-recurrent.h"
+#include "llama-kv-cache.h"
 
 #include <cstring>
 
@@ -890,17 +891,39 @@ llama_model_qwen35::graph_mtp::graph_mtp(const llama_model & model, const llm_gr
     const float kq_scale = hparams.f_attention_scale == 0.0f
             ? 1.0f / sqrtf(float(n_embd_head)) : hparams.f_attention_scale;
 
-    cur = build_attn(inp_attn,
-            nullptr, nullptr, nullptr,
-            Qcur, Kcur, Vcur, nullptr, nullptr, nullptr, kq_scale, il);
-    cb(cur, "mtp_attn_pregate", il);
+    // KV-only pass (LLAMA_MTP_KV_ONLY, default on): a batch without outputs (the catch-up decode of an MTP verification
+    // batch, the prompt) only needs the draft layer K/V of its tokens; nothing of the layer output is read (the nextn
+    // rows are extracted for output rows only in masked mode). Such a graph stores K/V and stops: no Q projection,
+    // attention, output projection, FFN or head (the remaining nodes have no rows). n_outputs is part of the graph
+    // reuse key, so graphs with outputs (the draft steps) are built exactly as before.
+    static const bool kv_only_on = [] {
+        const char * e = getenv("LLAMA_MTP_KV_ONLY");
+        return e == nullptr || atoi(e) != 0;
+    }();
+    const bool kv_only = kv_only_on && n_outputs == 0 && crop_before_nextn(inp_out_ids) && !cparams.training &&
+            !(il < (int) inp_attn->self_k_rot.size() && inp_attn->self_k_rot[il]) &&
+            !(il < (int) inp_attn->self_v_rot.size() && inp_attn->self_v_rot[il]);
+    if (kv_only) {
+        // same node order as build_attn (keeps the fused K norm + rope + cache store)
+        ggml_build_forward_expand(gf, Vcur);
+        ggml_build_forward_expand(gf, Kcur);
+        ggml_build_forward_expand(gf, inp_attn->mctx->cpy_k(ctx0, Kcur, inp_attn->get_k_idxs(), il));
+        ggml_build_forward_expand(gf, inp_attn->mctx->cpy_v(ctx0, Vcur, inp_attn->get_v_idxs(), il));
+        cur = ggml_get_rows(ctx0, inpSA, inp_out_ids);   // [n_embd, 0]
+        cb(cur, "mtp_attn_residual", il);
+    } else {
+        cur = build_attn(inp_attn,
+                nullptr, nullptr, nullptr,
+                Qcur, Kcur, Vcur, nullptr, nullptr, nullptr, kq_scale, il);
+        cb(cur, "mtp_attn_pregate", il);
 
-    cur = ggml_mul(ctx0, cur, ggml_sigmoid(ctx0, gate));
-    cur = build_lora_mm(layer.wo, cur, layer.wo_s);
-    cb(cur, "mtp_attn_out", il);
+        cur = ggml_mul(ctx0, cur, ggml_sigmoid(ctx0, gate));
+        cur = build_lora_mm(layer.wo, cur, layer.wo_s);
+        cb(cur, "mtp_attn_out", il);
 
-    cur = ggml_add(ctx0, cur, inpSA);
-    cb(cur, "mtp_attn_residual", il);
+        cur = ggml_add(ctx0, cur, inpSA);
+        cb(cur, "mtp_attn_residual", il);
+    }
 
     ggml_tensor * ffn_residual = cur;
     cur = build_norm(cur, layer.attn_post_norm, nullptr, LLM_NORM_RMS, il);

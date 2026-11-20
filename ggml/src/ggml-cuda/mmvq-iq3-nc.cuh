@@ -44,10 +44,15 @@ bool iq3nc_launch_multi(const iq3nc_multi_args & a, cudaStream_t stream);
 
 // ---- MFMA form (GGML_MMVQ_NC_IQ3_MFMA, default on; 0 = the dp4a form only, ncols <= IQ3NC_MAX)
 bool iq3mf_enabled();
-int  iq3mf_min();            // smallest column count that takes the MFMA form (GGML_MMVQ_NC_IQ3_MFMA_MIN, default 4)
-bool iq3mf_use(int ncols);   // MFMA form for this column count
+// smallest column count that can take the MFMA form: GGML_MMVQ_NC_IQ3_MFMA_MIN if set (then for every shape), else 2
+// with the second form (the choice is per shape, iq3mf_use_shape), 4 without it
+int  iq3mf_min();
+bool iq3mf_use(int ncols);   // MFMA form possible for this column count
+bool iq3mf_use_shape(int ncols, int rows, int K);   // MFMA form for this launch (rows: all jobs together)
 // the GLU launch needs a gate scratch (split gate / up passes) for these shapes
 bool iq3mf_glu_split(ggml_type tgate, ggml_type tup, int ncols);
+// second MFMA form (iq3gemv-mf2.cuh, GGML_MMVQ_NC_IQ3_MF2, default on; 0 = the first form iq3gemv-mf.cuh as before)
+bool iq3mf2_enabled();
 
 struct iq3mf_job {
     const uint8_t * w;      // weights (MODE 1: gate)
@@ -86,9 +91,11 @@ static inline size_t iq3mf_tab_bytes(const ggml_type t0, const ggml_type t1) {
     auto tb = [](const ggml_type t) -> size_t { return t == GGML_TYPE_IQ3_S ? 32768 : t == GGML_TYPE_IQ3_XXS ? 16384 : 0; };
     return tb(t0) + (t1 != t0 ? tb(t1) : 0);
 }
-// a K phase of 8 chunks (16 items: every item lane busy) fits next to the tables
-static inline bool iq3mf_fit8(const ggml_type t0, const ggml_type t1, const int nc) {
-    const size_t cs = (size_t) nc*144 + (nc % 2 == 0 ? 16 : 0);
+// a K phase of 8 chunks (16 items: every item lane busy) fits next to the tables; mf2: sized with the chunk stride of
+// the second form (iq3gemv-mf2.cuh cs2(): records plus 4*CG d slots of 16 B, odd multiple of 16 B), else the first's
+static inline bool iq3mf_fit8(const ggml_type t0, const ggml_type t1, const int nc, const bool mf2 = false) {
+    const size_t b2 = (size_t) nc*144 + 64*(size_t) ((nc + 3)/4);
+    const size_t cs = mf2 ? ((b2/16) % 2 == 0 ? b2 + 16 : b2) : (size_t) nc*144 + (nc % 2 == 0 ? 16 : 0);
     return iq3mf_tab_bytes(t0, t1) + 8*cs <= 65536;
 }
 #endif

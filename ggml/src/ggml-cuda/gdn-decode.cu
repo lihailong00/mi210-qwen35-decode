@@ -720,7 +720,10 @@ static __device__ __forceinline__ int gdn_diet_isum32(int v) {
 }
 
 // == gdn_decode_prep_f32<nv_bfloat16> for the shapes above; cs_dst = conv state row dst_row
-template <bool warm>
+// early (N1, GGML_GDN_PREP_EARLY=0 disables): dt_bias[h] and a[h] are loaded together with the projection rows instead
+// of after the reduction barrier, and the beta gate (sigmoid) runs in wave 2 while wave 0 runs the alpha gate chain,
+// instead of both in thread 0 one after the other (same operations on the same values: bit-identical)
+template <bool warm, bool early = false>
 static __global__ void __launch_bounds__(2*GDN_DEC_MMV_BLOCK)
 gdn_decode_prep_diet(
         const float       * __restrict__ qkv,
@@ -806,6 +809,14 @@ gdn_decode_prep_diet(
     const float2      * x2 = (const float2 *) x;
 
     if constexpr (!warm) {
+        float dt_e = 0.0f;
+        float a_e  = 0.0f;
+        if constexpr (early) {
+            if (half == 0) {
+                dt_e = dt_bias[h];
+                a_e  = a[h];
+            }
+        }
         float2 wv[nb];
         float2 xv[nb];
 #pragma unroll
@@ -826,6 +837,17 @@ gdn_decode_prep_diet(
         }
         __syncthreads();
 
+        if constexpr (early) {
+            if (tid == 0) {
+                const float alpha = (s_red[0] + s_red[1]) + dt_e;
+                const float gate  = gdn_dec_softplus(alpha) * a_e;
+                out[2*HK*S + h] = expf(gate);
+                ((unsigned int *) (out + 2*HK*S + 2*HV))[h] = 0u;
+            } else if (tid == 2*64) {
+                out[2*HK*S + HV + h] = gdn_dec_sigmoid(s_red[2] + s_red[3]);
+            }
+            return;
+        }
         if (tid == 0) {
             const float alpha = (s_red[0] + s_red[1]) + dt_bias[h];
             const float gate  = gdn_dec_softplus(alpha) * a[h];
@@ -2231,7 +2253,12 @@ void ggml_cuda_op_gdn_decode_prep(ggml_backend_cuda_context & ctx, ggml_tensor *
     if (gdn_dec_diet_enabled() && H_k == GDN_DIET_HK && H_v == GDN_DIET_HV && w_alpha->type == GGML_TYPE_BF16 &&
             ncols2 == GDN_DIET_NCOL2 && w_row_stride == 2*GDN_DIET_NCOL2 &&
             ggml_cuda_info().devices[ctx.device].warp_size == 64) {
-        auto * kernel = gdn_dec_diet_level() == 1 ? gdn_decode_prep_diet<false> : gdn_decode_prep_diet<true>;
+        static const bool early = [] {
+            const char * e = getenv("GGML_GDN_PREP_EARLY");
+            return e == nullptr || e[0] != '0';
+        }();
+        auto * kernel = gdn_dec_diet_level() == 1 ? (early ? gdn_decode_prep_diet<false, true> : gdn_decode_prep_diet<false>) :
+                                                    gdn_decode_prep_diet<true>;
         kernel<<<grid, block, 0, stream>>>(
             (const float *) qkv->data, (const float *) x->data,
             (const nv_bfloat16 *) w_alpha->data, (const nv_bfloat16 *) w_beta->data,

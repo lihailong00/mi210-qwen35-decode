@@ -961,7 +961,7 @@ bool ggml_cuda_mmvq_iq3_nc(ggml_backend_cuda_context & ctx, const ggml_tensor * 
     a.ncols = ncols;
     a.ncu   = ggml_cuda_info().devices[device].nsm;
     ggml_cuda_pool_alloc<float> gsc(ctx.pool());   // MFMA form, split gate / up: gate results
-    if (gate && iq3mf_use(ncols) && iq3mf_glu_split(a.ta, a.tb, ncols)) {
+    if (gate && iq3mf_use_shape(ncols, a.N, a.K) && iq3mf_glu_split(a.ta, a.tb, ncols)) {
         a.gsc = gsc.alloc((size_t) a.N*ncols);
     }
 

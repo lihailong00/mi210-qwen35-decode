@@ -55,12 +55,57 @@ static __device__ __forceinline__ int fdec_q8_round_div(const float v, const flo
 // instruction on the critical path costs ~13 ns of code fetch (measured: a fully unrolled first version with ~4700
 // instructions took ~65 us, early-exit ablations of a ~1900-instruction version showed ~10 us for the combine and ~7 us
 // for the q8 epilogue). So: rolled loops everywhere except for the batched loads, few serial cross-lane reductions.
+// N1: exact 32-lane max / int sum with DPP and one ds_swizzle (aligned groups of 32 lanes)
+template <int ctrl>
+static __device__ __forceinline__ int fdec_dpp_i(const int v) {
+    return __builtin_amdgcn_update_dpp(0, v, ctrl, 0xF, 0xF, false);
+}
+static __device__ __forceinline__ float fdec_max32(float v) {
+    v = fmaxf(v, __int_as_float(fdec_dpp_i<0xB1>(__float_as_int(v))));  // xor 1
+    v = fmaxf(v, __int_as_float(fdec_dpp_i<0x4E>(__float_as_int(v))));  // xor 2
+    v = fmaxf(v, __int_as_float(fdec_dpp_i<0x141>(__float_as_int(v)))); // row_half_mirror: the other quad of the 8
+    v = fmaxf(v, __int_as_float(fdec_dpp_i<0x140>(__float_as_int(v)))); // row_mirror: the other 8 of the row
+    v = fmaxf(v, __int_as_float(__builtin_amdgcn_ds_swizzle(__float_as_int(v), 0x401F))); // xor 16
+    return v;
+}
+static __device__ __forceinline__ int fdec_isum32(int v) {
+    v += fdec_dpp_i<0xB1>(v);
+    v += fdec_dpp_i<0x4E>(v);
+    v += fdec_dpp_i<0x141>(v);
+    v += fdec_dpp_i<0x140>(v);
+    v += __builtin_amdgcn_ds_swizzle(v, 0x401F);
+    return v;
+}
+// correctly rounded x / b for a constant b with r = 1/b (checked equal to the IEEE quotient for all 2^32 inputs on
+// gfx90a for b = 127 except x = -0, which cannot occur: amax >= +0; infinities keep x*r)
+static __device__ __forceinline__ float fdec_div_const(const float x, const float b, const float r) {
+    const float q0 = x * r;
+    const float e  = fmaf(-q0, b, x);
+    const float q  = fmaf(e, r, q0);
+    return e == e ? q : q0;
+}
+// (int) roundf(v / d) for |v| <= 127 d: rintf(v * rcp(d)) when the product is more than 4e-5 from a half-integer (its
+// error is below 2.8e-5), else the IEEE formula (also for NaN products and denormal d)
+static __device__ __forceinline__ int fdec_q8_fast(const float v, const float d) {
+    const float t = v * __builtin_amdgcn_rcpf(d);
+    const float m = fabsf(__builtin_amdgcn_fractf(fabsf(t)) - 0.5f);
+    if (m > 4.0e-5f && d >= 1.17549435e-38f) {
+        return (int) rintf(t);
+    }
+    return (int) roundf(v / d);
+}
 #define FDEC_MAX_SPLIT 8
 #define FDEC_MAX_KVH   32 // counters: [0, 32) arrivals, [32, 64) departures
 // MTP2-O2: the N-query kernel's arrival counters follow these 64 in the same allocation
 #define FDEC_NQ_MAX 16
 #define FDEC_NQ_COUNTERS (FDEC_MAX_KVH*FDEC_NQ_MAX)
-template <int D, int G, int S>
+// UNR (N1, GGML_CUDA_FA_DEC_UNROLL=0 disables), all bit-identical:
+//  - the score dot products and the P*V loop are unrolled 4x (rolled: 1x / 2x), so that 4 iterations of LDS loads are
+//    in flight per wait (same statements in the same order);
+//  - the chunk max and the q8_1 max / int sum use DPP / ds_swizzle instead of ds_bpermute (exact in any order);
+//  - q8_1: d = amax / 127 by the exhaustively checked fma-corrected product, roundf(r / d) as rintf(r * rcp(d))
+//    away from half-integers (see fdec_q8_fast), as in q8-producers.cu.
+template <int D, int G, int S, bool UNR = false>
 __launch_bounds__(FDEC_NT, 1)
 static __global__ void fattn_dec_gate_kernel(
         const float * __restrict__ Q, const char * __restrict__ K, const char * __restrict__ V,
@@ -160,7 +205,7 @@ static __global__ void fattn_dec_gate_kernel(
             const half  * kp = s_k + sr*KST;
             const float * qp = s_q + sg*D;
             float a = 0.0f;
-#pragma unroll 1
+#pragma unroll (UNR ? 4 : 1)
             for (int d = 0; d < D; d += 8) {
                 const uint4  k4 = *(const uint4 *) (kp + d);
                 const float4 q0 = *(const float4 *) (qp + d);
@@ -176,7 +221,12 @@ static __global__ void fattn_dec_gate_kernel(
                 a = fmaf(q1.z, k3.x, a); a = fmaf(q1.w, k3.y, a);
             }
             const float sc = mrow == -INFINITY ? -INFINITY : fmaf(a, scale, mrow);
-            const float mc = warp_reduce_max<S>(sc);
+            float mc;
+            if constexpr (UNR && S == 32) {
+                mc = fdec_max32(sc);
+            } else {
+                mc = warp_reduce_max<S>(sc);
+            }
             const float mn = fmaxf(s_m[par][sg], mc);
             s_p[sg][sr] = sc == -INFINITY ? 0.0f : __expf(sc - mn);
             if (sr == 0) {
@@ -195,7 +245,7 @@ static __global__ void fattn_dec_gate_kernel(
             acc[i].y *= al;
             lsum[i]  *= al;
         }
-#pragma unroll 2
+#pragma unroll (UNR ? 4 : 2)
         for (int r = 0; r < S; ++r) {
             const float2 v = __half22float2(((const half2 *) s_v)[r*(D/2) + dp]);
 #pragma unroll
@@ -280,10 +330,21 @@ static __global__ void fattn_dec_gate_kernel(
         if (dbg == 4) { return; }
 
         if (q8 != nullptr) {
-            const float amax = warp_reduce_max<QK8_1>(fabsf(r));
-            const float d    = amax / 127.0f;
-            const int   qv   = amax == 0.0f ? 0 : (int) roundf(r / d);
-            const int   sum  = warp_reduce_sum<QK8_1>(qv);
+            float amax;
+            float d;
+            int   qv;
+            int   sum;
+            if constexpr (UNR) {
+                amax = fdec_max32(fabsf(r));
+                d    = fdec_div_const(amax, 127.0f, 1.0f/127.0f);
+                qv   = amax == 0.0f ? 0 : fdec_q8_fast(r, d);
+                sum  = fdec_isum32(qv);
+            } else {
+                amax = warp_reduce_max<QK8_1>(fabsf(r));
+                d    = amax / 127.0f;
+                qv   = amax == 0.0f ? 0 : (int) roundf(r / d);
+                sum  = warp_reduce_sum<QK8_1>(qv);
+            }
             q8[j/QK8_1].qs[j%QK8_1] = (int8_t) qv;
             if (j % QK8_1 == 0) {
                 q8[j/QK8_1].ds = make_half2(d, d * sum);
@@ -328,6 +389,8 @@ static int fdec_env_int(const char * name, const int def) {
     return e ? atoi(e) : def;
 }
 
+static int fdec_unr_force = -1; // GGML_CUDA_FA_DEC_VERIFY: the reference launch forces the previous kernel
+
 template <int G, int S>
 static void fdec_launch(ggml_backend_cuda_context & ctx, const dim3 grid,
         const float * Q, const char * K, const char * V, const half * mask, float * parts, float2 * meta, int * counters,
@@ -335,7 +398,10 @@ static void fdec_launch(ggml_backend_cuda_context & ctx, const dim3 grid,
         const float scale, const int n_chunks, const int cpb,
         const int nbq2, const int nb11, const int nb12, const int nb21, const int nb22) {
     static const int dbg = fdec_env_int("GGML_CUDA_FA_DEC_DBG", 0); // timing ablations only (wrong results if != 0)
-    fattn_dec_gate_kernel<256, G, S><<<grid, FDEC_NT, 0, ctx.stream()>>>(
+    static const int unr = fdec_env_int("GGML_CUDA_FA_DEC_UNROLL", 1);
+    const bool use_unr = fdec_unr_force >= 0 ? fdec_unr_force != 0 : unr != 0;
+    auto * kernel = use_unr ? fattn_dec_gate_kernel<256, G, S, true> : fattn_dec_gate_kernel<256, G, S, false>;
+    kernel<<<grid, FDEC_NT, 0, ctx.stream()>>>(
         Q, K, V, mask, parts, meta, counters, gate, gated, q8, q8_sums, scale, n_chunks, cpb, nbq2, nb11, nb12, nb21, nb22, dbg);
 }
 
@@ -444,6 +510,21 @@ bool ggml_cuda_fattn_dec_gate(ggml_backend_cuda_context & ctx, const ggml_tensor
     const half  * Md = (const half *) mask->data; // row 0 = the single query
     float       * gated = (float *) mul_node->data;
 
+    // GGML_CUDA_FA_DEC_VERIFY=<n> (debug, N1): the first n launches outside graph capture are repeated with the previous
+    // kernel (GGML_CUDA_FA_DEC_UNROLL=0) into scratch buffers and compared bit for bit (gated output, q8_1, sums)
+    static int verify_left = fdec_env_int("GGML_CUDA_FA_DEC_VERIFY", 0);
+    bool verify = false;
+    if (verify_left > 0) {
+        hipStreamCaptureStatus status;
+        CUDA_CHECK(hipStreamIsCapturing(ctx.stream(), &status));
+        verify = status == hipStreamCaptureStatusNone;
+    }
+    const int64_t n_out = ggml_nelements(mul_node);
+    ggml_cuda_pool_alloc<float> gate_copy(pool, verify ? n_out : 1);
+    if (verify) {
+        CUDA_CHECK(cudaMemcpyAsync(gate_copy.ptr, gate, n_out*sizeof(float), cudaMemcpyDeviceToDevice, ctx.stream()));
+    }
+
     bool ok = false;
     switch (S) {
         case 16: ok = fdec_launch_g<16>(ctx, G, grid, Qd, Kd, Vd, Md, parts.ptr, meta.ptr, counters, gate, gated, q8, q8_sums,
@@ -453,6 +534,44 @@ bool ggml_cuda_fattn_dec_gate(ggml_backend_cuda_context & ctx, const ggml_tensor
         default: break;
     }
     CUDA_CHECK(cudaGetLastError());
+
+    if (ok && verify) {
+        {
+            verify_left--;
+            const float * gate = gate_copy.ptr;
+            const int64_t n  = n_out;
+            const int64_t nb = n / QK8_1;
+            ggml_cuda_pool_alloc<float>      rg(pool, n);
+            ggml_cuda_pool_alloc<block_q8_1> rq(pool, nb);
+            ggml_cuda_pool_alloc<int>        rs(pool, nb);
+            fdec_unr_force = 0;
+            if (S == 16) {
+                fdec_launch_g<16>(ctx, G, grid, Qd, Kd, Vd, Md, parts.ptr, meta.ptr, counters, gate, rg.ptr, q8 ? rq.ptr : nullptr, rs.ptr,
+                    scale, n_chunks, cpb, (int) Q->nb[2], (int) K->nb[1], (int) K->nb[2], (int) V->nb[1], (int) V->nb[2]);
+            } else {
+                fdec_launch_g<32>(ctx, G, grid, Qd, Kd, Vd, Md, parts.ptr, meta.ptr, counters, gate, rg.ptr, q8 ? rq.ptr : nullptr, rs.ptr,
+                    scale, n_chunks, cpb, (int) Q->nb[2], (int) K->nb[1], (int) K->nb[2], (int) V->nb[1], (int) V->nb[2]);
+            }
+            fdec_unr_force = -1;
+            CUDA_CHECK(cudaGetLastError());
+            std::vector<float> a(n), b(n);
+            std::vector<block_q8_1> qa(nb), qb(nb);
+            std::vector<int> sa(nb), sb(nb);
+            CUDA_CHECK(cudaMemcpyAsync(a.data(), gated, n*sizeof(float), cudaMemcpyDeviceToHost, ctx.stream()));
+            CUDA_CHECK(cudaMemcpyAsync(b.data(), rg.ptr, n*sizeof(float), cudaMemcpyDeviceToHost, ctx.stream()));
+            if (q8) {
+                CUDA_CHECK(cudaMemcpyAsync(qa.data(), q8, nb*sizeof(block_q8_1), cudaMemcpyDeviceToHost, ctx.stream()));
+                CUDA_CHECK(cudaMemcpyAsync(qb.data(), rq.ptr, nb*sizeof(block_q8_1), cudaMemcpyDeviceToHost, ctx.stream()));
+                CUDA_CHECK(cudaMemcpyAsync(sa.data(), q8_sums, nb*sizeof(int), cudaMemcpyDeviceToHost, ctx.stream()));
+                CUDA_CHECK(cudaMemcpyAsync(sb.data(), rs.ptr, nb*sizeof(int), cudaMemcpyDeviceToHost, ctx.stream()));
+            }
+            CUDA_CHECK(cudaStreamSynchronize(ctx.stream()));
+            const bool dg = memcmp(a.data(), b.data(), n*sizeof(float)) != 0;
+            const bool dq = q8 && (memcmp(qa.data(), qb.data(), nb*sizeof(block_q8_1)) != 0 || memcmp(sa.data(), sb.data(), nb*sizeof(int)) != 0);
+            fprintf(stderr, "fa_dec verify n_kv=%d: gated %s q8 %s%s\n", n_chunks*S, dg ? "DIFF" : "ok", q8 ? (dq ? "DIFF" : "ok") : "-",
+                    dg || dq ? " MISMATCH" : "");
+        }
+    }
     return ok;
 }
 

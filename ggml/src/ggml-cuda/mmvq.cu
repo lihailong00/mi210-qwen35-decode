@@ -1996,6 +1996,8 @@ static bool ggml_cuda_mmvq_nc_type(const ggml_type t) {
         case GGML_TYPE_IQ4_XS: case GGML_TYPE_Q4_K:                                           // B
         case GGML_TYPE_IQ2_S: case GGML_TYPE_IQ2_XS: case GGML_TYPE_IQ2_XXS: case GGML_TYPE_Q2_K: case GGML_TYPE_IQ1_M:   // C
             return true;
+        case GGML_TYPE_Q6_K:   // Q6K (mmvq-q6k.cu): only with its N-column path on, else the previous pool path exactly
+            return ggml_cuda_mmvq_q6k_nc_enabled();
         default:
             return false;
     }
@@ -2134,6 +2136,7 @@ void ggml_cuda_mul_mat_vec_q(
     if (!ids && ne11 == 1 && ggml_backend_buffer_get_usage(src0->buffer) != GGML_BACKEND_BUFFER_USAGE_COMPUTE &&
             (src0->type != GGML_TYPE_Q4_K || mmvq_q8_cache_disabled()) &&
             !ggml_cuda_mmvq_iq4k_wants(src0) &&
+            !ggml_cuda_mmvq_q6k_wants(src0) &&   // Q6K: the q6k SoA path below
             ggml_cuda_mmvq_fused(ctx, src0, src1, dst, fusion)) {
         return;
     }
@@ -2189,6 +2192,9 @@ void ggml_cuda_mul_mat_vec_q(
         if (ggml_cuda_mmvq_iq4k_nc_checked(ctx, src0, src1, src1_q8_1_ptr, (int) ne11, dst, fusion)) {   // MMVQ-NC B (slot 3)
             return;
         }
+        if (ggml_cuda_mmvq_q6k_nc(ctx, src0, src1_q8_1_ptr, (int) ne11, dst, fusion)) {   // Q6K: unfused only
+            return;
+        }
         if (fusion) {
             GGML_ABORT("MMVQ-NC: fused N-column GEMV (%s, ncols %d) not taken", ggml_type_name(src0->type), (int) ne11);
         }
@@ -2213,6 +2219,10 @@ void ggml_cuda_mul_mat_vec_q(
     }
     if (!ids && ne11 == 1 && ne12 == 1 && ne13 == 1 &&
             ggml_cuda_mmvq_iq4k(ctx, src0, src1_q8_1_ptr, dst, fusion)) {
+        return;
+    }
+    if (!ids && ne11 == 1 && ne12 == 1 && ne13 == 1 &&
+            ggml_cuda_mmvq_q6k(ctx, src0, src1_q8_1_ptr, dst, fusion)) {   // Q6K: MTP draft layer
         return;
     }
     if (!ids && ne11 == 1 && ne12 == 1 && ne13 == 1 && use_q8_cache &&
