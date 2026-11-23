@@ -66,9 +66,49 @@ decode 只到上限的约 15%。
 - 在 MI210 上 DSpark 几乎没有收益：n_max 3 时每步平均接受约 2.3 个 token，但一步验证 + 起草的耗时约为单 token decode 的 2.6 倍。原因很可能是 MoE：4 个 token 在每层最多会选到 32 个不同的专家，验证时读的专家权重接近单 token 的 4 倍，而不像稠密模型那样几乎不变。
 - **开 DSpark 后贪心输出与不开不同**：6 个提示里 0–1 个相同，在第 100–600 个字符处开始分叉。Unsloth 的文档也说明不保证相同。这和 Qwen3.8-27B 的 MTP（逐字节相同）标准不一样，优化时要先弄清分叉来自批量验证的数值差（不同 kernel、不同归约顺序）还是实现问题。
 
+## decode 剖析（基线）
+
+测量：rocprofv3 kernel trace，`llama-bench -p 0 -n 48`，取最后 20 个 token（以 LM head 为分界）。rocprofv3 会把小 kernel 拉长到约 4.4 µs、并让 graph 回放变成 CPU 受限，所以下面小 kernel 的时间偏大，大 kernel 的时间基本可信。真实 decode 是 33.1 token/s（30.2 ms/token）。
+
+- **每 token 约 7240 次 kernel 启动**，平均每次层计算约 150 次（Qwen3.8-27B 优化后整个 token 只有 601 次）。graph 节点 12658 个。
+- **HIP graph 是开着的**，每个 token 复用同一个 graph；关掉后掉到 27.4 token/s。注意：`GGML_CUDA_DISABLE_GRAPHS` 只看是否设置，设成 0 也会关掉 graph（`ggml-cuda/graph.cuh:66`），做 A/B 时不能用 `=0` 当"开"。
+- 每次层计算的小算子（次数/层计算）：二元运算 add/mul/sub/div 31，scale 15，一元运算 12，concat 12，各种 copy 约 11，rms_norm 9，以及 sum_rows、fill、clamp、pad、get_rows、set_rows、memcpy 等各 1–4 次。来源（`src/models/inkling2.cpp`）：
+  - `clip()`：Q、K、相对位置向量 R 各一次，每次 9 个 kernel（mul、sqr、sum_rows、sqrt、scale_bias、fill、div、clamp、mul），共 27 个。
+  - `control()`：循环第 2、3 遍时 q/k/v/mlp 各一次，每次 concat + rms_norm + 3 个秩 64 的小 GEMV + 2 个 tanh + scale_bias + 2 个 mul + add。
+  - `mix()`（按深度的注意力残差）：每层 2 次，循环第 2、3 遍再加 2 次；每次对已有的每个 block 各做一次 concat，再 rms_norm、repeat、两个小 mul_mat、softmax、转置 copy。
+  - `convolve()`：k、v、注意力输出、FFN 输出各一次短卷积，每次 transpose/concat/状态写回/ssm_conv/add/scale；全注意力层的 k、v 还有 4 个动态 tap，每个 cont + mul + add。
+  - 注意力的 dense 路径（decode 时 n_tokens ≤ 32 都走这里）：每次都对相对位置偏置权重做一次 pad，再 mul_mat、sub、permute copy、fill、get_rows、permute copy，再进 FA。
+- 大 kernel 的带宽（读取量 / 实测时间）：
+
+| kernel | 每 token | 带宽 | 说明 |
+| --- | --- | --- | --- |
+| NVFP4 专家 GEMV（`mul_mat_vec_q`，88 次） | 3.65 ms | 约 0.43 TB/s | 每次 8 个专家；上限约 1.3 TB/s |
+| BF16 q / gate（3072×2304，96 次） | 1.57 ms | 0.87 TB/s | |
+| BF16 o（2304×3072，48 次） | 0.84 ms | 0.81 TB/s | |
+| BF16 k / v（1024×2304，96 次） | 0.80 ms | 0.57 TB/s | |
+| BF16 rel（384×2304）、sink（24×2304） | 0.66 ms | 0.24 TB/s 以下 | 纯延迟 |
+| BF16 专家（第 20–23 层，8 次） | 0.50 ms | 0.68 TB/s | |
+| 循环控制的秩 64 GEMV（64×4608 等，约 290 次） | 约 1.9 ms | — | 纯延迟 |
+| LM head（BF16） | 0.75 ms | 1.24 TB/s | 正常 |
+| flash attention（vec + combine，上下文接近 0） | 1.1 ms | — | 18.6 µs/次，按 1536/2048 的 KV 长度带 mask 扫描 |
+| `topk_moe` | 0.66 ms | — | 13.6 µs/次 |
+| mix 的 softmax | 1.0 ms | — | |
+
+- 粗略时间分配（30.2 ms）：大 GEMV 约 11 ms（按带宽算本该约 4.5 ms），约 6000 个小 kernel 约 12–15 ms，注意力、路由和其余约 4 ms。
+
+**优化空间估计**（尚未实现，数字是估算）：
+
+| 方向 | 预计节省 |
+| --- | --- |
+| 小算子融合：clip、control、mix、convolve、注意力的偏置准备各写成一个 kernel，或并进相邻 GEMV 的前后处理；目标每次层计算 25–35 个 kernel | 8–12 ms |
+| NVFP4 专家 GEMV 提到约 1.1 TB/s（参照 Qwen 线上 IQ/Q4_K GEMV 的做法） | 约 2 ms |
+| BF16 GEMV 提到约 1.2 TB/s；同一输入的 q、gate、rel、sink 合成一次 GEMV | 约 2 ms |
+| 小 GEMV、topk、FA 的延迟 | 约 2 ms |
+
+合计约 14–18 ms，即 decode 约 60–80 token/s（现 33）。带宽上限 205–240 token/s 离得还远，主要因为 48 次层计算本身就带来大量必须的 GEMV 启动。多 token 验证的效率提高后，DSpark 才可能有明显收益。
+
 ## 下一步方向
 
-1. 剖析单 token decode（33 token/s ≈ 30 ms/token，而读权重只需约 4–5 ms），先找出与带宽无关的大头：48 次层计算的 kernel 启动数、MoE 路由与 `mul_mat_id`、相对位置偏置注意力、短卷积、循环门等小算子。
-2. NVFP4 / BF16 的 decode GEMV 与 MoE 专家 GEMV。
-3. 多 token 验证时的专家去重与分组，决定 DSpark 能否变成正收益。
-4. 先把 inkling2 架构移植进本仓库的源码树，或者把本仓库的通用优化移植到 Unsloth 合并版上；二选一需要先评估改动量。
+1. 按上面"优化空间估计"的顺序做：先小算子融合，再 NVFP4 / BF16 GEMV。
+2. 多 token 验证时的专家去重与分组，决定 DSpark 能否变成正收益。
+3. 先把 inkling2 架构移植进本仓库的源码树，或者把本仓库的通用优化移植到 Unsloth 合并版上；二选一需要先评估改动量。
