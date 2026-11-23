@@ -2,6 +2,8 @@
 
 2026-11-14
 
+> 本文是 Qwen3.8-27B 的完整工作记录（原 `docs/HANDOVER.md`，章节编号不变），后面各节按时间陆续追加到 2026-11-20。其中与模型无关的硬件事实和方法已整理到 [docs/mi210/](../../mi210/hardware.md)，各项优化的适用范围见 [docs/kernels/](../../kernels/README.md)，本模型的概览见 [README.md](README.md)。
+
 ## 一、背景、目标与最终结果
 
 单流 decode（不开 MTP）从 45.6 提升到 80.3 token/s，提升 76%；目标 90 token/s 未达到，还差每 token 约 1.35 ms。
@@ -897,7 +899,7 @@ llama-server，5 个 prompt（写代码、写故事、JSON 各 384 token，改�
 
 ## 十四、vLLM 部署：官方 FP8 checkpoint 的单流 decode 与 MTP
 
-前面各节针对 llama.cpp 和 IQ3_S GGUF。这一节是另一条线：用 vLLM 跑官方的 Qwen3.8-27B-FP8 checkpoint（自带 MTP 层），不重新量化，只做无损的权重重排。代码在本仓库的 `vllm-opt/` 目录，说明见 [vllm-opt/README.md](../vllm-opt/README.md)。运行环境是 vLLM 镜像 `2e7da1ad1c66`（vllm 0.30.0+rocm723）和单卡 MI210。镜像本身不做任何修改：插件目录以只读方式挂载，通过 `PYTHONPATH` 和 `usercustomize.py` 的 post-import hook 给 vLLM 打补丁；HIP 扩展用 `torch.utils.cpp_extension` 编译。
+前面各节针对 llama.cpp 和 IQ3_S GGUF。这一节是另一条线：用 vLLM 跑官方的 Qwen3.8-27B-FP8 checkpoint（自带 MTP 层），不重新量化，只做无损的权重重排。代码在本仓库的 `vllm-opt/` 目录，说明见 [vllm-opt/README.md](../../../vllm-opt/README.md)。运行环境是 vLLM 镜像 `2e7da1ad1c66`（vllm 0.30.0+rocm723）和单卡 MI210。镜像本身不做任何修改：插件目录以只读方式挂载，通过 `PYTHONPATH` 和 `usercustomize.py` 的 post-import hook 给 vLLM 打补丁；HIP 扩展用 `torch.utils.cpp_extension` 编译。
 
 ### 1. 上限与原版的瓶颈
 

@@ -1,30 +1,31 @@
-# mi210-qwen35-decode
+# MI210 LLM 推理优化
 
-在单张 AMD Instinct MI210（gfx90a，ROCm 7.2.1）上，把 llama.cpp b12110 跑 Qwen3.8-27B-GSQ-RCO-IQ3_S-mtp.gguf（架构 qwen35）的单流解码（不开 MTP）从 **45.6 提升到 80.3 token/s（+76%）**。同一个 GGUF，没有重新量化或降精度；与基线 logits 的 KL 散度处在纯计算重排的噪声底线上。
+在 AMD Instinct MI210（gfx90a / CDNA2，64 GB HBM2e，ROCm 7.2.1）上优化大模型推理，目标是在**不重新量化、不降精度**的前提下逼近这张卡的硬件上限。主体是 llama.cpp 的 HIP 后端（本仓库的源码树），另有一个给 vLLM 打补丁的插件目录 [vllm-opt/](vllm-opt/README.md)。
 
-| 指标 | 基线（保留版） | 本仓库 | 变化 |
-| --- | --- | --- | --- |
-| decode tg128，上下文 0 | 45.6 token/s | 80.3 token/s | +76% |
-| decode tg128，上下文 8192 | 44.2 | 74.6 | +69% |
-| decode tg128，上下文 32768 | 40.7 | 64.4 | +58% |
-| prefill pp512 / pp2048 / pp8192 | 893 / 1099 / 1220 | 1612 / 2074 / 2125 | +81% / +89% / +74% |
-| llama-server 单请求 | 45.6 | 79.1 | +73% |
-| 每 token kernel 启动数 | 1933 | 601 | −69% |
-| 显存峰值 | 24.1 GB | 28–32 GB | 重排权重副本 |
+## 结果
 
-prefill 的提升来自两处：让 rocBLAS 在 CDNA2 上默认使用 hipBLASLt 后端（rocBLAS 自带选核对 ffn_down 形状只跑到 47 TFLOPS），更快的权重反量化启动方式、逐形状的 GEMM 选核（后来改为按精确形状和 token 数固定的 kernel 表，并把 FFN 的 gate 与 up 合成一个 GEMM），为 wave64 重写、后来又拆成并行预处理加波分工串行两段的 fp32 MFMA DeltaNet kernel，flash attention 的装载预取和 GQA 6 分发修正，以及四项小算子融合（卷积输入、SwiGLU 直接写 f16、f16 副本共享、残差加法并入 GEMM）；本机实测的 decode / prefill 上限约 124 / 2980 token/s（prefill 受 300 W 功耗上限限制），见交接文档第十三节。
+| 模型 | 后端 / 权重 | 单流 decode（基线 → 现在） | 投机解码（MTP） | prefill pp8192 | 上限（decode / prefill） | 文档 |
+| --- | --- | --- | --- | --- | --- | --- |
+| Qwen3.8-27B | llama.cpp，IQ3_S GGUF | 45.6 → **80.3** token/s | K=3 约 **155** token/s，输出与不开逐字节相同 | 1220 → **2125** token/s | 124 / 约 2980 | [qwen3.8-27b](docs/models/qwen3.8-27b/README.md) |
+| Qwen3.8-27B | vLLM，官方 FP8 | 9.9 → **42** token/s | K=3 **106–122** token/s，输出与 MTP=0 逐字节相同 | — | 约 53 / — | [qwen3.8-27b](docs/models/qwen3.8-27b/README.md)、[vllm-opt](vllm-opt/README.md) |
 
-原定目标 90 token/s 未达到：逐节点复核显示，在同一 GGUF、不损失精度、不用 MTP 的约束下 decode 现实可达约 84–86 token/s（交接文档第十三节第 14 小节），因此没有继续；越过 90 要靠 MTP / 投机解码：用模型自带的 MTP 头（`llama-server --spec-type draft-mtp --spec-draft-n-max 3`），配合新的多 token 验证 kernel，单请求 decode 约 155 token/s（JSON、改代码类输出约 180），输出与不开投机逐字节相同，见交接文档第十三节第 15–17 小节。原因分析、全部优化细节、失败的尝试和后续方向见 [docs/HANDOVER.md](docs/HANDOVER.md)。
+正确性的标准是：非位精确的改动与基线 logits 的 KL 散度处在纯计算重排的噪声底线上；融合、多列 kernel 和投机解码要求逐位 / 逐字节相同。方法见 [docs/mi210/method.md](docs/mi210/method.md)。
 
-另一条线是用 **vLLM 跑官方 Qwen3.8-27B-FP8 checkpoint**（不重新量化，代码在 [vllm-opt/](vllm-opt/README.md)）：单流 decode 从原版的 9.9 提升到 **42 token/s**（字节上限约 53）；开模型自带的 MTP（K=3）后为 **106–122 token/s**（5 个测试提示平均 122，新提示 106–112），输出与不开 MTP 逐字节相同（贪心）；不开 MTP 时并发 64 路约 124 token/s。见交接文档第十四节。
+## 文档
 
-## 分支与标签
+| 文档 | 内容 |
+| --- | --- |
+| [docs/mi210/hardware.md](docs/mi210/hardware.md) | MI210 的实测峰值、性能模型、kernel 启动与 graph、冷指令缓存、内存系统、调度、ISA、数学库、测量工具的失真 |
+| [docs/mi210/method.md](docs/mi210/method.md) | 优化流程、测量与 A/B 协议、正确性标尺（KLD 噪声底线、位精确检查）、工程约定、共享 GPU 规则、**新模型上手清单** |
+| [docs/kernels/README.md](docs/kernels/README.md) | 已有的每项优化：触发条件、是否与模型无关、文件、开关 |
+| [docs/models/](docs/models/README.md) | 每个模型的概览、上限、结果和完整工作记录；新增模型的步骤 |
 
-- `main`：最终版本的代码（= 标签 `mi210-final`）加本说明、交接文档和实验脚本。
-- `baseline`：对照基线，即 llama.cpp b12110（提交 cd959bae）+ ROCm 7.2 兼容补丁 + IQ3_S/IQ3_XXS 4-bit 展开补丁（"保留版"）。`git diff baseline main` 就是全部优化。
-- 标签 `int-v8-base`（74.0 token/s）、`int-v9`（76.0）、`int-v11`（78.0）、`mi210-final`（80.3）为中间集成节点。
+## 适用范围
 
-本仓库没有 llama.cpp 的上游提交历史；基线是一次性导入的源码快照。
+- 所有改动都针对 HIP / CDNA2（gfx90a），其他 GPU 走 llama.cpp 原来的代码路径。CUDA/MUSA 构建的修复只做过 clang 语法检查。
+- 按量化类型写的 decode GEMV（IQ3_S/IQ3_XXS、IQ4_XS/Q4_K、IQ2/IQ1/Q2_K、Q6_K）、q8 激活缓存与生产者、反量化、hipBLASLt 默认开启、多数 prefill 小算子融合，对任何模型都会生效。
+- 一部分优化是按 Qwen3.8-27B 的形状或计算图写的（头维 256 的 FA decode、GQA 6 的分发、5120 列的定形 norm、GEMM 固定表、融合 DeltaNet 解码等），其他模型会自动回退到原路径。逐项列表见 [docs/kernels/README.md](docs/kernels/README.md)。
+- decode 优化覆盖单序列、1–16 个 token（单 token 与投机验证）；多序列批次走原路径。
 
 ## 编译
 
@@ -42,38 +43,27 @@ cmake -S . -B build -G Ninja \
 cmake --build build --target ggml-hip llama-bench llama-perplexity llama-completion llama-server --parallel 16
 ```
 
-HIP 源文件在 configure 时按通配符收集：新增 `.cu` 文件后必须重新运行 cmake，否则 libggml-hip.so 加载失败（报 `invalid device: ROCm0`）。
+HIP 源文件在 configure 时按通配符收集：新增 `.cu` 文件后必须重新运行 cmake，否则 libggml-hip.so 加载失败（报 `invalid device: ROCm0`，或者悄悄只用 CPU）。
 
 ## 运行
 
-所有测量都在下面的环境变量下进行（基线补丁的开关；新的 IQ3 路径优先，旧路径作为回退）：
+用法与上游 llama.cpp 相同。每项优化都有环境变量开关（默认开，设 0 关闭），列表见 [docs/kernels/README.md](docs/kernels/README.md)。
 
 ```bash
-export CODEX_IQ3_PREPACK=1 CODEX_IQ3_XXS_PREPACK=1
-./build/bin/llama-bench -m Qwen3.8-27B-GSQ-RCO-IQ3_S-mtp.gguf -ngl 999 -fa on -b 4096 -ub 4096 -ctk f16 -ctv f16 -p 0 -n 128 -r 2
-./build/bin/llama-server -m Qwen3.8-27B-GSQ-RCO-IQ3_S-mtp.gguf -ngl 999 -fa on -c 65536 -np 1 --host 127.0.0.1 --port 8080
+./build/bin/llama-bench  -m <model.gguf> -ngl 999 -fa on -b 4096 -ub 4096 -p 512,2048,8192 -n 128 -r 2
+./build/bin/llama-server -m <model.gguf> -ngl 999 -fa on -c 65536 -np 1 --host 127.0.0.1 --port 8080
 ```
 
-每项优化都有关闭开关（例如 `LLAMA_GDN_FUSED_DECODE=0`、`GGML_MMVQ_IQ3=0`），完整列表见交接文档附录。
+带 IQ3_S / IQ3_XXS 权重的模型请设置 `CODEX_IQ3_PREPACK=1 CODEX_IQ3_XXS_PREPACK=1`（基线补丁的开关；所有测量都在这个设置下进行）。各模型的具体命令（包括 MTP）在各自的文档里。
 
-## 适用范围
+## 分支与标签
 
-- 只优化 HIP / CDNA2（gfx90a）上的单 token、单序列解码；其他 GPU 和多序列批次走原代码路径。
-- 融合 DeltaNet 算子只用于 qwen35 架构、单序列、未开启投机回滚的情况，其余自动回退。
-- CUDA/MUSA 构建的修复只做过 clang 语法检查，未在 NVIDIA 平台编译测试。
+- `main`：当前代码、文档和实验脚本。
+- `baseline`：对照基线，即 llama.cpp b12110（提交 cd959bae）+ ROCm 7.2 兼容补丁 + IQ3_S/IQ3_XXS 4-bit 展开补丁（"保留版"）。`git diff baseline main` 就是全部优化。
+- 已有标签 `int-v8-base`、`int-v9`、`int-v11`、`mi210-final` 是 Qwen3.8-27B decode 优化的中间集成节点（74.0 / 76.0 / 78.0 / 80.3 token/s），保持不变。
+- 以后的标签用 `<模型id>/<名字>` 的形式，例如 `qwen3.8-27b/mtp-r3`。
 
-## vLLM 部署（`vllm-opt/`）
-
-不改镜像（vLLM `2e7da1ad1c66`，vllm 0.30.0+rocm723），以只读挂载的插件给 vLLM 打补丁：逐列精确的 weight-only FP8 GEMV、bf16 LM head GEMV 与融合采样、融合的 norm/DeltaNet/注意力，以及 MTP 验证用的多 token kernel 和 int4 草稿头。
-
-```bash
-cd vllm-opt
-./build.sh                     # 预编译 4 个 HIP 扩展（不用 GPU）
-./start.sh serve               # 默认 MTP=3，端口 18340，模型名 qwen38
-MTP=0 ./start.sh serve         # 多路并发服务用这个
-```
-
-模型目录用 `MODEL_DIR` 指定（默认 `/data/model/Qwen3.8-27B-FP8`），GPU 锁文件用 `GPU_LOCK_FILE` 指定。完整的开关、结果和限制见 [vllm-opt/README.md](vllm-opt/README.md)。
+本仓库没有 llama.cpp 的上游提交历史；基线是一次性导入的源码快照。
 
 ## 实验工具
 
