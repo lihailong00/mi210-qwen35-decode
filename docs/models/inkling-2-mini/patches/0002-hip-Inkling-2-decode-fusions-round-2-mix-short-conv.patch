@@ -1,0 +1,909 @@
+From 5c7417fc5585c2dd08256d9bff302226e940757c Mon Sep 17 00:00:00 2001
+From: mi210 <mi210@local>
+Date: Tue, 24 Nov 2026 03:26:25 +0800
+Subject: [PATCH 2/2] hip: Inkling-2 decode fusions round 2 (mix, short conv)
+
+- mix: concat chain + rms_norm + transpose copy + query repeat + score
+  GEMV + softmax in one kernel (one block per state, last block does the
+  scores/softmax; per-call-site ticket counters). nq <= 2 only: the
+  3-query case does not reproduce mul_mat_vec_f<.., 3, ..> bit for bit.
+- sconv: concat + state store + ssm_conv + add + scale, decided at the
+  CONCAT and launched at the SSM_CONV (deferred skip set). When the conv
+  history is no longer intact at the SSM_CONV (FFN conv), the concat and
+  state store run at the CONCAT and the rest at the SSM_CONV.
+  Early/late placement is guarded by memory-overlap checks over every
+  node in between (views and empty tensors ignored).
+- backend loop: ggml_cuda_inkling_should_skip + negative try_fuse result
+  for "node handled".
+Kernels per decoded token 7243 -> 3497; tg128 33.4 -> 44.8 tok/s;
+kld.sh logits md5 identical to baseline; llama-server greedy outputs
+identical (6/6, also with DSpark).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ ggml/src/ggml-cuda/ggml-cuda.cu     |  10 +-
+ ggml/src/ggml-cuda/inkling-fuse.cu  | 756 +++++++++++++++++++++++++++-
+ ggml/src/ggml-cuda/inkling-fuse.cuh |   6 +
+ 3 files changed, 763 insertions(+), 9 deletions(-)
+
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index a1e1b5b..2665f42 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -4593,7 +4593,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+ 
+     {
+         const int n_inkling = ggml_cuda_try_fuse_inkling(*cuda_ctx, cgraph, i);
+-        if (n_inkling > 0) {
++        if (n_inkling != 0) {
+             return n_inkling;
+         }
+     }
+@@ -5592,7 +5592,14 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
+                     continue;
+                 }
+ 
++                if (ggml_cuda_inkling_should_skip(node)) {
++                    continue;
++                }
++
+                 int nodes_to_skip = ggml_cuda_try_fuse(cuda_ctx, cgraph, i);
++                if (nodes_to_skip < 0) {
++                    continue; // inkling fusion handled this node (later nodes are in the deferred skip set)
++                }
+ 
+                 if (nodes_to_skip != 0) {
+ #ifdef GGML_CUDA_DEBUG
+@@ -5685,6 +5692,7 @@ static bool ggml_cuda_graph_set_enabled(ggml_backend_cuda_context * cuda_ctx, ui
+ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
+     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
+     ggml_cuda_dump_nodes(cgraph);
++    ggml_cuda_inkling_begin(cgraph);
+ 
+     ggml_cuda_set_device(cuda_ctx->device);
+ 
+diff --git a/ggml/src/ggml-cuda/inkling-fuse.cu b/ggml/src/ggml-cuda/inkling-fuse.cu
+index 701971f..d720323 100644
+--- a/ggml/src/ggml-cuda/inkling-fuse.cu
++++ b/ggml/src/ggml-cuda/inkling-fuse.cu
+@@ -3,11 +3,14 @@
+ #include "convert.cuh"
+ #include "ggml-impl.h"
+ 
++#include <algorithm>
+ #include <atomic>
+ #include <cstdio>
+ #include <cstdlib>
+ #include <cstring>
+ #include <set>
++#include <unordered_set>
++#include <unordered_map>
+ #include <vector>
+ 
+ // ---------------------------------------------------------------------------------------------
+@@ -60,12 +63,15 @@ enum ink_fusion {
+     INK_MOE_DOWN,
+     INK_CTRL_NORM,
+     INK_CTRL_GATE,
++    INK_MIX,
++    INK_SCONV,
+     INK_COUNT,
+ };
+ 
+-static const char * ink_fusion_names[INK_COUNT] = { "clip", "situ", "moe_down", "ctrl_norm", "ctrl_gate" };
++static const char * ink_fusion_names[INK_COUNT] = { "clip", "situ", "moe_down", "ctrl_norm", "ctrl_gate", "mix", "sconv" };
+ static const char * ink_fusion_envs[INK_COUNT]  = { "GGML_CUDA_INK_CLIP", "GGML_CUDA_INK_SITU", "GGML_CUDA_INK_MOE_DOWN",
+-                                                    "GGML_CUDA_INK_CTRL_NORM", "GGML_CUDA_INK_CTRL_GATE" };
++                                                    "GGML_CUDA_INK_CTRL_NORM", "GGML_CUDA_INK_CTRL_GATE",
++                                                    "GGML_CUDA_INK_MIX", "GGML_CUDA_INK_SCONV" };
+ 
+ static std::atomic<long long> ink_hits[INK_COUNT];
+ 
+@@ -165,6 +171,9 @@ static bool ink_internal_only(const ggml_cgraph * cgraph, int i0, int i1, const
+ }
+ 
+ static bool ink_overlap(const ggml_tensor * a, const ggml_tensor * b) {
++    if (ggml_is_empty(a) || ggml_is_empty(b) || !a->data || !b->data) {
++        return false; // empty tensors (e.g. zero-row state copies) touch no memory
++    }
+     const char * a0 = (const char *) a->data;
+     const char * a1 = a0 + ggml_nbytes(a);
+     const char * b0 = (const char *) b->data;
+@@ -724,7 +733,7 @@ struct ink_verify_entry {
+ 
+ static std::vector<ink_verify_entry> ink_pending;
+ static unsigned long long * ink_vcnt = nullptr; // [slot*4]: compared, mismatched, first bad index, (float bits mine | ref)
+-static const char * ink_vnames[16] = {};
++static const char * ink_vnames[64] = {};
+ static float * ink_vfirst = nullptr; // [slot*2]
+ 
+ static __global__ void ink_cmp_kernel(const float * a, const float * b, const int n, unsigned long long * cnt, float * first) {
+@@ -750,7 +759,7 @@ static void ink_verify_print() {
+         return;
+     }
+     cudaDeviceSynchronize();
+-    for (int k = 0; k < 16; ++k) {
++    for (int k = 0; k < 64; ++k) {
+         if (!ink_vnames[k]) {
+             continue;
+         }
+@@ -761,9 +770,9 @@ static void ink_verify_print() {
+ 
+ static void ink_verify_add(const float * mine, const ggml_tensor * ref, int ref_idx, int slot, const char * name) {
+     if (!ink_vcnt) {
+-        CUDA_CHECK(cudaMallocManaged(&ink_vcnt, 16*4*sizeof(unsigned long long)));
+-        CUDA_CHECK(cudaMallocManaged(&ink_vfirst, 16*2*sizeof(float)));
+-        memset(ink_vcnt, 0, 16*4*sizeof(unsigned long long));
++        CUDA_CHECK(cudaMallocManaged(&ink_vcnt, 64*4*sizeof(unsigned long long)));
++        CUDA_CHECK(cudaMallocManaged(&ink_vfirst, 64*2*sizeof(float)));
++        memset(ink_vcnt, 0, 64*4*sizeof(unsigned long long));
+         atexit(ink_verify_print);
+     }
+     ink_vnames[slot] = name;
+@@ -849,6 +858,723 @@ static int ink_try_ctrl_gate(ggml_backend_cuda_context & ctx, ggml_cgraph * cgra
+     return idx[7] - i;
+ }
+ 
++
++// ---------------------------------------------------------------------------------------------
++// mix (inkling2.cpp mix(), depth attention): CONCAT chain -> RMS_NORM -> TRANSPOSE/CONT ; REPEAT(query) ->
++// MUL_MAT(states, queries) -> SOFT_MAX ; the final MUL_MAT(cont, softmax) is left to the regular path.
++// One 1024-thread block reproduces rms_norm_f32 (vec, block 1024, vpt 1) per state row, mul_mat_vec_f f32 (block 128)
++// per score row and soft_max_f32 (32-thread block) per query, so all outputs are bit-identical.
++// ---------------------------------------------------------------------------------------------
++
++#define INK_MIX_MAX_STATES 16
++#define INK_MIX_MAX_Q      4
++
++struct ink_mix_args {
++    const float * rows[INK_MIX_MAX_STATES]; // state s (n floats each)
++    const float * q;                        // queries [n, nq] contiguous
++    float       * nrm;                      // RMS_NORM dst [n, S]
++    float       * cont;                     // CONT dst [S, n]
++    float       * smax;                     // SOFT_MAX dst [S, nq]
++    float       * scores_dbg;               // verify only: scores [S, nq]
++    int           n;
++    int           S;
++    int           nq;
++    float         eps;
++    float         sm_scale;
++};
++
++static int * ink_mix_counter = nullptr;
++
++// grid: one 1024-thread block per state row (rms_norm), the last block to finish computes scores + softmax
++static __global__ void __launch_bounds__(1024) ink_mix_kernel(const ink_mix_args a, int * counter) {
++    const int tid = threadIdx.x;
++    const int n   = a.n;
++    const int S   = a.S;
++
++    __shared__ float s_sum[32];
++    __shared__ float buf_iw[8][64];
++    __shared__ float scores[INK_MIX_MAX_Q][INK_MIX_MAX_STATES];
++    __shared__ int   ticket;
++
++    // 1. rms_norm of state row s: identical to rms_norm_f32<float, 1024, 1, true> on a [n, S] tensor
++    {
++        const int s = blockIdx.x;
++        const int ncols4 = n / 4;
++        const float * xc = a.rows[s];
++        float4 xs  = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
++        float  tmp = 0.0f;
++        if (tid < ncols4) {
++            xs = ((const float4 *) xc)[tid];
++            tmp += xs.x*xs.x + xs.y*xs.y + xs.z*xs.z + xs.w*xs.w;
++        }
++        tmp = block_reduce<block_reduce_method::SUM, 1024>(tmp, s_sum);
++        const float scale = rsqrtf(tmp / n + a.eps);
++        if (tid < ncols4) {
++            const float4 r = make_float4(scale*xs.x, scale*xs.y, scale*xs.z, scale*xs.w);
++            ((float4 *) (a.nrm + (int64_t) s*n))[tid] = r;
++            const int c = 4*tid;
++            a.cont[(int64_t) (c + 0)*S + s] = r.x;
++            a.cont[(int64_t) (c + 1)*S + s] = r.y;
++            a.cont[(int64_t) (c + 2)*S + s] = r.z;
++            a.cont[(int64_t) (c + 3)*S + s] = r.w;
++        }
++    }
++    __threadfence();
++    __syncthreads();
++    if (tid == 0) {
++        ticket = atomicAdd(counter, 1);
++    }
++    __syncthreads();
++    if (ticket != S - 1) {
++        return;
++    }
++    __threadfence();
++
++    // 2. scores[j][s] = dot(nrm[s], q[j]): mul_mat_vec_f<float, float, nq, 128> with one 128-thread group per row
++    const int g  = tid / 128;
++    const int lt = tid % 128;
++    const int ncols2 = n / 2;
++    for (int s0 = 0; s0 < S; s0 += 8) {
++        const int s = s0 + g;
++        if (lt < 64) {
++            buf_iw[g][lt] = 0.0f;
++        }
++        __syncthreads();
++
++        float sumf[INK_MIX_MAX_Q] = { 0.0f };
++        if (s < S) {
++            const float2 * x2 = (const float2 *) (a.nrm + (int64_t) s*n);
++            const float2 * y2 = (const float2 *) a.q;
++            for (int col2 = lt; col2 < ncols2; col2 += 128) {
++                const float2 tmpx = x2[col2];
++#pragma unroll
++                for (int j = 0; j < INK_MIX_MAX_Q; ++j) {
++                    if (j < a.nq) {
++                        const float2 tmpy = y2[j*ncols2 + col2];
++                        ggml_cuda_mad(sumf[j], tmpx.x, tmpy.x);
++                        ggml_cuda_mad(sumf[j], tmpx.y, tmpy.y);
++                    }
++                }
++            }
++        }
++#pragma unroll
++        for (int j = 0; j < INK_MIX_MAX_Q; ++j) {
++            if (j >= a.nq) {
++                break;
++            }
++            sumf[j] = warp_reduce_sum<64>(sumf[j]);
++            buf_iw[g][lt/64] = sumf[j];
++            __syncthreads();
++            if (lt < 64) {
++                sumf[j] = buf_iw[g][lt];
++                sumf[j] = warp_reduce_sum<64>(sumf[j]);
++            }
++            __syncthreads();
++        }
++        if (s < S && lt < a.nq) {
++            float value = 0.0f;
++#pragma unroll
++            for (int j = 0; j < INK_MIX_MAX_Q; ++j) {
++                if (j == lt) {
++                    value = sumf[j];
++                }
++            }
++            scores[lt][s] = value;
++            if (a.scores_dbg) {
++                a.scores_dbg[lt*S + s] = value;
++            }
++        }
++        __syncthreads();
++    }
++
++    // 3. softmax over S for each query: soft_max_f32<true, 0, 0> with a 32-thread block (lanes 0..31 of wave j)
++    const int w    = tid / 64;
++    const int lane = tid % 64;
++    if (w < a.nq && lane < 32) {
++        const int j = w;
++        float max_val = -INFINITY;
++        float val     = 0.0f;
++        const int col = lane;
++        if (col < S) {
++            val     = scores[j][col]*a.sm_scale + 0.0f;
++            max_val = max(max_val, val);
++        }
++        max_val = warp_reduce_max(max_val);
++        float tmp = 0.0f;
++        if (col < S) {
++            val = expf(val - max_val);
++            tmp += val;
++        }
++        tmp = warp_reduce_sum(tmp);
++        const float inv_sum = 1.0f / tmp;
++        if (col < S) {
++            a.smax[j*S + col] = val * inv_sum;
++        }
++    }
++    if (tid == 0) {
++        *counter = 0;
++    }
++}
++
++static bool ink_out_of(const ggml_tensor * t, ggml_tensor * const * outs, int n_outs) {
++    for (int k = 0; k < n_outs; ++k) {
++        if (outs[k] == t) {
++            return true;
++        }
++    }
++    return false;
++}
++
++// like ink_internal_only, with several outputs
++static bool ink_internal_only_multi(const ggml_cgraph * cgraph, int i0, int i1, ggml_tensor * const * outs, int n_outs) {
++    for (int k = i0; k <= i1; ++k) {
++        const ggml_tensor * nd = cgraph->nodes[k];
++        if (ink_out_of(nd, outs, n_outs)) {
++            continue;
++        }
++        if (nd->flags & GGML_TENSOR_FLAG_OUTPUT) {
++            return false;
++        }
++        int uses = 0;
++        for (int m = k + 1; m <= i1; ++m) {
++            for (int s = 0; s < GGML_MAX_SRC; ++s) {
++                if (cgraph->nodes[m]->src[s] == nd) {
++                    uses++;
++                }
++            }
++        }
++        if (uses != ggml_node_get_use_count(cgraph, k)) {
++            return false;
++        }
++    }
++    return true;
++}
++
++static int ink_try_mix(ggml_backend_cuda_context & ctx, ggml_cgraph * cgraph, int i) {
++    ink_mix_args a = {};
++    const ggml_tensor * rows_rev[INK_MIX_MAX_STATES];
++    int nrows = 0;
++
++    ggml_tensor * node = cgraph->nodes[i];
++    int k = i;
++    ggml_tensor * states = nullptr;
++    if (node->op == GGML_OP_CONCAT) {
++        // innermost concat: src1 is the current state, src0 the first block
++        if (node->src[1]->op == GGML_OP_CONCAT || ggml_get_op_params_i32(node, 0) != 1) {
++            return 0;
++        }
++        rows_rev[nrows++] = node->src[1];
++        rows_rev[nrows++] = node->src[0];
++        ggml_tensor * prev = node;
++        while (true) {
++            const int kn = ink_next(cgraph, k);
++            if (kn < 0) {
++                return 0;
++            }
++            ggml_tensor * nx = cgraph->nodes[kn];
++            if (nx->op != GGML_OP_CONCAT) {
++                break;
++            }
++            if (nx->src[1] != prev || ggml_get_op_params_i32(nx, 0) != 1 || nrows >= INK_MIX_MAX_STATES) {
++                return 0;
++            }
++            rows_rev[nrows++] = nx->src[0];
++            prev = nx;
++            k    = kn;
++        }
++        states = prev;
++        k = ink_next(cgraph, k);
++    } else if (node->op == GGML_OP_RMS_NORM) {
++        states = node->src[0];
++        rows_rev[nrows++] = states;
++    } else {
++        return 0;
++    }
++    if (k < 0) {
++        return 0;
++    }
++    ggml_tensor * nrm = cgraph->nodes[k];
++    if (nrm->op != GGML_OP_RMS_NORM || nrm->src[0] != states) {
++        return 0;
++    }
++    const int64_t n = nrm->ne[0];
++    const int     S = nrows;
++    if (nrm->type != GGML_TYPE_F32 || nrm->ne[1] != S || ggml_nrows(nrm) != S || !ggml_is_contiguous(nrm) || n % 4 != 0 ||
++        n/4 <= 512 || n/4 > 1024 || ((uintptr_t) nrm->data % 16)) {
++        return 0;
++    }
++    for (int r = 0; r < S; ++r) {
++        const ggml_tensor * t = rows_rev[r];
++        if (t->type != GGML_TYPE_F32 || ggml_nelements(t) != n || !ggml_is_contiguous(t) || ((uintptr_t) t->data % 16)) {
++            return 0;
++        }
++        // rows in final order: last concat's src0 first, the current state last
++        a.rows[r] = (const float *) rows_rev[S - 1 - r]->data;
++    }
++    if (S == 1) {
++        a.rows[0] = (const float *) rows_rev[0]->data;
++    }
++
++    // TRANSPOSE (view) + CONT, REPEAT(query), MUL_MAT(nrm, repeat), SOFT_MAX
++    const int kc = ink_next(cgraph, k);
++    if (kc < 0) {
++        return 0;
++    }
++    ggml_tensor * cont = cgraph->nodes[kc];
++    if (cont->op != GGML_OP_CONT || cont->src[0]->op != GGML_OP_TRANSPOSE || cont->src[0]->src[0] != nrm) {
++        return 0;
++    }
++    const int kr = ink_next(cgraph, kc);
++    if (kr < 0) {
++        return 0;
++    }
++    ggml_tensor * rep = cgraph->nodes[kr];
++    if (rep->op != GGML_OP_REPEAT || !ggml_are_same_shape(rep, rep->src[0]) || rep->ne[0] != n || rep->ne[1] > INK_MIX_MAX_Q ||
++        ggml_nelements(rep) != n*rep->ne[1] || !ggml_is_contiguous(rep->src[0]) || rep->src[0]->type != GGML_TYPE_F32 ||
++        ((uintptr_t) rep->src[0]->data % 8)) {
++        return 0;
++    }
++    const int nq = (int) rep->ne[1];
++    // nq == 3 (full-attention layers) does not reproduce mul_mat_vec_f<float, float, 3> bit for bit yet: leave it unfused
++    if (nq > 2) {
++        return 0;
++    }
++    const int km = ink_next(cgraph, kr);
++    if (km < 0) {
++        return 0;
++    }
++    ggml_tensor * mm = cgraph->nodes[km];
++    if (mm->op != GGML_OP_MUL_MAT || mm->src[0] != nrm || mm->src[1] != rep || mm->ne[0] != S || mm->ne[1] != nq ||
++        ggml_nelements(mm) != S*nq) {
++        return 0;
++    }
++    const int ks = ink_next(cgraph, km);
++    if (ks < 0) {
++        return 0;
++    }
++    ggml_tensor * sm = cgraph->nodes[ks];
++    float sm_scale, sm_max_bias;
++    memcpy(&sm_scale, (const float *) sm->op_params + 0, sizeof(float));
++    memcpy(&sm_max_bias, (const float *) sm->op_params + 1, sizeof(float));
++    if (sm->op != GGML_OP_SOFT_MAX || sm->src[0] != mm || sm->src[1] || sm->src[2] || sm_max_bias != 0.0f ||
++        !ggml_is_contiguous(sm) || ggml_nelements(sm) != S*nq || sm->type != GGML_TYPE_F32 ||
++        cont->type != GGML_TYPE_F32 || !ggml_is_contiguous(cont) || cont->ne[0] != S || cont->ne[1] != n) {
++        return 0;
++    }
++
++    ggml_tensor * outs[2] = { cont, sm };
++    if (!ink_internal_only_multi(cgraph, i, ks, outs, 2)) {
++        return 0;
++    }
++    // outputs must not alias inputs or each other; nrm is internal scratch
++    for (int r = 0; r < S; ++r) {
++        const ggml_tensor * t = rows_rev[r];
++        if (ink_overlap(cont, t) || ink_overlap(sm, t) || ink_overlap(nrm, t)) {
++            return 0;
++        }
++    }
++    if (ink_overlap(cont, sm) || ink_overlap(cont, nrm) || ink_overlap(sm, nrm) || ink_overlap(cont, rep->src[0]) ||
++        ink_overlap(sm, rep->src[0]) || ink_overlap(nrm, rep->src[0])) {
++        return 0;
++    }
++
++    memcpy(&a.eps, nrm->op_params, sizeof(float));
++    a.q        = (const float *) rep->src[0]->data;
++    a.nrm      = (float *) nrm->data;
++    a.cont     = (float *) cont->data;
++    a.smax     = (float *) sm->data;
++    a.n        = (int) n;
++    a.S        = S;
++    a.nq       = nq;
++    a.sm_scale = sm_scale;
++    a.scores_dbg = nullptr;
++    if (ink_verify()) {
++        float * dbg = nullptr;
++        CUDA_CHECK(cudaMalloc(&dbg, (2*S*n + 2*S*nq)*sizeof(float)));
++        a.nrm  = dbg;
++        a.cont = dbg + S*n;
++        a.scores_dbg = dbg + 2*S*n;
++        a.smax = dbg + 2*S*n + S*nq;
++        ink_verify_add(a.nrm, nrm, k, 10, "mix.nrm");
++        ink_verify_add(a.cont, cont, kc, 11, "mix.cont");
++        static char names[64][32];
++        const int slot = 16 + (S < 12 ? S : 11)*4 + (nq - 1);
++        snprintf(names[slot], sizeof(names[slot]), "mix.scores.S%d.q%d", S, nq);
++        ink_verify_add(a.scores_dbg, mm, km, slot, names[slot]);
++        ink_verify_add(a.smax, sm, ks, 13, "mix.softmax");
++    }
++    // one zero-initialized ticket counter per captured call site (reset by the kernel), so concurrent streams never share one
++    static const int n_slots = 1 << 14;
++    static int       next_slot = 0;
++    if (!ink_mix_counter) {
++        CUDA_CHECK(cudaMalloc(&ink_mix_counter, n_slots*sizeof(int)));
++        CUDA_CHECK(cudaMemset(ink_mix_counter, 0, n_slots*sizeof(int)));
++    }
++    int * counter = ink_mix_counter + next_slot;
++    next_slot = (next_slot + 1) % n_slots;
++    ink_mix_kernel<<<S, 1024, 0, ctx.stream()>>>(a, counter);
++    CUDA_CHECK(cudaGetLastError());
++    ink_hits[INK_MIX]++;
++    if (a.scores_dbg) {
++        return 0;
++    }
++    return ks - i;
++}
++
++
++// ---------------------------------------------------------------------------------------------
++// deferred skips: a fusion computed early (at its first node) marks the later nodes it replaced
++// ---------------------------------------------------------------------------------------------
++
++static std::unordered_set<const ggml_tensor *> ink_skip;
++
++static std::unordered_map<const ggml_tensor *, struct ink_sconv_launch> & ink_sconv_pending_ref();
++
++void ggml_cuda_inkling_begin(const ggml_cgraph * cgraph) {
++    GGML_UNUSED(cgraph);
++    ink_skip.clear();
++    ink_sconv_pending_ref().clear();
++}
++
++bool ggml_cuda_inkling_should_skip(const ggml_tensor * node) {
++    if (ink_skip.empty()) {
++        return false;
++    }
++    auto it = ink_skip.find(node);
++    if (it == ink_skip.end()) {
++        return false;
++    }
++    ink_skip.erase(it);
++    return true;
++}
++
++// For a fusion evaluated at node i whose results are graph nodes that normally run later (up to i_end):
++// every node in (i, i_end] that is not part of the fusion must neither write nor read memory overlapping `region`,
++// otherwise writing `region` early would be unsafe.
++static bool ink_early_write_safe(const ggml_cgraph * cgraph, int i, int i_end, const ggml_tensor * region,
++                                 const std::unordered_set<const ggml_tensor *> & fused) {
++    for (int k = i + 1; k <= i_end; ++k) {
++        const ggml_tensor * nd = cgraph->nodes[k];
++        if (fused.count(nd)) {
++            continue;
++        }
++        if (ink_is_noop(nd)) {
++            continue;
++        }
++        if (ink_overlap(nd, region)) {
++            return false;
++        }
++        for (int q = 0; q < GGML_MAX_SRC; ++q) {
++            const ggml_tensor * sq = nd->src[q];
++            if (sq && !fused.count(sq) && sq->data && ink_overlap(sq, region)) {
++                return false;
++            }
++        }
++    }
++    return true;
++}
++
++// ---------------------------------------------------------------------------------------------
++// convolve (inkling2.cpp convolve(), no dynamic taps), single token:
++//   CONCAT(past [3, C] view of the conv history, x^T [1, C]) ; VIEW(concat, last 3) -> CPY into the conv state ;
++//   SSM_CONV(concat, w) -> RESHAPE -> ADD(x, conv) -> SCALE
++// computed at the CONCAT; the CPY / SSM_CONV / ADD / SCALE nodes later in the graph are skipped.
++// ---------------------------------------------------------------------------------------------
++
++static __global__ void ink_sconv_f32(const float * __restrict__ x, const float * __restrict__ past, const int64_t past_nb1,
++                                     const float * __restrict__ catm, const float * __restrict__ w, const int64_t w_nb1,
++                                     float * __restrict__ state, float * dst, const int C, const float s_scale, const float s_bias) {
++    const int c = blockIdx.x*blockDim.x + threadIdx.x;
++    if (c >= C) {
++        return;
++    }
++    float xv[4];
++    if (catm) {
++        // concat already materialized (and the state stored) by ink_sconv_cat_f32
++        xv[0] = catm[c*4 + 0];
++        xv[1] = catm[c*4 + 1];
++        xv[2] = catm[c*4 + 2];
++        xv[3] = catm[c*4 + 3];
++    } else {
++        xv[0] = past[c*past_nb1 + 0];
++        xv[1] = past[c*past_nb1 + 1];
++        xv[2] = past[c*past_nb1 + 2];
++        xv[3] = x[c];
++        state[c*3 + 0] = xv[1];
++        state[c*3 + 1] = xv[2];
++        state[c*3 + 2] = xv[3];
++    }
++    const float xin = x[c];
++
++    float wv[4];
++#pragma unroll
++    for (int j = 0; j < 4; j++) {
++        wv[j] = w[c*w_nb1 + j];
++    }
++    // ssm_conv_f32 (d_conv 4, one token, no bias)
++    float sumf = 0.0f;
++#pragma unroll
++    for (int j = 0; j < 4; j++) {
++        sumf += xv[j] * wv[j];
++    }
++    const float b = 0.0f;
++    sumf += b;
++
++    float y;
++    {
++#pragma clang fp contract(off)
++        y = xin + sumf;
++    }
++    dst[c] = s_scale * y + s_bias;
++}
++
++// concat [past, x] into catm [4, C] and store the new conv state [p1, p2, x]
++static __global__ void ink_sconv_cat_f32(const float * __restrict__ x, const float * __restrict__ past, const int64_t past_nb1,
++                                         float * __restrict__ catm, float * __restrict__ state, const int C) {
++    const int c = blockIdx.x*blockDim.x + threadIdx.x;
++    if (c >= C) {
++        return;
++    }
++    const float p0 = past[c*past_nb1 + 0];
++    const float p1 = past[c*past_nb1 + 1];
++    const float p2 = past[c*past_nb1 + 2];
++    const float xv = x[c];
++    catm[c*4 + 0] = p0;
++    catm[c*4 + 1] = p1;
++    catm[c*4 + 2] = p2;
++    catm[c*4 + 3] = xv;
++    state[c*3 + 0] = p1;
++    state[c*3 + 1] = p2;
++    state[c*3 + 2] = xv;
++}
++
++struct ink_sconv_launch {
++    const float * x;
++    const float * past;
++    const float * catm;
++    int64_t       past_nb1;
++    const float * w;
++    int64_t       w_nb1;
++    float       * state;
++    float       * dst;
++    int           C;
++    float         s_scale;
++    float         s_bias;
++};
++
++// decided at the CONCAT, launched when the SSM_CONV node is reached
++static std::unordered_map<const ggml_tensor *, ink_sconv_launch> ink_sconv_pending;
++
++// nodes in (i0, i1) that are not fused must not write memory overlapping `t` (t is read late)
++static bool ink_unmodified_between(const ggml_cgraph * cgraph, int i0, int i1, const ggml_tensor * t,
++                                   const std::unordered_set<const ggml_tensor *> & fused) {
++    for (int k = i0 + 1; k < i1; ++k) {
++        const ggml_tensor * nd = cgraph->nodes[k];
++        if (fused.count(nd) || ink_is_noop(nd)) {
++            continue;
++        }
++        if (ink_overlap(nd, t)) {
++            return false;
++        }
++    }
++    return true;
++}
++
++// nodes in (i0, i1] that are not fused must neither read nor write memory overlapping `t` (t is written late)
++static bool ink_untouched_between(const ggml_cgraph * cgraph, int i0, int i1, const ggml_tensor * t,
++                                  const std::unordered_set<const ggml_tensor *> & fused) {
++    for (int k = i0 + 1; k <= i1; ++k) {
++        const ggml_tensor * nd = cgraph->nodes[k];
++        if (fused.count(nd)) {
++            continue;
++        }
++        if (ink_is_noop(nd)) {
++            continue; // views/reshapes neither read nor write memory; their consumers are checked
++        }
++        if (ink_overlap(nd, t)) {
++            if (ink_debug()) {
++                fprintf(stderr, "ink untouched: node %d %s (%s) writes %s\n", k, nd->name, ggml_op_desc(nd), t->name);
++            }
++            return false;
++        }
++        for (int q = 0; q < GGML_MAX_SRC; ++q) {
++            const ggml_tensor * sq = nd->src[q];
++            if (sq && !fused.count(sq) && sq->data && ink_overlap(sq, t)) {
++                if (ink_debug()) {
++                    fprintf(stderr, "ink untouched: node %d %s (%s) reads %s (%s) overlapping %s\n", k, nd->name, ggml_op_desc(nd),
++                            sq->name, ggml_op_desc(sq), t->name);
++                }
++                return false;
++            }
++        }
++    }
++    return true;
++}
++
++#define INK_SCONV_REJECT() do { if (ink_debug()) { fprintf(stderr, "ink sconv reject line %d at node %d %s\n", __LINE__, i, cat->name); } return 0; } while (0)
++
++static int ink_try_sconv(ggml_backend_cuda_context & ctx, ggml_cgraph * cgraph, int i) {
++    ggml_tensor * cat = cgraph->nodes[i];
++    if (cat->op != GGML_OP_CONCAT || ggml_get_op_params_i32(cat, 0) != 0 || cat->type != GGML_TYPE_F32 || cat->ne[0] != 4 ||
++        cat->ne[2] != 1 || cat->ne[3] != 1 || !ggml_is_contiguous(cat)) {
++        return 0;
++    }
++    const ggml_tensor * past = cat->src[0];
++    const ggml_tensor * xt   = cat->src[1];
++    const int64_t C = cat->ne[1];
++    if (past->type != GGML_TYPE_F32 || past->ne[0] != 3 || past->ne[1] != C || past->nb[0] != sizeof(float) ||
++        xt->op != GGML_OP_TRANSPOSE || xt->ne[0] != 1 || xt->ne[1] != C || xt->nb[1] != sizeof(float) || xt->type != GGML_TYPE_F32) {
++        INK_SCONV_REJECT();
++    }
++    const ggml_tensor * x_rs = xt->src[0];
++    const ggml_tensor * x    = x_rs->op == GGML_OP_RESHAPE ? x_rs->src[0] : x_rs;
++    if (ggml_nelements(x) != C || !ggml_is_contiguous(x) || x->type != GGML_TYPE_F32) {
++        INK_SCONV_REJECT();
++    }
++
++    ggml_tensor * sview = nullptr;
++    ggml_tensor * scpy  = nullptr;
++    ggml_tensor * conv  = nullptr;
++    int i_cpy = -1, i_conv = -1;
++    const int i_lim = std::min(cgraph->n_nodes, i + 400);
++    for (int k = i + 1; k < i_lim; ++k) {
++        ggml_tensor * nd = cgraph->nodes[k];
++        if (!sview && nd->op == GGML_OP_VIEW && nd->view_src == cat) {
++            sview = nd;
++        } else if (sview && !scpy && nd->op == GGML_OP_CPY && nd->src[0] == sview) {
++            scpy  = nd;
++            i_cpy = k;
++        } else if (!conv && nd->op == GGML_OP_SSM_CONV && nd->src[0] == cat) {
++            conv   = nd;
++            i_conv = k;
++        }
++        if (scpy && conv) {
++            break;
++        }
++    }
++    if (!sview || !scpy || !conv) {
++        INK_SCONV_REJECT();
++    }
++    const ggml_tensor * sdst = scpy->src[1];
++    if (sview->ne[0] != 3 || sview->ne[1] != C || sview->view_offs != sizeof(float) || sview->nb[1] != cat->nb[1] ||
++        sdst->type != GGML_TYPE_F32 || ggml_nelements(sdst) != 3*C || !ggml_is_contiguous(sdst) || scpy->data != sdst->data) {
++        INK_SCONV_REJECT();
++    }
++    const ggml_tensor * w = conv->src[1];
++    if (w->type != GGML_TYPE_F32 || w->ne[0] != 4 || w->ne[1] != C || w->nb[0] != sizeof(float) || conv->ne[0] != C ||
++        conv->ne[1] != 1 || conv->type != GGML_TYPE_F32) {
++        INK_SCONV_REJECT();
++    }
++    int k = ink_next(cgraph, i_conv);
++    if (k < 0) {
++        INK_SCONV_REJECT();
++    }
++    ggml_tensor * add = cgraph->nodes[k];
++    const ggml_tensor * add_rhs = add->src[1];
++    const ggml_tensor * add_rhs_base = add_rhs && add_rhs->op == GGML_OP_RESHAPE ? add_rhs->src[0] : add_rhs;
++    if (add->op != GGML_OP_ADD || add_rhs_base != conv || add->src[0] != x || ggml_nelements(add) != C || add->type != GGML_TYPE_F32) {
++        INK_SCONV_REJECT();
++    }
++    k = ink_next(cgraph, k);
++    if (k < 0) {
++        INK_SCONV_REJECT();
++    }
++    ggml_tensor * scl = cgraph->nodes[k];
++    if (scl->op != GGML_OP_SCALE || scl->src[0] != add || !ggml_is_contiguous(scl) || ggml_nelements(scl) != C ||
++        scl->type != GGML_TYPE_F32) {
++        INK_SCONV_REJECT();
++    }
++    const int i_end = k;
++    if (i_cpy > i_conv) {
++        INK_SCONV_REJECT();
++    }
++
++    std::unordered_set<const ggml_tensor *> fused = { cat, sview, scpy, conv, add, scl };
++    if (add_rhs != conv) {
++        fused.insert(add_rhs);
++    }
++    if (ggml_node_get_use_count(cgraph, i) != 2 || (cat->flags & GGML_TENSOR_FLAG_OUTPUT) || (conv->flags & GGML_TENSOR_FLAG_OUTPUT) ||
++        (add->flags & GGML_TENSOR_FLAG_OUTPUT)) {
++        INK_SCONV_REJECT();
++    }
++    for (int m = i + 1; m < cgraph->n_nodes; ++m) {
++        const ggml_tensor * nd = cgraph->nodes[m];
++        if (fused.count(nd)) {
++            continue;
++        }
++        for (int q = 0; q < GGML_MAX_SRC; ++q) {
++            const ggml_tensor * sq = nd->src[q];
++            if (sq && (sq == conv || sq == add || sq == cat || sq == sview || (add_rhs != conv && sq == add_rhs))) {
++                INK_SCONV_REJECT(); // an intermediate is used outside the fusion
++            }
++        }
++    }
++    // the kernel runs at i_conv: x and past are read late, the state is written late, the output at its usual time
++    if (!ink_unmodified_between(cgraph, i, i_conv, x, fused)) {
++        INK_SCONV_REJECT();
++    }
++    // single kernel at the SSM_CONV if the conv history is still intact there and the state can be stored late;
++    // otherwise materialize the concat (its own buffer, alive until the SSM_CONV) and store the state at the CONCAT
++    const bool late_ok = ink_unmodified_between(cgraph, i, i_conv, past, fused) && ink_untouched_between(cgraph, i, i_conv, sdst, fused);
++    if (!late_ok && !ink_untouched_between(cgraph, i, i_cpy, sdst, fused)) {
++        INK_SCONV_REJECT();
++    }
++    if (!ink_untouched_between(cgraph, i_conv, i_end, scl, fused)) {
++        INK_SCONV_REJECT();
++    }
++    // the output may alias x exactly (in-place ADD/SCALE): every thread reads x[c] before writing dst[c]
++    const bool scl_x_alias = scl->data == x->data && ggml_nbytes(scl) == ggml_nbytes(x);
++    if ((ink_overlap(scl, x) && !scl_x_alias) || ink_overlap(scl, past) || ink_overlap(sdst, x) || ink_overlap(sdst, past) ||
++        ink_overlap(scl, sdst) || ink_overlap(scl, w) || ink_overlap(sdst, w) ||
++        (!late_ok && (ink_overlap(cat, x) || ink_overlap(cat, past) || ink_overlap(cat, sdst) || ink_overlap(cat, scl)))) {
++        INK_SCONV_REJECT();
++    }
++
++    ink_sconv_launch L;
++    L.x        = (const float *) x->data;
++    L.past     = (const float *) past->data;
++    L.catm     = late_ok ? nullptr : (const float *) cat->data;
++    L.past_nb1 = past->nb[1]/sizeof(float);
++    L.w        = (const float *) w->data;
++    L.w_nb1    = w->nb[1]/sizeof(float);
++    L.state    = (float *) sdst->data;
++    L.dst      = (float *) scl->data;
++    L.C        = (int) C;
++    L.s_scale  = ink_param_f32(scl, 0);
++    L.s_bias   = ink_param_f32(scl, 1);
++    ink_sconv_pending[conv] = L;
++    if (!late_ok) {
++        const int threads = 256;
++        ink_sconv_cat_f32<<<(C + threads - 1)/threads, threads, 0, ctx.stream()>>>(
++            L.x, L.past, L.past_nb1, (float *) cat->data, L.state, L.C);
++        CUDA_CHECK(cudaGetLastError());
++    }
++
++    ink_skip.insert(scpy);
++    ink_skip.insert(add);
++    ink_skip.insert(scl);
++    ink_hits[INK_SCONV]++;
++    return -1; // the concat is not computed; the kernel is launched at the SSM_CONV
++}
++
++static std::unordered_map<const ggml_tensor *, struct ink_sconv_launch> & ink_sconv_pending_ref() {
++    return ink_sconv_pending;
++}
++
++static int ink_launch_sconv(ggml_backend_cuda_context & ctx, ggml_cgraph * cgraph, int i) {
++    auto it = ink_sconv_pending.find(cgraph->nodes[i]);
++    if (it == ink_sconv_pending.end()) {
++        return 0;
++    }
++    const ink_sconv_launch L = it->second;
++    ink_sconv_pending.erase(it);
++    const int threads = 256;
++    ink_sconv_f32<<<(L.C + threads - 1)/threads, threads, 0, ctx.stream()>>>(L.x, L.past, L.past_nb1, L.catm, L.w, L.w_nb1, L.state,
++                                                                            L.dst, L.C, L.s_scale, L.s_bias);
++    CUDA_CHECK(cudaGetLastError());
++    return -1;
++}
++
+ // ---------------------------------------------------------------------------------------------
+ 
+ int ggml_cuda_try_fuse_inkling(ggml_backend_cuda_context & ctx, ggml_cgraph * cgraph, int i) {
+@@ -881,10 +1607,24 @@ int ggml_cuda_try_fuse_inkling(ggml_backend_cuda_context & ctx, ggml_cgraph * cg
+             }
+             break;
+         case GGML_OP_CONCAT:
+-            if (ink_enabled(INK_CTRL_NORM)) {
++            if (ink_enabled(INK_SCONV)) {
++                n = ink_try_sconv(ctx, cgraph, i);
++            }
++            if (n == 0 && ink_enabled(INK_MIX)) {
++                n = ink_try_mix(ctx, cgraph, i);
++            }
++            if (n == 0 && ink_enabled(INK_CTRL_NORM)) {
+                 n = ink_try_ctrl_norm(ctx, cgraph, i);
+             }
+             break;
++        case GGML_OP_SSM_CONV:
++            n = ink_launch_sconv(ctx, cgraph, i);
++            break;
++        case GGML_OP_RMS_NORM:
++            if (ink_enabled(INK_MIX)) {
++                n = ink_try_mix(ctx, cgraph, i);
++            }
++            break;
+         case GGML_OP_MUL_MAT:
+             if (ink_enabled(INK_CTRL_GATE)) {
+                 n = ink_try_ctrl_gate(ctx, cgraph, i);
+diff --git a/ggml/src/ggml-cuda/inkling-fuse.cuh b/ggml/src/ggml-cuda/inkling-fuse.cuh
+index 0675c44..0f024b2 100644
+--- a/ggml/src/ggml-cuda/inkling-fuse.cuh
++++ b/ggml/src/ggml-cuda/inkling-fuse.cuh
+@@ -14,3 +14,9 @@ int ggml_cuda_try_fuse_inkling(ggml_backend_cuda_context & ctx, ggml_cgraph * cg
+ 
+ // prints per-fusion hit counters at exit when GGML_CUDA_FUSION_STATS=1
+ void ggml_cuda_inkling_fusion_stats_register();
++
++// called at the start of each graph evaluation
++void ggml_cuda_inkling_begin(const ggml_cgraph * cgraph);
++
++// true if `node` was already computed by an earlier fusion and must be skipped
++bool ggml_cuda_inkling_should_skip(const ggml_tensor * node);
+-- 
+2.43.0
+

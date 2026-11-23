@@ -1,6 +1,6 @@
 # Inkling-2-Mini
 
-第二个模型，目前只有**基线测量**，还没有做优化。
+第二个模型。基线 decode 33.3 token/s；第一阶段（小算子融合，logits 与基线逐位相同）后 **44.8** token/s。
 
 - **权重**：Unsloth 的 `Inkling-2-Mini-UD-Q8_K_XL.gguf`（ModelScope `unsloth/Inkling-2-Mini-GGUF` 根目录，Unsloth 循环层布局，22,867,451,616 字节，SHA-256 以 dfb04bf3 开头）。专家权重 NVFP4 共 11.47 GB，其余（注意力、最后 4 层的专家、词嵌入、LM head）为 BF16 共 11.35 GB。
 - **投机解码 drafter**：`dspark/dspark-Inkling-2-Mini-BF16.gguf`（架构 dflash，DSpark = DFlash 块 drafter + Markov 头，3 层，块大小 8，647,792,800 字节，SHA-256 以 b8985695 开头）。
@@ -12,7 +12,7 @@
 
 - release `b12588-mix-c0c3de8` 的源码包 `llama.cpp-source-b12588-mix-c0c3de8.tar.gz`（SHA-256 92ee8439…7607，源提交 883286076efe）。它是上游 b12588 加上 Inkling 1/2、DSpark（ggml-org PR 32218）和若干修复的合并结果。
 - 注意：git 标签 `b12588-mix-c0c3de8` 本身指向的是 Unsloth fork 的 master，里面**没有** inkling2 代码；必须用 release 里的源码包。
-- 服务器上解压在 `/data/tools/mi210-opt/unsloth-llama`（容器内 `/lab/unsloth-llama`），已建 git 仓库，导入提交带标签 `upstream-b12588-mix`。编译参数与仓库根目录 README 相同（gfx90a、HIP graph、MMQ MFMA、FA），未改任何代码。
+- 服务器上解压在 `/data/tools/mi210-opt/unsloth-llama`（容器内 `/lab/unsloth-llama`），已建 git 仓库，导入提交带标签 `upstream-b12588-mix`。编译参数与仓库根目录 README 相同（gfx90a、HIP graph、MMQ MFMA、FA）。基线测量时未改任何代码；优化在 `inkling-opt` 分支上，见下文"decode 融合"。
 
 上游主线的支持需要 `Mainline_Support/` 下的另一种布局和 llama.cpp PR 32704，且不支持 DSpark，这里没有用。
 
@@ -107,8 +107,46 @@ decode 只到上限的约 15%。
 
 合计约 14–18 ms，即 decode 约 60–80 token/s（现 33）。带宽上限 205–240 token/s 离得还远，主要因为 48 次层计算本身就带来大量必须的 GEMV 启动。多 token 验证的效率提高后，DSpark 才可能有明显收益。
 
+## decode 融合（第一阶段）
+
+代码在 Unsloth 合并版的 `inkling-opt` 分支（服务器 `/data/tools/mi210-opt/unsloth-llama`，提交 8e9a5f5、5c7417f），补丁导出在 [patches/](patches/)（对 `upstream-b12588-mix` 用 `git am` 应用）。新增文件 `ggml/src/ggml-cuda/inkling-fuse.cu/.cuh`，`ggml-cuda.cu` 只加了几处挂钩。
+
+做法：在 HIP 后端里识别 `src/models/inkling2.cpp` 生成的节点序列，用一个 kernel 代替。模型代码和 CPU 路径不变。每个融合 kernel 都照原来各个 kernel 的算术顺序写（归约树、block 大小、FMA 合并与否），所以 **decode 的 logits 与基线逐位相同**。
+
+| 融合 | 原来的节点 | 现在 | 每次层计算省下的 kernel |
+| --- | --- | --- | --- |
+| clip（Q、K、R 的 L2 裁剪） | [mul] sqr sum_rows sqrt scale fill div clamp mul | 1 | 约 23 |
+| SITU 激活 | scale tanh scale sigmoid mul scale tanh scale mul | 1 | 8 |
+| MoE down 尾部 | repeat get_rows + 加权求和 | 1 | 约 2 |
+| 循环控制门 control | concat rms_norm ；forget/gain GEMV tanh scale mul tanh mul add | 2（down GEMV 照旧） | 8 × 4（只在循环第 2、3 遍） |
+| mix（按深度的注意力） | concat 链 rms_norm 转置拷贝 repeat 打分 GEMV softmax | 1（最后的加权 GEMV 照旧） | 约 6 × 每层 2–4 次 |
+| 短卷积 convolve | concat 状态写回 ssm_conv add scale | 1（FFN 那次是 2） | 约 15 |
+
+- 每 token kernel 数：7243 → 3497。
+- 没融合的：全注意力层 k/v 的动态卷积（带 4 个动态 tap）、3 个 query 的 mix（`mul_mat_vec_f<.., 3, ..>` 还没能逐位复现）、注意力的相对位置偏置准备、多处 view 的 cont 拷贝、残差 add。
+- 开关（设 0 关闭）：`GGML_CUDA_INK_FUSE`（全部）、`GGML_CUDA_INK_CLIP`、`_SITU`、`_MOE_DOWN`、`_CTRL_NORM`、`_CTRL_GATE`、`_MIX`、`_SCONV`。`GGML_CUDA_FUSION_STATS=1` 打印命中次数，`GGML_CUDA_DUMP_NODES=<文件>` 导出 graph 节点，`GGML_CUDA_INK_VERIFY=1`（配合 `GGML_CUDA_DISABLE_GRAPHS=1`）让融合 kernel 把中间结果写到暂存区、原节点照常运行，再逐位比较，用来定位不一致。
+
+**结果**（单卡 MI210，Q8_K_XL）
+
+| 测试 | 基线 | 融合后 |
+| --- | --- | --- |
+| llama-bench tg128 | 33.3 token/s | **44.8** token/s（+34%） |
+| llama-server 贪心（6 个提示 × 256 token） | 33.1 | **44.4** |
+| llama-server 采样（temp 1） | 32.3 | **42.8** |
+| llama-server + DSpark n_max 2，贪心 | 36.8 | 38.3（验证 graph 是多 token 的，没有融合，现在比不开还慢） |
+
+正确性：`kld.sh`（`llama-perplexity -ub 1`，每步都是单 token decode graph，3 个 512 token 的块）保存的全部 logits 的 md5 与基线相同（`01ec923fac19`）；llama-server 贪心输出 6/6 与基线逐字相同，开 DSpark 时也是 6/6、接受数相同。
+
+**做的过程中确认的事实**（gfx90a / ROCm 7.2.1）：
+
+- HIP 的 `__fmul_rn` / `__fadd_rn` 挡不住编译器把乘加合并成 FMA；要和分开的 graph 节点逐位一致，得在相应代码块里写 `#pragma clang fp contract(off)`。
+- 设备代码里 `WARP_SIZE` 是 32，物理 wave 是 64：`block_reduce` 用前者，`mul_mat_vec_f` 用后者，复现时两种都要照搬。
+- 把后面节点的结果提前算（或把输入推后读）时，ggml-alloc 会复用中间缓冲区，必须逐个检查中间节点的读写范围；view 节点不读写内存，0 行的空张量的 `ggml_nbytes` 不可信，两者都要排除。
+- `GGML_CUDA_DISABLE_GRAPHS` 只看是否设置，设成 0 也会关 graph。
+
 ## 下一步方向
 
-1. 按上面"优化空间估计"的顺序做：先小算子融合，再 NVFP4 / BF16 GEMV。
-2. 多 token 验证时的专家去重与分组，决定 DSpark 能否变成正收益。
-3. 先把 inkling2 架构移植进本仓库的源码树，或者把本仓库的通用优化移植到 Unsloth 合并版上；二选一需要先评估改动量。
+1. 剩下的大头是两类 GEMV：BF16 投影（q/gate/o/k/v/rel/sink，约 0.6–0.9 TB/s）和 NVFP4 专家（约 0.43 TB/s）。把它们提到 1.1–1.3 TB/s 预计每 token 省 4–5 ms；GEMV 改写会改变归约顺序，正确性按 KLD 噪声底线验收（见 [method.md](../../mi210/method.md)）。
+2. 继续融合：注意力的相对位置偏置准备（pad 是常量权重，可提到加载时）、mix 输出的 view/cont 拷贝、残差 add，3 个 query 的 mix，动态卷积。
+3. 多 token 验证（DSpark）的 graph 也要融合，并做专家去重，DSpark 才可能有收益。
+4. 是否把 inkling2 架构移植进本仓库的源码树：目前优化都在 Unsloth 合并版上，以补丁形式保存在 [patches/](patches/)。

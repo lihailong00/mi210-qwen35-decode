@@ -1,0 +1,1028 @@
+From 8e9a5f58c0dc458d22e8720b31c1a0cb76e7ecd6 Mon Sep 17 00:00:00 2001
+From: mi210 <mi210@local>
+Date: Tue, 24 Nov 2026 02:49:41 +0800
+Subject: [PATCH 1/2] hip: Inkling-2 decode fusions round 1 (clip, SITU, MoE
+ down tail, loop control)
+
+Backend-level pattern fusions for the node chains emitted by
+src/models/inkling2.cpp; each reproduces the original kernels arithmetic
+(reduction trees, contraction) so decode logits stay bit-identical.
+- clip: [mul] sqr sum_rows sqrt scale fill div clamp mul -> 1 kernel
+- situ: scale tanh scale sigmoid mul scale tanh scale mul -> 1 kernel
+- moe_down: repeat get_rows + weighted expert sum -> 1 kernel
+- ctrl_norm: concat + rms_norm -> 1 kernel
+- ctrl_gate: forget/gain K=64 GEMVs + tanh/scale/mul/add -> 1 kernel
+Switches GGML_CUDA_INK_{FUSE,CLIP,SITU,MOE_DOWN,CTRL_NORM,CTRL_GATE}=0,
+stats GGML_CUDA_FUSION_STATS=1, node dump GGML_CUDA_DUMP_NODES=<file>,
+bit-compare debug GGML_CUDA_INK_VERIFY=1 (with graphs disabled).
+tg128 33.0 -> 39.7 tok/s; kld.sh -ub 1 logits md5 identical to baseline.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ b.sh                                |   8 +
+ ggml/src/ggml-cuda/ggml-cuda.cu     |   9 +
+ ggml/src/ggml-cuda/inkling-fuse.cu  | 897 ++++++++++++++++++++++++++++
+ ggml/src/ggml-cuda/inkling-fuse.cuh |  16 +
+ kld.sh                              |  14 +
+ 5 files changed, 944 insertions(+)
+ create mode 100755 b.sh
+ create mode 100644 ggml/src/ggml-cuda/inkling-fuse.cu
+ create mode 100644 ggml/src/ggml-cuda/inkling-fuse.cuh
+ create mode 100755 kld.sh
+
+diff --git a/b.sh b/b.sh
+new file mode 100755
+index 0000000..3014dd6
+--- /dev/null
++++ b/b.sh
+@@ -0,0 +1,8 @@
++#!/bin/bash
++# build helper (run inside container): reconfigure (new .cu files are globbed) + build
++set -e
++export PATH=/opt/rocm/bin:/opt/rocm/llvm/bin:$PATH
++cd /lab/unsloth-llama
++cmake -S . -B build > /lab/logs/ink-cmake.log 2>&1
++cmake --build build --target ggml-hip ggml-cpu llama-bench llama-completion llama-server llama-perplexity --parallel 16 > /lab/logs/ink-build.log 2>&1 || { grep -E "error|FAILED" /lab/logs/ink-build.log | head -30; echo BUILD_FAILED; exit 1; }
++echo BUILD_OK
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index efbbb71..a1e1b5b 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -39,6 +39,7 @@
+ #include "ggml-cuda/mmq-few.cuh"
+ #include "ggml-cuda/mmvf.cuh"
+ #include "ggml-cuda/mmvq.cuh"
++#include "ggml-cuda/inkling-fuse.cuh"
+ #include "ggml-cuda/moe-weighted-reduction.cuh"
+ #include "ggml-cuda/norm.cuh"
+ #include "ggml-cuda/opt-step-adamw.cuh"
+@@ -4590,6 +4591,13 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+         return 0;
+     }
+ 
++    {
++        const int n_inkling = ggml_cuda_try_fuse_inkling(*cuda_ctx, cgraph, i);
++        if (n_inkling > 0) {
++            return n_inkling;
++        }
++    }
++
+     ggml_tensor * node = cgraph->nodes[i];
+ 
+     if (node->op == GGML_OP_MUL_MAT_ID && cuda_ctx->stream_context().concurrent_events.empty() &&
+@@ -5676,6 +5684,7 @@ static bool ggml_cuda_graph_set_enabled(ggml_backend_cuda_context * cuda_ctx, ui
+ 
+ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
+     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
++    ggml_cuda_dump_nodes(cgraph);
+ 
+     ggml_cuda_set_device(cuda_ctx->device);
+ 
+diff --git a/ggml/src/ggml-cuda/inkling-fuse.cu b/ggml/src/ggml-cuda/inkling-fuse.cu
+new file mode 100644
+index 0000000..701971f
+--- /dev/null
++++ b/ggml/src/ggml-cuda/inkling-fuse.cu
+@@ -0,0 +1,897 @@
++#include "inkling-fuse.cuh"
++#include "graph.cuh"
++#include "convert.cuh"
++#include "ggml-impl.h"
++
++#include <atomic>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <set>
++#include <vector>
++
++// ---------------------------------------------------------------------------------------------
++// debug dump
++// ---------------------------------------------------------------------------------------------
++
++void ggml_cuda_dump_nodes(const ggml_cgraph * cgraph) {
++    static const char * path = getenv("GGML_CUDA_DUMP_NODES");
++    if (!path) {
++        return;
++    }
++    static std::set<int> seen;
++    if (!seen.insert(cgraph->n_nodes).second) {
++        return;
++    }
++    FILE * f = fopen(path, "a");
++    if (!f) {
++        return;
++    }
++    fprintf(f, "### graph n_nodes=%d\n", cgraph->n_nodes);
++    for (int i = 0; i < cgraph->n_nodes; ++i) {
++        const ggml_tensor * t = cgraph->nodes[i];
++        fprintf(f, "%d\t%s\t%s\t%s\t[%lld,%lld,%lld,%lld]\tc%d\tu%d\tf%d", i, ggml_op_desc(t), t->name, ggml_type_name(t->type),
++                (long long) t->ne[0], (long long) t->ne[1], (long long) t->ne[2], (long long) t->ne[3],
++                (int) ggml_is_contiguous(t), ggml_node_get_use_count(cgraph, i), (int) t->flags);
++        for (int j = 0; j < GGML_MAX_SRC; ++j) {
++            const ggml_tensor * s = t->src[j];
++            if (s) {
++                fprintf(f, "\t%s:%s:%s[%lld,%lld,%lld,%lld]", ggml_op_desc(s), s->name, ggml_type_name(s->type),
++                        (long long) s->ne[0], (long long) s->ne[1], (long long) s->ne[2], (long long) s->ne[3]);
++            }
++        }
++        fprintf(f, "\n");
++    }
++    fclose(f);
++}
++
++// ---------------------------------------------------------------------------------------------
++// switches and counters
++// ---------------------------------------------------------------------------------------------
++
++static bool ink_env_on(const char * name) {
++    const char * v = getenv(name);
++    return v == nullptr || atoi(v) != 0;
++}
++
++enum ink_fusion {
++    INK_CLIP,
++    INK_SITU,
++    INK_MOE_DOWN,
++    INK_CTRL_NORM,
++    INK_CTRL_GATE,
++    INK_COUNT,
++};
++
++static const char * ink_fusion_names[INK_COUNT] = { "clip", "situ", "moe_down", "ctrl_norm", "ctrl_gate" };
++static const char * ink_fusion_envs[INK_COUNT]  = { "GGML_CUDA_INK_CLIP", "GGML_CUDA_INK_SITU", "GGML_CUDA_INK_MOE_DOWN",
++                                                    "GGML_CUDA_INK_CTRL_NORM", "GGML_CUDA_INK_CTRL_GATE" };
++
++static std::atomic<long long> ink_hits[INK_COUNT];
++
++static bool ink_enabled(ink_fusion f) {
++    static const bool all = ink_env_on("GGML_CUDA_INK_FUSE");
++    static bool       on[INK_COUNT];
++    static bool       init = false;
++    if (!init) {
++        for (int k = 0; k < INK_COUNT; ++k) {
++            on[k] = ink_env_on(ink_fusion_envs[k]);
++        }
++        init = true;
++    }
++    return all && on[f];
++}
++
++static void ink_print_stats() {
++    fprintf(stderr, "inkling fusions (captured nodes):");
++    for (int k = 0; k < INK_COUNT; ++k) {
++        fprintf(stderr, " %s=%lld", ink_fusion_names[k], ink_hits[k].load());
++    }
++    fprintf(stderr, "\n");
++}
++
++void ggml_cuda_inkling_fusion_stats_register() {
++    static bool done = false;
++    if (done) {
++        return;
++    }
++    done = true;
++    const char * v = getenv("GGML_CUDA_FUSION_STATS");
++    if (v && atoi(v) != 0) {
++        atexit(ink_print_stats);
++    }
++}
++
++// ---------------------------------------------------------------------------------------------
++// graph helpers
++// ---------------------------------------------------------------------------------------------
++
++static bool ink_is_noop(const ggml_tensor * t) {
++    return t->op == GGML_OP_NONE || t->op == GGML_OP_RESHAPE || t->op == GGML_OP_VIEW || t->op == GGML_OP_PERMUTE ||
++           t->op == GGML_OP_TRANSPOSE || ggml_is_empty(t);
++}
++
++// next node index > j that is not a view/no-op, or -1
++static int ink_next(const ggml_cgraph * cgraph, int j) {
++    for (++j; j < cgraph->n_nodes; ++j) {
++        if (!ink_is_noop(cgraph->nodes[j])) {
++            return j;
++        }
++    }
++    return -1;
++}
++
++// follow views/reshapes back to the tensor that owns the data computation
++static const ggml_tensor * ink_base(const ggml_tensor * t) {
++    while (t && (t->op == GGML_OP_RESHAPE || t->op == GGML_OP_VIEW) && t->src[0] && t->view_offs == 0 &&
++           ggml_nbytes(t) == ggml_nbytes(t->src[0]) && ggml_is_contiguous(t) && ggml_is_contiguous(t->src[0])) {
++        t = t->src[0];
++    }
++    return t;
++}
++
++static int ink_node_index(const ggml_cgraph * cgraph, const ggml_tensor * t, int lo, int hi) {
++    for (int k = lo; k <= hi; ++k) {
++        if (cgraph->nodes[k] == t) {
++            return k;
++        }
++    }
++    return -1;
++}
++
++// every node in [i0, i1] except `out` must be used only by nodes inside [i0, i1] and must not be an output
++static bool ink_internal_only(const ggml_cgraph * cgraph, int i0, int i1, const ggml_tensor * out) {
++    for (int k = i0; k <= i1; ++k) {
++        const ggml_tensor * n = cgraph->nodes[k];
++        if (n == out) {
++            continue;
++        }
++        if (n->flags & GGML_TENSOR_FLAG_OUTPUT) {
++            return false;
++        }
++        int uses = 0;
++        for (int m = k + 1; m <= i1; ++m) {
++            for (int s = 0; s < GGML_MAX_SRC; ++s) {
++                if (cgraph->nodes[m]->src[s] == n) {
++                    uses++;
++                }
++            }
++        }
++        if (uses != ggml_node_get_use_count(cgraph, k)) {
++            return false;
++        }
++    }
++    return true;
++}
++
++static bool ink_overlap(const ggml_tensor * a, const ggml_tensor * b) {
++    const char * a0 = (const char *) a->data;
++    const char * a1 = a0 + ggml_nbytes(a);
++    const char * b0 = (const char *) b->data;
++    const char * b1 = b0 + ggml_nbytes(b);
++    return a0 < b1 && b0 < a1;
++}
++
++static float ink_param_f32(const ggml_tensor * t, int k) {
++    return ggml_get_op_params_f32(t, k);
++}
++
++// ---------------------------------------------------------------------------------------------
++// clip: [mul(x, s)] -> sqr -> sum_rows -> sqrt -> scale -> fill -> div -> clamp -> mul
++// dst = xs * clamp(fill / (scale * sqrt(sum(xs^2)) + bias), lo, hi), xs = x * s
++// The row sum follows reduce_rows_f32 (same block size and reduction tree), so the result is bit-identical.
++// ---------------------------------------------------------------------------------------------
++
++template <bool has_scale>
++static __global__ void ink_clip_f32(const float * __restrict__ x, const float * __restrict__ s, float * dst, const int ncols,
++                                    const float sc_scale, const float sc_bias, const float fill, const float lo, const float hi) {
++    const int64_t row = blockIdx.x;
++    const int     col = threadIdx.x;
++
++    x += row*ncols;
++    if (has_scale) {
++        s += row*ncols;
++    }
++    dst += row*ncols;
++
++    // same accumulation order as reduce_row_f32 for ncols <= blockDim.x (one element per thread, padded with zeros)
++    float xs = 0.0f;
++    float v  = 0.0f;
++    if (col < ncols) {
++        xs = has_scale ? x[col] * s[col] : x[col];
++        v  = xs * xs;
++    }
++    __shared__ float shared_vals[32];
++    const float sum = block_reduce<block_reduce_method::SUM>(v, shared_vals);
++
++    const float norm   = sqrtf(sum);
++    const float normb  = sc_scale * norm + sc_bias;
++    const float factor = fill / normb;
++    const float c      = fminf(fmaxf(factor, lo), hi);
++
++    if (col < ncols) {
++        dst[col] = xs * c;
++    }
++}
++
++static int ink_try_clip(ggml_backend_cuda_context & ctx, ggml_cgraph * cgraph, int i) {
++    ggml_tensor * n0 = cgraph->nodes[i];
++
++    const ggml_tensor * x      = nullptr;
++    const ggml_tensor * s      = nullptr;
++    const ggml_tensor * xs     = nullptr; // tensor squared and multiplied at the end
++    int                 j      = i;
++
++    if (n0->op == GGML_OP_MUL) {
++        x  = n0->src[0];
++        s  = n0->src[1];
++        xs = n0;
++        if (!ggml_are_same_shape(x, s) || !ggml_are_same_shape(x, n0)) {
++            return 0;
++        }
++        j = ink_next(cgraph, j);
++        if (j < 0) {
++            return 0;
++        }
++    } else if (n0->op != GGML_OP_SQR) {
++        return 0;
++    }
++
++    ggml_tensor * sqr = cgraph->nodes[j];
++    if (sqr->op != GGML_OP_SQR) {
++        return 0;
++    }
++    if (xs) {
++        if (sqr->src[0] != xs) {
++            return 0;
++        }
++    } else {
++        x  = sqr->src[0];
++        xs = x;
++    }
++
++    const ggml_op seq[] = { GGML_OP_SUM_ROWS, GGML_OP_SQRT, GGML_OP_SCALE, GGML_OP_FILL, GGML_OP_DIV, GGML_OP_CLAMP, GGML_OP_MUL };
++    int idx[7];
++    int k = j;
++    for (int q = 0; q < 7; ++q) {
++        k = ink_next(cgraph, k);
++        if (k < 0 || cgraph->nodes[k]->op != seq[q]) {
++            return 0;
++        }
++        idx[q] = k;
++    }
++    ggml_tensor * sum   = cgraph->nodes[idx[0]];
++    ggml_tensor * sqrtn = cgraph->nodes[idx[1]];
++    ggml_tensor * scl   = cgraph->nodes[idx[2]];
++    ggml_tensor * fill  = cgraph->nodes[idx[3]];
++    ggml_tensor * div   = cgraph->nodes[idx[4]];
++    ggml_tensor * clamp = cgraph->nodes[idx[5]];
++    ggml_tensor * out   = cgraph->nodes[idx[6]];
++
++    if (sum->src[0] != sqr || sqrtn->src[0] != sum || scl->src[0] != sqrtn || fill->src[0] != scl ||
++        div->src[0] != fill || div->src[1] != scl || clamp->src[0] != div || out->src[0] != xs || out->src[1] != clamp) {
++        return 0;
++    }
++
++    const int64_t ncols = x->ne[0];
++    const int64_t nrows = ggml_nrows(x);
++    if (x->type != GGML_TYPE_F32 || !ggml_is_contiguous(x) || (s && (s->type != GGML_TYPE_F32 || !ggml_is_contiguous(s))) ||
++        !ggml_is_contiguous(out) || !ggml_are_same_shape(out, x) || sum->ne[0] != 1 || ggml_nrows(sum) != nrows) {
++        return 0;
++    }
++
++    // reduce_rows_f32 launch configuration (sum_rows_f32_cuda)
++    const int nsm   = ggml_cuda_info().devices[ggml_cuda_get_device()].nsm;
++    const int block = (nrows / nsm) < 2 ? 512 : (ncols < 1024 ? 32 : 128);
++    if (ncols > block) {
++        return 0; // the one-element-per-thread form only reproduces the reduction order for ncols <= block
++    }
++
++    if (!ink_internal_only(cgraph, i, idx[6], out)) {
++        return 0;
++    }
++    // the kernel reads x/s and writes out row by row in place: only exact aliasing is safe
++    if ((ink_overlap(out, x) && out->data != x->data) || (s && ink_overlap(out, s) && out->data != s->data)) {
++        return 0;
++    }
++
++    // the FILL value is a constant; the eps of scale and the clamp bounds come from op params
++    const float fval = ink_param_f32(fill, 0);
++    const float s_sc = ink_param_f32(scl, 0);
++    const float s_b  = ink_param_f32(scl, 1);
++    const float lo   = ink_param_f32(clamp, 0);
++    const float hi   = ink_param_f32(clamp, 1);
++
++    cudaStream_t stream = ctx.stream();
++    if (s) {
++        ink_clip_f32<true><<<nrows, block, 0, stream>>>((const float *) x->data, (const float *) s->data, (float *) out->data,
++                                                        ncols, s_sc, s_b, fval, lo, hi);
++    } else {
++        ink_clip_f32<false><<<nrows, block, 0, stream>>>((const float *) x->data, nullptr, (float *) out->data, ncols, s_sc, s_b,
++                                                         fval, lo, hi);
++    }
++    CUDA_CHECK(cudaGetLastError());
++    ink_hits[INK_CLIP]++;
++    return idx[6] - i;
++}
++
++// ---------------------------------------------------------------------------------------------
++// MoE helpers: per-expert scale = scale_w[ids[e]] (REPEAT + GET_ROWS in the graph)
++// ---------------------------------------------------------------------------------------------
++
++struct ink_expert_scale {
++    const ggml_tensor * repeat;
++    const ggml_tensor * get_rows;
++    const ggml_tensor * weight; // [1, n_expert] f32
++    const ggml_tensor * ids;    // [n_used, n_tokens] i32 (may be strided)
++};
++
++// matches REPEAT(w) at node i and GET_ROWS(REPEAT, ids) at the next node; returns the GET_ROWS index or -1
++static int ink_match_expert_scale(const ggml_cgraph * cgraph, int i, ink_expert_scale & m) {
++    const ggml_tensor * rep = cgraph->nodes[i];
++    if (rep->op != GGML_OP_REPEAT || !ggml_are_same_shape(rep, rep->src[0]) || rep->type != GGML_TYPE_F32 ||
++        rep->src[0]->type != GGML_TYPE_F32 || !ggml_is_contiguous(rep->src[0]) || rep->ne[0] != 1) {
++        return -1;
++    }
++    const int j = ink_next(cgraph, i);
++    if (j < 0) {
++        return -1;
++    }
++    const ggml_tensor * gr = cgraph->nodes[j];
++    if (gr->op != GGML_OP_GET_ROWS || gr->src[0] != rep || gr->src[1]->type != GGML_TYPE_I32 || gr->type != GGML_TYPE_F32 ||
++        gr->ne[0] != 1 || gr->src[1]->ne[2] != 1 || gr->src[1]->ne[3] != 1 || gr->src[0]->ne[2] != 1) {
++        return -1;
++    }
++    m.repeat   = rep;
++    m.get_rows = gr;
++    m.weight   = rep->src[0];
++    m.ids      = gr->src[1];
++    return j;
++}
++
++// ---------------------------------------------------------------------------------------------
++// SITU activation on gu = [gate; up] (already scaled per expert, e.g. by the fused NVFP4 mmvq):
++// out = (s2*tanh(s1*g + b1) + b2) * sigmoid(g) * (s4*tanh(s3*u + b3) + b4)
++// graph: SCALE(view g) UNARY(tanh) SCALE UNARY(sigmoid, view g) MUL SCALE(view u) UNARY(tanh) SCALE MUL
++// ---------------------------------------------------------------------------------------------
++
++static __global__ void ink_situ_f32(const float * __restrict__ gu, float * __restrict__ dst, const int n_ff, const int n_used,
++                                    const int64_t gu_nb1, const int64_t gu_nb2, const int64_t g_offs, const int64_t u_offs,
++                                    const float s1, const float b1, const float s2, const float b2,
++                                    const float s3, const float b3, const float s4, const float b4) {
++    const int r = blockIdx.x*blockDim.x + threadIdx.x;
++    const int e = blockIdx.y;
++    const int t = blockIdx.z;
++    if (r >= n_ff) {
++        return;
++    }
++    const float * row = gu + t*gu_nb2 + e*gu_nb1;
++
++    const float g = row[g_offs + r];
++    const float u = row[u_offs + r];
++
++    const float tg  = s1 * g + b1;
++    const float tg2 = tanhf(tg);
++    const float ag  = s2 * tg2 + b2;
++    const float sg  = 1.0f / (1.0f + expf(-g));
++    const float gg  = ag * sg;
++
++    const float tu  = s3 * u + b3;
++    const float tu2 = tanhf(tu);
++    const float au  = s4 * tu2 + b4;
++
++    dst[((int64_t) t*n_used + e)*n_ff + r] = gg * au;
++}
++
++static int ink_try_situ(ggml_backend_cuda_context & ctx, ggml_cgraph * cgraph, int i) {
++    const ggml_op seq[] = { GGML_OP_SCALE, GGML_OP_UNARY, GGML_OP_SCALE, GGML_OP_UNARY, GGML_OP_MUL,
++                            GGML_OP_SCALE, GGML_OP_UNARY, GGML_OP_SCALE, GGML_OP_MUL };
++    int idx[9];
++    int k = i;
++    for (int q = 0; q < 9; ++q) {
++        if (q > 0) {
++            k = ink_next(cgraph, k);
++        }
++        if (k < 0 || cgraph->nodes[k]->op != seq[q]) {
++            return 0;
++        }
++        idx[q] = k;
++    }
++    ggml_tensor * n[9];
++    for (int q = 0; q < 9; ++q) {
++        n[q] = cgraph->nodes[idx[q]];
++    }
++    const ggml_tensor * gview = n[0]->src[0];
++    const ggml_tensor * uview = n[5]->src[0];
++    if (gview->op != GGML_OP_VIEW || uview->op != GGML_OP_VIEW || !gview->view_src || gview->view_src != uview->view_src ||
++        gview->src[0] != gview->view_src || uview->src[0] != uview->view_src || n[3]->src[0] != gview ||
++        ggml_get_unary_op(n[1]) != GGML_UNARY_OP_TANH || ggml_get_unary_op(n[3]) != GGML_UNARY_OP_SIGMOID ||
++        ggml_get_unary_op(n[6]) != GGML_UNARY_OP_TANH ||
++        n[1]->src[0] != n[0] || n[2]->src[0] != n[1] || n[4]->src[0] != n[2] || n[4]->src[1] != n[3] ||
++        n[6]->src[0] != n[5] || n[7]->src[0] != n[6] || n[8]->src[0] != n[4] || n[8]->src[1] != n[7]) {
++        return 0;
++    }
++    const ggml_tensor * gu  = gview->view_src;
++    ggml_tensor *       out = n[8];
++
++    const int64_t n_ff   = gview->ne[0];
++    const int64_t n_used = gu->ne[1];
++    const int64_t n_tok  = gu->ne[2];
++    if (gu->type != GGML_TYPE_F32 || !ggml_is_contiguous(gu) || gu->ne[3] != 1 ||
++        gview->ne[1] != n_used || gview->ne[2] != n_tok || gview->ne[3] != 1 || uview->ne[0] != n_ff || uview->ne[1] != n_used ||
++        uview->ne[2] != n_tok || gview->nb[0] != sizeof(float) || uview->nb[0] != sizeof(float) ||
++        gview->nb[1] != gu->nb[1] || uview->nb[1] != gu->nb[1] || gview->nb[2] != gu->nb[2] || uview->nb[2] != gu->nb[2] ||
++        gview->view_offs % sizeof(float) || uview->view_offs % sizeof(float) ||
++        gview->view_offs + n_ff*sizeof(float) > (size_t) gu->nb[1] || uview->view_offs + n_ff*sizeof(float) > (size_t) gu->nb[1] ||
++        !ggml_is_contiguous(out) || out->ne[0] != n_ff || out->ne[1] != n_used || out->ne[2] != n_tok) {
++        return 0;
++    }
++    for (int q = 0; q < 9; ++q) {
++        if (n[q]->type != GGML_TYPE_F32) {
++            return 0;
++        }
++    }
++    // the views are created before the first SCALE; they are views, so only the computed nodes need checking
++    if (!ink_internal_only(cgraph, i, idx[8], out)) {
++        return 0;
++    }
++    if (ink_overlap(out, gu)) {
++        return 0;
++    }
++
++    const int threads = 256;
++    const dim3 grid((n_ff + threads - 1)/threads, n_used, n_tok);
++    ink_situ_f32<<<grid, threads, 0, ctx.stream()>>>(
++        (const float *) gu->data, (float *) out->data, n_ff, n_used, gu->nb[1]/sizeof(float), gu->nb[2]/sizeof(float),
++        gview->view_offs/sizeof(float), uview->view_offs/sizeof(float),
++        ink_param_f32(n[0], 0), ink_param_f32(n[0], 1), ink_param_f32(n[2], 0), ink_param_f32(n[2], 1),
++        ink_param_f32(n[5], 0), ink_param_f32(n[5], 1), ink_param_f32(n[7], 0), ink_param_f32(n[7], 1));
++    CUDA_CHECK(cudaGetLastError());
++    ink_hits[INK_SITU]++;
++    return idx[8] - i;
++}
++
++// ---------------------------------------------------------------------------------------------
++// MoE down tail: out = sum_e (mm[e] * sc[e]) * w[e], same expression and order as moe_weighted_reduction_f32
++// graph: REPEAT, GET_ROWS, MUL(mm, sc), MUL(., w), n_used views, n_used-1 ADDs
++// ---------------------------------------------------------------------------------------------
++
++static __global__ void ink_moe_down_f32(const float * __restrict__ mm, const float * __restrict__ scale_w, const int32_t * __restrict__ ids,
++                                        const float * __restrict__ w, float * __restrict__ dst, const int64_t n_embd, const int n_used,
++                                        const int64_t ids_nb1_i32, const int64_t w_nb1, const int64_t dst_nb1) {
++    const int64_t t   = blockIdx.x;
++    const int64_t col = (int64_t) blockIdx.y*blockDim.x + threadIdx.x;
++    if (col >= n_embd) {
++        return;
++    }
++    const int32_t * id = ids + t*ids_nb1_i32;
++    const float   * wt = w + t*w_nb1;
++    const float   * x  = mm + t*n_used*n_embd;
++
++    const float first_scale = scale_w[id[0]];
++    float       sum         = (x[col] * first_scale) * wt[0];
++    for (int e = 1; e < n_used; ++e) {
++        const float scale = scale_w[id[e]];
++        sum += (x[e*n_embd + col] * scale) * wt[e];
++    }
++    dst[t*dst_nb1 + col] = sum;
++}
++
++static bool ink_debug() {
++    static const bool on = getenv("GGML_CUDA_INK_DEBUG") != nullptr;
++    return on;
++}
++
++static int ink_try_moe_down_impl(ggml_backend_cuda_context & ctx, ggml_cgraph * cgraph, int i);
++
++static int ink_try_moe_down(ggml_backend_cuda_context & ctx, ggml_cgraph * cgraph, int i) {
++    const int n = ink_try_moe_down_impl(ctx, cgraph, i);
++    if (n == 0 && ink_debug()) {
++        const int j = ink_next(cgraph, i);
++        const int k = j >= 0 ? ink_next(cgraph, j) : -1;
++        fprintf(stderr, "ink moe_down miss at %d %s -> %s -> %s\n", i, cgraph->nodes[i]->name, j >= 0 ? ggml_op_desc(cgraph->nodes[j]) : "-",
++                k >= 0 ? ggml_op_desc(cgraph->nodes[k]) : "-");
++    }
++    return n;
++}
++
++static int ink_try_moe_down_impl(ggml_backend_cuda_context & ctx, ggml_cgraph * cgraph, int i) {
++    ink_expert_scale es;
++    const int jg = ink_match_expert_scale(cgraph, i, es);
++    if (jg < 0) {
++        return 0;
++    }
++    int k = ink_next(cgraph, jg);
++    if (k < 0) {
++        return 0;
++    }
++    ggml_tensor * scaled = cgraph->nodes[k];
++    if (scaled->op != GGML_OP_MUL || scaled->src[1] != es.get_rows || scaled->src[0]->op != GGML_OP_MUL_MAT_ID) {
++        return 0;
++    }
++    const ggml_tensor * mm = scaled->src[0];
++    k = ink_next(cgraph, k);
++    if (k < 0) {
++        return 0;
++    }
++    ggml_tensor * weighted = cgraph->nodes[k];
++    if (weighted->op != GGML_OP_MUL || weighted->src[0] != scaled) {
++        return 0;
++    }
++    const ggml_tensor * w = weighted->src[1];
++
++    const int64_t n_embd = mm->ne[0];
++    const int64_t n_used = mm->ne[1];
++    const int64_t n_tok  = mm->ne[2];
++    if (mm->type != GGML_TYPE_F32 || !ggml_is_contiguous(mm) || mm->ne[3] != 1 || !ggml_is_contiguous(scaled) ||
++        !ggml_is_contiguous(weighted) || w->type != GGML_TYPE_F32 || w->ne[0] != 1 || w->ne[1] != n_used || w->ne[2] != n_tok ||
++        w->nb[1] != sizeof(float) || es.ids->nb[0] != sizeof(int32_t) || es.ids->ne[0] < n_used || es.ids->ne[1] != n_tok ||
++        es.get_rows->ne[1] != n_used || es.get_rows->ne[2] != n_tok || n_used < 2) {
++        return 0;
++    }
++
++    // n_used views of `weighted` followed by an ADD chain ((v0 + v1) + v2) + ...; views may sit anywhere in between
++    const ggml_tensor * views[64] = {};
++    if (n_used > 64) {
++        return 0;
++    }
++    int last = k;
++    const ggml_tensor * acc = nullptr;
++    int n_add = 0;
++    for (int m = k + 1; m < cgraph->n_nodes && n_add < n_used - 1; ++m) {
++        const ggml_tensor * nd = cgraph->nodes[m];
++        if (nd->op == GGML_OP_VIEW && nd->view_src == weighted) {
++            const size_t e = nd->view_offs / weighted->nb[1];
++            if (nd->view_offs % weighted->nb[1] || e >= (size_t) n_used || nd->ne[0] != n_embd || nd->ne[1] != n_tok ||
++                (n_tok > 1 && nd->nb[1] != weighted->nb[2]) || views[e]) {
++                return 0;
++            }
++            views[e] = nd;
++            continue;
++        }
++        if (ink_is_noop(nd)) {
++            continue;
++        }
++        if (nd->op != GGML_OP_ADD) {
++            return 0;
++        }
++        const ggml_tensor * lhs = n_add == 0 ? views[0] : acc;
++        if (!lhs || !views[n_add + 1] || nd->src[0] != lhs || nd->src[1] != views[n_add + 1]) {
++            return 0;
++        }
++        acc  = nd;
++        last = m;
++        n_add++;
++    }
++    if (n_add != n_used - 1) {
++        return 0;
++    }
++    ggml_tensor * out = cgraph->nodes[last];
++    if (out->type != GGML_TYPE_F32 || out->ne[0] != n_embd || ggml_nrows(out) != n_tok || out->nb[0] != sizeof(float)) {
++        return 0;
++    }
++    if (!ink_internal_only(cgraph, i, last, out)) {
++        return 0;
++    }
++    if (ink_overlap(out, mm) || ink_overlap(out, w) || ink_overlap(out, es.ids) || ink_overlap(out, es.weight)) {
++        return 0;
++    }
++
++    const int threads = 256;
++    const dim3 grid(n_tok, (n_embd + threads - 1)/threads, 1);
++    ink_moe_down_f32<<<grid, threads, 0, ctx.stream()>>>(
++        (const float *) mm->data, (const float *) es.weight->data, (const int32_t *) es.ids->data, (const float *) w->data,
++        (float *) out->data, n_embd, (int) n_used, es.ids->nb[1]/sizeof(int32_t), w->nb[2]/sizeof(float), out->nb[1]/sizeof(float));
++    CUDA_CHECK(cudaGetLastError());
++    ink_hits[INK_MOE_DOWN]++;
++    return last - i;
++}
++
++
++// ---------------------------------------------------------------------------------------------
++// loop control (inkling2.cpp control()):
++//   CONCAT(a, b) -> RMS_NORM -> [down GEMV] -> forget GEMV, TANH, SCALE, MUL(., a') ; gain GEMV, TANH, MUL(., b') ; ADD
++// ctrl_norm: CONCAT + RMS_NORM in one kernel (same reduction as rms_norm_f32 vec path, block 1024, vpt 1)
++// ctrl_gate: forget + gain GEMVs (same accumulation as mul_mat_vec_f bf16, one 64-lane wave per row) + epilogue
++// ---------------------------------------------------------------------------------------------
++
++template <int block_size>
++static __global__ void ink_concat_rms_norm_f32(const float * __restrict__ a, const float * __restrict__ b, float * __restrict__ dst,
++                                               const int ncols, const float eps) {
++    const int row = blockIdx.x;
++    const int tid = threadIdx.x;
++    const float * xc   = row == 0 ? a : b;
++    float       * dstc = dst + row*ncols;
++
++    __shared__ float s_sum[32];
++
++    const int ncols4 = ncols / 4;
++    float4 xs = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
++    float  tmp = 0.0f;
++    const int i = tid;
++    if (i < ncols4) {
++        xs = ((const float4 *) xc)[i];
++        tmp += xs.x*xs.x + xs.y*xs.y + xs.z*xs.z + xs.w*xs.w;
++    }
++    tmp = block_reduce<block_reduce_method::SUM, block_size>(tmp, s_sum);
++    const float scale = rsqrtf(tmp / ncols + eps);
++    if (i < ncols4) {
++        float4 r = make_float4(scale*xs.x, scale*xs.y, scale*xs.z, scale*xs.w);
++        ((float4 *) dstc)[i] = r;
++    }
++}
++
++static int ink_try_ctrl_norm(ggml_backend_cuda_context & ctx, ggml_cgraph * cgraph, int i) {
++    ggml_tensor * cat = cgraph->nodes[i];
++    const int j = ink_next(cgraph, i);
++    if (j < 0) {
++        return 0;
++    }
++    ggml_tensor * nrm = cgraph->nodes[j];
++    if (nrm->op != GGML_OP_RMS_NORM || nrm->src[0] != cat || ggml_get_op_params_i32(cat, 0) != 1) {
++        return 0;
++    }
++    const ggml_tensor * a = cat->src[0];
++    const ggml_tensor * b = cat->src[1];
++    const int64_t n = a->ne[0];
++    // rms_norm_f32_dispatch picks the vec path with block 1024, vpt 1 for 512 < n/4 <= 1024
++    if (a->type != GGML_TYPE_F32 || b->type != GGML_TYPE_F32 || nrm->type != GGML_TYPE_F32 || ggml_nelements(a) != n ||
++        ggml_nelements(b) != n || b->ne[0] != n || !ggml_is_contiguous(a) || !ggml_is_contiguous(b) || !ggml_is_contiguous(nrm) ||
++        cat->ne[0] != n || cat->ne[1] != 2 || ggml_nelements(cat) != 2*n || n % 4 != 0 || n/4 <= 512 || n/4 > 1024 ||
++        ((uintptr_t) a->data % 16) || ((uintptr_t) b->data % 16) || ((uintptr_t) nrm->data % 16)) {
++        return 0;
++    }
++    if (!ink_internal_only(cgraph, i, j, nrm) || ink_overlap(nrm, a) || ink_overlap(nrm, b)) {
++        return 0;
++    }
++    float eps;
++    memcpy(&eps, nrm->op_params, sizeof(float));
++    ink_concat_rms_norm_f32<1024><<<2, 1024, 0, ctx.stream()>>>((const float *) a->data, (const float *) b->data, (float *) nrm->data,
++                                                                (int) n, eps);
++    CUDA_CHECK(cudaGetLastError());
++    ink_hits[INK_CTRL_NORM]++;
++    return j - i;
++}
++
++static __device__ __forceinline__ float ink_dot64_bf16(const nv_bfloat16 * w_row, const float * h, const int lane) {
++    float sum = 0.0f;
++    if (lane < 32) {
++        const int    tmpx = ((const int *) w_row)[lane];
++        const float2 tmpy = ((const float2 *) h)[lane];
++        const float tmpx0 = ggml_cuda_cast<float>(reinterpret_cast<const nv_bfloat16 *>(&tmpx)[0]);
++        const float tmpx1 = ggml_cuda_cast<float>(reinterpret_cast<const nv_bfloat16 *>(&tmpx)[1]);
++        ggml_cuda_mad(sum, tmpx0, tmpy.x);
++        ggml_cuda_mad(sum, tmpx1, tmpy.y);
++    }
++    return warp_reduce_sum<64>(sum);
++}
++
++static __global__ void ink_ctrl_gate(const nv_bfloat16 * __restrict__ wf, const nv_bfloat16 * __restrict__ wg, const float * __restrict__ h,
++                                     const float * cur, const float * msg, float * dst, const int n,
++                                     const float s_scale, const float s_bias, float * dbg) {
++    const int lane = threadIdx.x % 64;
++    const int row  = blockIdx.x*(blockDim.x/64) + threadIdx.x/64;
++    if (row >= n) {
++        return;
++    }
++    const float sf = ink_dot64_bf16(wf + (int64_t) row*64, h, lane);
++    const float sg = ink_dot64_bf16(wg + (int64_t) row*64, h, lane);
++    if (lane != 0) {
++        return;
++    }
++    // the graph rounds each product (separate MUL nodes) before the ADD; HIP's __fmul_rn/__fadd_rn still get contracted,
++    // so contraction is switched off for this block. The SCALE node (scale*x + bias) is contracted in scale_f32 as well,
++    // so it is computed outside the no-contract block.
++    const float f  = tanhf(sf);
++    const float fs = s_scale * f + s_bias;
++    const float g  = tanhf(sg);
++    float m1, m2, r;
++    {
++#pragma clang fp contract(off)
++        m1 = fs * cur[row];
++        m2 = g * msg[row];
++        r  = m1 + m2;
++    }
++    if (dbg) {
++        dbg[row] = sf;
++        dbg[n + row] = sg;
++        dbg[2*n + row] = r;
++        dbg[3*n + row] = f;
++        dbg[4*n + row] = fs;
++        dbg[5*n + row] = m1;
++        dbg[6*n + row] = g;
++        dbg[7*n + row] = m2;
++    } else {
++        dst[row] = r;
++    }
++}
++
++
++// GGML_CUDA_INK_VERIFY=1 (debug, needs GGML_CUDA_DISABLE_GRAPHS=1): fused kernels write their results to a scratch buffer,
++// the original nodes still run, and the results are compared bit by bit once the reference nodes have been computed.
++static bool ink_verify() {
++    static const bool on = getenv("GGML_CUDA_INK_VERIFY") != nullptr;
++    return on;
++}
++
++struct ink_verify_entry {
++    const float * mine;
++    const float * ref;
++    int           n;
++    int           ref_idx;
++    int           slot;
++};
++
++static std::vector<ink_verify_entry> ink_pending;
++static unsigned long long * ink_vcnt = nullptr; // [slot*4]: compared, mismatched, first bad index, (float bits mine | ref)
++static const char * ink_vnames[16] = {};
++static float * ink_vfirst = nullptr; // [slot*2]
++
++static __global__ void ink_cmp_kernel(const float * a, const float * b, const int n, unsigned long long * cnt, float * first) {
++    const int i = blockIdx.x*blockDim.x + threadIdx.x;
++    if (i >= n) {
++        return;
++    }
++    if (i == 0) {
++        atomicAdd(&cnt[0], (unsigned long long) n);
++    }
++    if (__float_as_uint(a[i]) != __float_as_uint(b[i])) {
++        const unsigned long long prev = atomicAdd(&cnt[1], 1ULL);
++        if (prev == 0) {
++            cnt[2] = i;
++            first[0] = a[i];
++            first[1] = b[i];
++        }
++    }
++}
++
++static void ink_verify_print() {
++    if (!ink_vcnt) {
++        return;
++    }
++    cudaDeviceSynchronize();
++    for (int k = 0; k < 16; ++k) {
++        if (!ink_vnames[k]) {
++            continue;
++        }
++        fprintf(stderr, "ink verify %-12s compared %llu mismatched %llu first at %llu: fused %.9g ref %.9g\n", ink_vnames[k],
++                ink_vcnt[k*4 + 0], ink_vcnt[k*4 + 1], ink_vcnt[k*4 + 2], ink_vfirst[k*2 + 0], ink_vfirst[k*2 + 1]);
++    }
++}
++
++static void ink_verify_add(const float * mine, const ggml_tensor * ref, int ref_idx, int slot, const char * name) {
++    if (!ink_vcnt) {
++        CUDA_CHECK(cudaMallocManaged(&ink_vcnt, 16*4*sizeof(unsigned long long)));
++        CUDA_CHECK(cudaMallocManaged(&ink_vfirst, 16*2*sizeof(float)));
++        memset(ink_vcnt, 0, 16*4*sizeof(unsigned long long));
++        atexit(ink_verify_print);
++    }
++    ink_vnames[slot] = name;
++    ink_pending.push_back({ mine, (const float *) ref->data, (int) ggml_nelements(ref), ref_idx, slot });
++}
++
++static void ink_verify_flush(ggml_backend_cuda_context & ctx, int i) {
++    for (size_t k = 0; k < ink_pending.size();) {
++        const ink_verify_entry & e = ink_pending[k];
++        if (e.ref_idx < i) {
++            ink_cmp_kernel<<<(e.n + 255)/256, 256, 0, ctx.stream()>>>(e.mine, e.ref, e.n, ink_vcnt + e.slot*4, ink_vfirst + e.slot*2);
++            ink_pending.erase(ink_pending.begin() + k);
++        } else {
++            ++k;
++        }
++    }
++}
++
++static int ink_try_ctrl_gate(ggml_backend_cuda_context & ctx, ggml_cgraph * cgraph, int i) {
++    // i: forget MUL_MAT
++    const ggml_op seq[] = { GGML_OP_MUL_MAT, GGML_OP_UNARY, GGML_OP_SCALE, GGML_OP_MUL, GGML_OP_MUL_MAT, GGML_OP_UNARY, GGML_OP_MUL, GGML_OP_ADD };
++    int idx[8];
++    int k = i;
++    for (int q = 0; q < 8; ++q) {
++        if (q > 0) {
++            k = ink_next(cgraph, k);
++        }
++        if (k < 0 || cgraph->nodes[k]->op != seq[q]) {
++            return 0;
++        }
++        idx[q] = k;
++    }
++    ggml_tensor * n[8];
++    for (int q = 0; q < 8; ++q) {
++        n[q] = cgraph->nodes[idx[q]];
++    }
++    const ggml_tensor * wf  = n[0]->src[0];
++    const ggml_tensor * h   = n[0]->src[1];
++    const ggml_tensor * wg  = n[4]->src[0];
++    const ggml_tensor * cur = n[3]->src[1];
++    const ggml_tensor * msg = n[6]->src[1];
++    ggml_tensor *       out = n[7];
++    if (ggml_get_unary_op(n[1]) != GGML_UNARY_OP_TANH || ggml_get_unary_op(n[5]) != GGML_UNARY_OP_TANH ||
++        n[1]->src[0] != n[0] || n[2]->src[0] != n[1] || n[3]->src[0] != n[2] || n[4]->src[1] != h || n[5]->src[0] != n[4] ||
++        n[6]->src[0] != n[5] || n[7]->src[0] != n[3] || n[7]->src[1] != n[6]) {
++        return 0;
++    }
++    const int64_t nout = wf->ne[1];
++    if (wf->type != GGML_TYPE_BF16 || wg->type != GGML_TYPE_BF16 || wf->ne[0] != 64 || wg->ne[0] != 64 || wg->ne[1] != nout ||
++        !ggml_is_contiguous(wf) || !ggml_is_contiguous(wg) || h->type != GGML_TYPE_F32 || ggml_nelements(h) != 64 ||
++        !ggml_is_contiguous(h) || cur->type != GGML_TYPE_F32 || msg->type != GGML_TYPE_F32 || ggml_nelements(cur) != nout ||
++        ggml_nelements(msg) != nout || !ggml_is_contiguous(cur) || !ggml_is_contiguous(msg) || out->type != GGML_TYPE_F32 ||
++        ggml_nelements(out) != nout || !ggml_is_contiguous(out) || ((uintptr_t) h->data % 8) || ggml_nelements(n[0]) != nout) {
++        return 0;
++    }
++    if (!ink_internal_only(cgraph, i, idx[7], out)) {
++        return 0;
++    }
++    if (ink_overlap(out, h) || (ink_overlap(out, cur) && out->data != cur->data) || (ink_overlap(out, msg) && out->data != msg->data)) {
++        return 0;
++    }
++    const int rows_per_block = 4;
++    float * dbg = nullptr;
++    if (ink_verify()) {
++        CUDA_CHECK(cudaMalloc(&dbg, 8*nout*sizeof(float)));
++        ink_verify_add(dbg + 3*nout, n[1], idx[1], 3, "gate.tanh_f");
++        ink_verify_add(dbg + 4*nout, n[2], idx[2], 4, "gate.scale");
++        ink_verify_add(dbg + 5*nout, n[3], idx[3], 5, "gate.mul1");
++        ink_verify_add(dbg + 6*nout, n[5], idx[5], 6, "gate.tanh_g");
++        ink_verify_add(dbg + 7*nout, n[6], idx[6], 7, "gate.mul2");
++        ink_verify_add(dbg,          n[0], idx[0], 0, "gate.forget");
++        ink_verify_add(dbg + nout,   n[4], idx[4], 1, "gate.gain");
++        ink_verify_add(dbg + 2*nout, out,  idx[7], 2, "gate.out");
++    }
++    ink_ctrl_gate<<<(nout + rows_per_block - 1)/rows_per_block, 64*rows_per_block, 0, ctx.stream()>>>(
++        (const nv_bfloat16 *) wf->data, (const nv_bfloat16 *) wg->data, (const float *) h->data, (const float *) cur->data,
++        (const float *) msg->data, (float *) out->data, (int) nout, ink_param_f32(n[2], 0), ink_param_f32(n[2], 1), dbg);
++    CUDA_CHECK(cudaGetLastError());
++    ink_hits[INK_CTRL_GATE]++;
++    if (dbg) {
++        return 0; // let the original nodes run, compare later
++    }
++    return idx[7] - i;
++}
++
++// ---------------------------------------------------------------------------------------------
++
++int ggml_cuda_try_fuse_inkling(ggml_backend_cuda_context & ctx, ggml_cgraph * cgraph, int i) {
++    ggml_cuda_inkling_fusion_stats_register();
++
++    const ggml_tensor * node = cgraph->nodes[i];
++    if (!ctx.stream_context().concurrent_events.empty()) {
++        return 0;
++    }
++    if (ink_verify()) {
++        ink_verify_flush(ctx, i);
++    }
++
++    int n = 0;
++    switch (node->op) {
++        case GGML_OP_MUL:
++        case GGML_OP_SQR:
++            if (ink_enabled(INK_CLIP)) {
++                n = ink_try_clip(ctx, cgraph, i);
++            }
++            break;
++        case GGML_OP_SCALE:
++            if (ink_enabled(INK_SITU)) {
++                n = ink_try_situ(ctx, cgraph, i);
++            }
++            break;
++        case GGML_OP_REPEAT:
++            if (ink_enabled(INK_MOE_DOWN)) {
++                n = ink_try_moe_down(ctx, cgraph, i);
++            }
++            break;
++        case GGML_OP_CONCAT:
++            if (ink_enabled(INK_CTRL_NORM)) {
++                n = ink_try_ctrl_norm(ctx, cgraph, i);
++            }
++            break;
++        case GGML_OP_MUL_MAT:
++            if (ink_enabled(INK_CTRL_GATE)) {
++                n = ink_try_ctrl_gate(ctx, cgraph, i);
++            }
++            break;
++        default:
++            break;
++    }
++    return n;
++}
+diff --git a/ggml/src/ggml-cuda/inkling-fuse.cuh b/ggml/src/ggml-cuda/inkling-fuse.cuh
+new file mode 100644
+index 0000000..0675c44
+--- /dev/null
++++ b/ggml/src/ggml-cuda/inkling-fuse.cuh
+@@ -0,0 +1,16 @@
++#pragma once
++
++#include "common.cuh"
++
++// Inkling-2 decode fusions (MI210 work). Each fusion matches the node sequence that
++// src/models/inkling2.cpp emits and replaces it with one kernel. Every fusion has an
++// opt-out env var (set to 0 to disable); GGML_CUDA_INKLING_FUSE=0 disables all.
++
++// debug: GGML_CUDA_DUMP_NODES=<file> appends every node of each distinct graph size once
++void ggml_cuda_dump_nodes(const ggml_cgraph * cgraph);
++
++// returns the number of extra nodes consumed (0 = no fusion)
++int ggml_cuda_try_fuse_inkling(ggml_backend_cuda_context & ctx, ggml_cgraph * cgraph, int i);
++
++// prints per-fusion hit counters at exit when GGML_CUDA_FUSION_STATS=1
++void ggml_cuda_inkling_fusion_stats_register();
+diff --git a/kld.sh b/kld.sh
+new file mode 100755
+index 0000000..cc0d2e4
+--- /dev/null
++++ b/kld.sh
+@@ -0,0 +1,14 @@
++#!/bin/bash
++# decode-path logits check (run inside the container). usage: kld.sh <bindir> <tag> [chunks]
++# writes /lab/results/inkkld-<tag>.bin (llama-perplexity --kl-divergence-base with -ub 1 = single-token decode graphs)
++# and prints its md5; if /lab/results/inkkld-base.bin exists and tag != base, also prints KLD vs base.
++B=$1; TAG=$2; CH=${3:-3}
++M=/data/model/Inkling-2-Mini-GGUF/Inkling-2-Mini-UD-Q8_K_XL.gguf
++export LD_LIBRARY_PATH=$B:/opt/rocm/lib
++O=/lab/results/inkkld-$TAG.bin
++$B/llama-perplexity -m $M -f /lab/eval/ppl.txt -c 512 --chunks $CH -b 512 -ub 1 -ngl 999 -fa on --kl-divergence-base $O > /lab/results/inkkld-$TAG.log 2>&1
++echo "$TAG md5 $(md5sum < $O | cut -c1-12) $(grep -o "Final estimate: PPL = [0-9.]*" /lab/results/inkkld-$TAG.log)"
++if [ "$TAG" != base ] && [ -f /lab/results/inkkld-base.bin ] && ! cmp -s $O /lab/results/inkkld-base.bin; then
++  $B/llama-perplexity -m $M -f /lab/eval/ppl.txt -c 512 --chunks $CH -b 512 -ub 1 -ngl 999 -fa on --kl-divergence-base /lab/results/inkkld-base.bin --kl-divergence > /lab/results/inkkld-$TAG-cmp.log 2>&1
++  grep -E "Mean    KLD|Maximum KLD|Same top p|Mean PPL\(Q\)" /lab/results/inkkld-$TAG-cmp.log | sed "s/^/  /"
++fi
+-- 
+2.43.0
+
