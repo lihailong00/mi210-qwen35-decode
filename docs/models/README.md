@@ -7,6 +7,7 @@
 | 模型 id | 架构 | 后端 / 权重 | 状态 | 文档 |
 | --- | --- | --- | --- | --- |
 | `qwen3.8-27b` | qwen35（48 层 Gated DeltaNet + 16 层全注意力，带 MTP） | llama.cpp，IQ3_S GGUF；vLLM，官方 FP8 | decode / prefill / MTP 已完成 | [qwen3.8-27b/](qwen3.8-27b/README.md) |
+| `inkling-2-mini` | inkling2（循环 MoE，128 专家选 8，24 层权重跑 48 次，带 DSpark drafter） | llama.cpp（Unsloth 合并版 b12588），UD-Q8_K_XL GGUF（NVFP4 + BF16） | 只有基线 | [inkling-2-mini/](inkling-2-mini/README.md) |
 
 ## 每个模型目录里放什么
 
