@@ -1,6 +1,6 @@
 # Inkling-2-Mini
 
-第二个模型。基线 decode 33.3 token/s；第一阶段（小算子融合，logits 与基线逐位相同）后 **44.8** token/s。
+第二个模型。基线 decode 33.3 token/s；第一阶段（小算子融合，logits 与基线逐位相同）后 44.8 token/s；第二阶段（GEMV）后 **50.7** token/s，KLD 在求和顺序的噪声底线上。
 
 - **权重**：Unsloth 的 `Inkling-2-Mini-UD-Q8_K_XL.gguf`（ModelScope `unsloth/Inkling-2-Mini-GGUF` 根目录，Unsloth 循环层布局，22,867,451,616 字节，SHA-256 以 dfb04bf3 开头）。专家权重 NVFP4 共 11.47 GB，其余（注意力、最后 4 层的专家、词嵌入、LM head）为 BF16 共 11.35 GB。
 - **投机解码 drafter**：`dspark/dspark-Inkling-2-Mini-BF16.gguf`（架构 dflash，DSpark = DFlash 块 drafter + Markov 头，3 层，块大小 8，647,792,800 字节，SHA-256 以 b8985695 开头）。
@@ -144,9 +144,36 @@ decode 只到上限的约 15%。
 - 把后面节点的结果提前算（或把输入推后读）时，ggml-alloc 会复用中间缓冲区，必须逐个检查中间节点的读写范围；view 节点不读写内存，0 行的空张量的 `ggml_nbytes` 不可信，两者都要排除。
 - `GGML_CUDA_DISABLE_GRAPHS` 只看是否设置，设成 0 也会关 graph。
 
+## decode GEMV（第二阶段）
+
+代码在同一分支（提交 b888be8，补丁 0003），新文件 `ggml/src/ggml-cuda/inkling-gemv.cu`。只处理单 token。
+
+- **NVFP4 MoE 专家**（`MUL_MAT_ID`）：原来 CDNA 上 `mul_mat_vec_q` 每行一个 block（2 个 wave），一行只有 36 个 64 值块，线程大多空闲，还要调度 18432 个小 block。现在 8 条 lane 一行、256 线程一个 block；q8_1 激活放进 LDS；int8 点积与原来相同；UE4M3 尺度原来在 gfx90a 上走 `ldexpf` + 除法的慢路径，换成按位构造（结果完全相同）；每专家 scale 的 RESHAPE/REPEAT/GET_ROWS/MUL 一并融合。最好情况约 1.3 TB/s。
+- **BF16 投影**（`MUL_MAT`）：16 字节读取（8 个 bf16），按行数选 32 / 64 / 256 条 lane 一行（256 即一行一个 block）。共用同一激活向量的几个 GEMV（如 q、rel、sink、gate，非循环层还有 k、v）合成一次 launch，后面的提前计算，同样做缓冲区复用检查。q/gate/o 约 1.2 TB/s，LM head 约 1.4 TB/s。
+- **mix** 改为单个 1024 线程 block：所有状态一次读入，rms 的两级归约树与原来相同（仍逐位相同），归一化结果放 LDS，转置输出按连续段写；状态数 S ≤ 5 用模板实例化，避免寄存器数组溢出到 scratch。
+- 开关：`GGML_CUDA_INK_NVFP4=0`、`GGML_CUDA_INK_BF16=0`、`GGML_CUDA_INK_BF16_MERGE=0`。
+
+| 测试 | 第一阶段 | 第二阶段 |
+| --- | --- | --- |
+| llama-bench tg128 | 44.8 token/s | **50.7** token/s |
+| llama-server 贪心 | 44.4 | **50.2** |
+| llama-server 采样 | 42.8 | **48.1** |
+
+正确性：两个 GEMV 只改变 fp32 部分和的相加顺序（权重、int8 激活量化、乘积都相同），所以这里的 KLD 就是本模型的求和顺序噪声底线：与基线 logits 的平均 KLD 0.00079，top-1 相同 99.87%（Qwen3.8-27B 的同类底线是 0.00114）。关掉这两个开关时 logits 仍与基线逐位相同。贪心输出在第 130–600 个字符后开始与基线不同。
+
+经验：
+
+- gfx90a 没有 FP8 硬件，`ggml_cuda_ue4m3_to_fp32` 走带分支、`ldexpf` 和除法的回退路径，每 16 个值一次，在 GEMV 里是明显的 ALU 开销。
+- 单 block 内核的寄存器数组只要有运行时下标就会溢出到 scratch（rocprofv3 的 `Scratch_Size` 列可以看到），改成模板参数后消失。
+- 从一个 CU 发出跨步 4 字节的写（每次写都落在不同 cache line）很慢；让每个线程写一段连续区间。
+- rocprofv3 下单个 kernel 的耗时会被放大、方差很大，取舍以 llama-bench 交替 A/B 为准（`ksweep.sh` 只用来看相对差别）。
+
 ## 下一步方向
 
-1. 剩下的大头是两类 GEMV：BF16 投影（q/gate/o/k/v/rel/sink，约 0.6–0.9 TB/s）和 NVFP4 专家（约 0.43 TB/s）。把它们提到 1.1–1.3 TB/s 预计每 token 省 4–5 ms；GEMV 改写会改变归约顺序，正确性按 KLD 噪声底线验收（见 [method.md](../../mi210/method.md)）。
-2. 继续融合：注意力的相对位置偏置准备（pad 是常量权重，可提到加载时）、mix 输出的 view/cont 拷贝、残差 add，3 个 query 的 mix，动态卷积。
-3. 多 token 验证（DSpark）的 graph 也要融合，并做专家去重，DSpark 才可能有收益。
-4. 是否把 inkling2 架构移植进本仓库的源码树：目前优化都在 Unsloth 合并版上，以补丁形式保存在 [patches/](patches/)。
+现在约 19.7 ms/token，带宽下限约 4.3 ms。剩下的主要部分（rocprofv3 估计）：
+
+1. 小算子仍有约 3400 个 kernel/token：残差 add、mix 输出的 view/cont 拷贝（memcpy）、注意力相对位置偏置的准备（pad 的是常量权重，可以提到加载时）、K/V cache 写入、3 个 query 的 mix、动态卷积。
+2. flash attention decode 约 22 µs/次（48 次/token）。
+3. NVFP4 GEMV 前的 q8_1 量化可以并进 GEMV（88 次 launch/token）；最后 4 层的 BF16 专家仍走 `mul_mat_vec_f`。
+4. DSpark 的多 token 验证 graph 没有融合，也没有专家去重；现在开 DSpark 比不开慢。
+5. 是否把 inkling2 架构移植进本仓库的源码树：目前优化都在 Unsloth 合并版上，以补丁形式保存在 [patches/](patches/)。

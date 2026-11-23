@@ -1,7 +1,7 @@
 From 5c7417fc5585c2dd08256d9bff302226e940757c Mon Sep 17 00:00:00 2001
 From: mi210 <mi210@local>
 Date: Tue, 24 Nov 2026 03:26:25 +0800
-Subject: [PATCH 2/2] hip: Inkling-2 decode fusions round 2 (mix, short conv)
+Subject: [PATCH 2/3] hip: Inkling-2 decode fusions round 2 (mix, short conv)
 
 - mix: concat chain + rms_norm + transpose copy + query repeat + score
   GEMV + softmax in one kernel (one block per state, last block does the

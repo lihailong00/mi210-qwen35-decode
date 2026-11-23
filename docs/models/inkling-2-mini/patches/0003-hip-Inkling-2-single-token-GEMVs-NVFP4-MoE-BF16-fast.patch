@@ -1,0 +1,777 @@
+From b888be8f1880591934f8e914fd256c22587a5608 Mon Sep 17 00:00:00 2001
+From: mi210 <mi210@local>
+Date: Tue, 24 Nov 2026 04:19:24 +0800
+Subject: [PATCH 3/3] hip: Inkling-2 single-token GEMVs (NVFP4 MoE, BF16) +
+ faster mix
+
+- NVFP4 MUL_MAT_ID (one token): 8 lanes per row, 256-thread blocks,
+  q8_1 activations staged in LDS, int8 dot products as mul_mat_vec_q,
+  exact bit-built UE4M3 decode (the gfx90a fallback used ldexpf + div),
+  per-expert scale (RESHAPE/REPEAT/GET_ROWS/MUL) fused. ~1.3 TB/s.
+- BF16 MUL_MAT (one token): 16-byte loads, 32/64/256 lanes per row by
+  row count; GEMVs sharing the activation are merged into one launch
+  (later ones computed early, guarded by the buffer-reuse check).
+  q/gate/o ~1.2 TB/s, LM head ~1.4 TB/s.
+- mix: single 1024-thread block, all states loaded at once, the same
+  two-level rms reduction tree (bit-identical), normalized states in LDS,
+  contiguous transposed writes; S <= 5 templated (no scratch).
+Switches GGML_CUDA_INK_NVFP4/_BF16/_BF16_MERGE=0. tg128 44.8 -> 50.7
+tok/s; KLD vs baseline 0.00079 (top-1 99.87%), the GEMV summation-order
+noise floor; with the GEMVs off logits stay bit-identical.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ ggml/src/ggml-cuda/inkling-fuse.cu  | 136 ++++++---
+ ggml/src/ggml-cuda/inkling-fuse.cuh |   3 +
+ ggml/src/ggml-cuda/inkling-gemv.cu  | 440 ++++++++++++++++++++++++++++
+ ggml/src/ggml-cuda/inkling-gemv.cuh |   7 +
+ ksweep.sh                           |  21 ++
+ 5 files changed, 572 insertions(+), 35 deletions(-)
+ create mode 100644 ggml/src/ggml-cuda/inkling-gemv.cu
+ create mode 100644 ggml/src/ggml-cuda/inkling-gemv.cuh
+ create mode 100755 ksweep.sh
+
+diff --git a/ggml/src/ggml-cuda/inkling-fuse.cu b/ggml/src/ggml-cuda/inkling-fuse.cu
+index d720323..87693e9 100644
+--- a/ggml/src/ggml-cuda/inkling-fuse.cu
++++ b/ggml/src/ggml-cuda/inkling-fuse.cu
+@@ -1,4 +1,5 @@
+ #include "inkling-fuse.cuh"
++#include "inkling-gemv.cuh"
+ #include "graph.cuh"
+ #include "convert.cuh"
+ #include "ggml-impl.h"
+@@ -876,6 +877,7 @@ struct ink_mix_args {
+     float       * cont;                     // CONT dst [S, n]
+     float       * smax;                     // SOFT_MAX dst [S, nq]
+     float       * scores_dbg;               // verify only: scores [S, nq]
++    int           stop_phase;               // debug timing: return after this phase (0 = run all)
+     int           n;
+     int           S;
+     int           nq;
+@@ -885,50 +887,91 @@ struct ink_mix_args {
+ 
+ static int * ink_mix_counter = nullptr;
+ 
+-// grid: one 1024-thread block per state row (rms_norm), the last block to finish computes scores + softmax
++// Single 1024-thread block. Step 1 reproduces rms_norm_f32<float, 1024, 1, true> for all S rows in parallel:
++// thread t of the original holds float4 t (t < n/4) and block_reduce sums WARP_SIZE(32)-lane groups, then the 32 group sums.
++// Here a 32-lane group computes one (row, 32-thread chunk) partial with the same warp_reduce_sum<32>, the 32 chunk sums of a
++// row (zeros past n/4) are then reduced by one more warp_reduce_sum<32>: the same tree, so bit-identical, without
++// any cross-block synchronisation.
++template <int S>
+ static __global__ void __launch_bounds__(1024) ink_mix_kernel(const ink_mix_args a, int * counter) {
++    GGML_UNUSED(counter);
+     const int tid = threadIdx.x;
+     const int n   = a.n;
+-    const int S   = a.S;
++    const int ncols4 = n / 4;
+ 
+-    __shared__ float s_sum[32];
++    __shared__ float chunk_sum[INK_MIX_MAX_STATES][32];
++    __shared__ float row_scale[INK_MIX_MAX_STATES];
+     __shared__ float buf_iw[8][64];
+     __shared__ float scores[INK_MIX_MAX_Q][INK_MIX_MAX_STATES];
+-    __shared__ int   ticket;
+ 
+-    // 1. rms_norm of state row s: identical to rms_norm_f32<float, 1024, 1, true> on a [n, S] tensor
+-    {
+-        const int s = blockIdx.x;
+-        const int ncols4 = n / 4;
+-        const float * xc = a.rows[s];
+-        float4 xs  = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+-        float  tmp = 0.0f;
++    constexpr int CH  = WARP_SIZE;   // block_reduce's warp width
++    // thread tid plays thread tid of rms_norm_f32<float, 1024, 1, true> for every row: all S loads in flight at once
++    float4 xs[S];
++#pragma unroll
++    for (int s = 0; s < S; ++s) {
++        xs[s] = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+         if (tid < ncols4) {
+-            xs = ((const float4 *) xc)[tid];
+-            tmp += xs.x*xs.x + xs.y*xs.y + xs.z*xs.z + xs.w*xs.w;
++            xs[s] = ((const float4 *) a.rows[s])[tid];
+         }
+-        tmp = block_reduce<block_reduce_method::SUM, 1024>(tmp, s_sum);
+-        const float scale = rsqrtf(tmp / n + a.eps);
+-        if (tid < ncols4) {
+-            const float4 r = make_float4(scale*xs.x, scale*xs.y, scale*xs.z, scale*xs.w);
+-            ((float4 *) (a.nrm + (int64_t) s*n))[tid] = r;
+-            const int c = 4*tid;
+-            a.cont[(int64_t) (c + 0)*S + s] = r.x;
+-            a.cont[(int64_t) (c + 1)*S + s] = r.y;
+-            a.cont[(int64_t) (c + 2)*S + s] = r.z;
+-            a.cont[(int64_t) (c + 3)*S + s] = r.w;
++    }
++#pragma unroll
++    for (int s = 0; s < S; ++s) {
++        if (s < S) {
++            float tmp = 0.0f;
++            if (tid < ncols4) {
++                tmp += xs[s].x*xs[s].x + xs[s].y*xs[s].y + xs[s].z*xs[s].z + xs[s].w*xs[s].w;
++            }
++            tmp = warp_reduce_sum<CH>(tmp);
++            if (tid % CH == 0) {
++                chunk_sum[s][tid / CH] = tmp;
++            }
+         }
+     }
+-    __threadfence();
+     __syncthreads();
+-    if (tid == 0) {
+-        ticket = atomicAdd(counter, 1);
++    {
++        constexpr int NCH = 1024 / CH;
++        const int grp  = tid / CH;
++        const int glan = tid % CH;
++        if (grp < S) {
++            float v = glan < NCH ? chunk_sum[grp][glan] : 0.0f;
++            v = warp_reduce_sum<CH>(v);
++            if (glan == 0) {
++                row_scale[grp] = rsqrtf(v / n + a.eps);
++            }
++        }
+     }
+     __syncthreads();
+-    if (ticket != S - 1) {
+-        return;
++    // normalized rows -> LDS (and nrm in verify mode); cont [S, n]: thread tid owns the contiguous run cont[4*tid*S, 4*(tid+1)*S)
++    extern __shared__ float nrm_lds[];
++    if (tid < ncols4) {
++        float4 r[S];
++#pragma unroll
++        for (int s = 0; s < S; ++s) {
++            if (s < S) {
++                const float scale = row_scale[s];
++                r[s] = make_float4(scale*xs[s].x, scale*xs[s].y, scale*xs[s].z, scale*xs[s].w);
++                ((float4 *) (nrm_lds + s*n))[tid] = r[s];
++                if (a.nrm) {
++                    ((float4 *) (a.nrm + (int64_t) s*n))[tid] = r[s];
++                }
++            }
++        }
++        float * run = a.cont + (int64_t) 4*tid*S;
++        // element (c = 4*tid + e, s) at e*S + s within the run
++        float vals[4*S];
++#pragma unroll
++        for (int e = 0; e < 4; ++e) {
++#pragma unroll
++            for (int ss = 0; ss < S; ++ss) {
++                vals[e*S + ss] = e == 0 ? r[ss].x : e == 1 ? r[ss].y : e == 2 ? r[ss].z : r[ss].w;
++            }
++        }
++#pragma unroll
++        for (int q4 = 0; q4 < S; ++q4) {
++            ((float4 *) run)[q4] = make_float4(vals[4*q4 + 0], vals[4*q4 + 1], vals[4*q4 + 2], vals[4*q4 + 3]);
++        }
+     }
+-    __threadfence();
++    __syncthreads();
+ 
+     // 2. scores[j][s] = dot(nrm[s], q[j]): mul_mat_vec_f<float, float, nq, 128> with one 128-thread group per row
+     const int g  = tid / 128;
+@@ -943,7 +986,7 @@ static __global__ void __launch_bounds__(1024) ink_mix_kernel(const ink_mix_args
+ 
+         float sumf[INK_MIX_MAX_Q] = { 0.0f };
+         if (s < S) {
+-            const float2 * x2 = (const float2 *) (a.nrm + (int64_t) s*n);
++            const float2 * x2 = (const float2 *) (nrm_lds + s*n);
+             const float2 * y2 = (const float2 *) a.q;
+             for (int col2 = lt; col2 < ncols2; col2 += 128) {
+                 const float2 tmpx = x2[col2];
+@@ -987,6 +1030,9 @@ static __global__ void __launch_bounds__(1024) ink_mix_kernel(const ink_mix_args
+         __syncthreads();
+     }
+ 
++    if (a.stop_phase == 2) {
++        return;
++    }
+     // 3. softmax over S for each query: soft_max_f32<true, 0, 0> with a 32-thread block (lanes 0..31 of wave j)
+     const int w    = tid / 64;
+     const int lane = tid % 64;
+@@ -1011,9 +1057,6 @@ static __global__ void __launch_bounds__(1024) ink_mix_kernel(const ink_mix_args
+             a.smax[j*S + col] = val * inv_sum;
+         }
+     }
+-    if (tid == 0) {
+-        *counter = 0;
+-    }
+ }
+ 
+ static bool ink_out_of(const ggml_tensor * t, ggml_tensor * const * outs, int n_outs) {
+@@ -1135,6 +1178,9 @@ static int ink_try_mix(ggml_backend_cuda_context & ctx, ggml_cgraph * cgraph, in
+         return 0;
+     }
+     const int nq = (int) rep->ne[1];
++    if ((size_t) S*n*sizeof(float) > 48*1024 || S > 5) {
++        return 0; // normalized states are kept in LDS; kernels are instantiated for S <= 5
++    }
+     // nq == 3 (full-attention layers) does not reproduce mul_mat_vec_f<float, float, 3> bit for bit yet: leave it unfused
+     if (nq > 2) {
+         return 0;
+@@ -1180,7 +1226,7 @@ static int ink_try_mix(ggml_backend_cuda_context & ctx, ggml_cgraph * cgraph, in
+ 
+     memcpy(&a.eps, nrm->op_params, sizeof(float));
+     a.q        = (const float *) rep->src[0]->data;
+-    a.nrm      = (float *) nrm->data;
++    a.nrm      = nullptr; // internal: only needed when verifying
+     a.cont     = (float *) cont->data;
+     a.smax     = (float *) sm->data;
+     a.n        = (int) n;
+@@ -1188,6 +1234,8 @@ static int ink_try_mix(ggml_backend_cuda_context & ctx, ggml_cgraph * cgraph, in
+     a.nq       = nq;
+     a.sm_scale = sm_scale;
+     a.scores_dbg = nullptr;
++    static const int stop_phase = getenv("GGML_CUDA_INK_MIX_STOP") ? atoi(getenv("GGML_CUDA_INK_MIX_STOP")) : 0;
++    a.stop_phase = stop_phase;
+     if (ink_verify()) {
+         float * dbg = nullptr;
+         CUDA_CHECK(cudaMalloc(&dbg, (2*S*n + 2*S*nq)*sizeof(float)));
+@@ -1212,7 +1260,15 @@ static int ink_try_mix(ggml_backend_cuda_context & ctx, ggml_cgraph * cgraph, in
+     }
+     int * counter = ink_mix_counter + next_slot;
+     next_slot = (next_slot + 1) % n_slots;
+-    ink_mix_kernel<<<S, 1024, 0, ctx.stream()>>>(a, counter);
++    const size_t smem = (size_t) S*n*sizeof(float);
++    switch (S) {
++        case 1: ink_mix_kernel<1><<<1, 1024, smem, ctx.stream()>>>(a, counter); break;
++        case 2: ink_mix_kernel<2><<<1, 1024, smem, ctx.stream()>>>(a, counter); break;
++        case 3: ink_mix_kernel<3><<<1, 1024, smem, ctx.stream()>>>(a, counter); break;
++        case 4: ink_mix_kernel<4><<<1, 1024, smem, ctx.stream()>>>(a, counter); break;
++        case 5: ink_mix_kernel<5><<<1, 1024, smem, ctx.stream()>>>(a, counter); break;
++        default: GGML_ABORT("ink mix: S");
++    }
+     CUDA_CHECK(cudaGetLastError());
+     ink_hits[INK_MIX]++;
+     if (a.scores_dbg) {
+@@ -1236,6 +1292,10 @@ void ggml_cuda_inkling_begin(const ggml_cgraph * cgraph) {
+     ink_sconv_pending_ref().clear();
+ }
+ 
++void ggml_cuda_inkling_defer_skip(const ggml_tensor * node) {
++    ink_skip.insert(node);
++}
++
+ bool ggml_cuda_inkling_should_skip(const ggml_tensor * node) {
+     if (ink_skip.empty()) {
+         return false;
+@@ -1620,6 +1680,9 @@ int ggml_cuda_try_fuse_inkling(ggml_backend_cuda_context & ctx, ggml_cgraph * cg
+         case GGML_OP_SSM_CONV:
+             n = ink_launch_sconv(ctx, cgraph, i);
+             break;
++        case GGML_OP_MUL_MAT_ID:
++            n = ggml_cuda_ink_try_gemv(ctx, cgraph, i);
++            break;
+         case GGML_OP_RMS_NORM:
+             if (ink_enabled(INK_MIX)) {
+                 n = ink_try_mix(ctx, cgraph, i);
+@@ -1629,6 +1692,9 @@ int ggml_cuda_try_fuse_inkling(ggml_backend_cuda_context & ctx, ggml_cgraph * cg
+             if (ink_enabled(INK_CTRL_GATE)) {
+                 n = ink_try_ctrl_gate(ctx, cgraph, i);
+             }
++            if (n == 0) {
++                n = ggml_cuda_ink_try_gemv(ctx, cgraph, i);
++            }
+             break;
+         default:
+             break;
+diff --git a/ggml/src/ggml-cuda/inkling-fuse.cuh b/ggml/src/ggml-cuda/inkling-fuse.cuh
+index 0f024b2..a047785 100644
+--- a/ggml/src/ggml-cuda/inkling-fuse.cuh
++++ b/ggml/src/ggml-cuda/inkling-fuse.cuh
+@@ -20,3 +20,6 @@ void ggml_cuda_inkling_begin(const ggml_cgraph * cgraph);
+ 
+ // true if `node` was already computed by an earlier fusion and must be skipped
+ bool ggml_cuda_inkling_should_skip(const ggml_tensor * node);
++
++// mark a later node as already computed (it will be skipped when the graph loop reaches it)
++void ggml_cuda_inkling_defer_skip(const ggml_tensor * node);
+diff --git a/ggml/src/ggml-cuda/inkling-gemv.cu b/ggml/src/ggml-cuda/inkling-gemv.cu
+new file mode 100644
+index 0000000..02ea2f5
+--- /dev/null
++++ b/ggml/src/ggml-cuda/inkling-gemv.cu
+@@ -0,0 +1,440 @@
++// Inkling-2 decode GEMVs for MI210 (gfx90a): single-token MoE NVFP4 experts.
++// Replaces mul_mat_vec_q for MUL_MAT_ID(NVFP4, f32 activations, one token) and optionally the
++// following per-expert scale (RESHAPE, REPEAT, GET_ROWS, MUL). Same q8_1 activation quantization and
++// int8 dot products as mul_mat_vec_q; only the order in which float partial sums are added differs.
++// GGML_CUDA_INK_NVFP4=0 disables it.
++
++#include "inkling-gemv.cuh"
++#include "inkling-fuse.cuh"
++#include "quantize.cuh"
++#include "vecdotq.cuh"
++#include "ggml-impl.h"
++
++#include <cstdlib>
++
++static bool ink_gemv_env_on(const char * name) {
++    const char * v = getenv(name);
++    return v == nullptr || atoi(v) != 0;
++}
++
++static bool ink_gemv_overlap(const ggml_tensor * a, const ggml_tensor * b) {
++    if (ggml_is_empty(a) || ggml_is_empty(b) || !a->data || !b->data) {
++        return false;
++    }
++    const char * a0 = (const char *) a->data;
++    const char * a1 = a0 + ggml_nbytes(a);
++    const char * b0 = (const char *) b->data;
++    const char * b1 = b0 + ggml_nbytes(b);
++    return a0 < b1 && b0 < a1;
++}
++
++// exact equivalent of ggml_cuda_ue4m3_to_fp32 (fallback path on gfx90a: branches + ldexpf + division) built from bits:
++// value/2 for exp > 0 is 2^(exp-8) * (1 + man/8); subnormals man * 2^-10; 0 and 0x7F give 0
++static __device__ __forceinline__ float ink_ue4m3_half(const uint32_t x) {
++    const uint32_t e = (x >> 3) & 0xF;
++    const uint32_t m = x & 0x7;
++    const float normal = __uint_as_float(((e + 119u) << 23) | (m << 20));
++    const float sub    = (float) m * (1.0f/1024.0f);
++    const float r = e == 0 ? sub : normal;
++    return x == 0x7F ? 0.0f : r;
++}
++
++typedef int ink_int4_a4 __attribute__((ext_vector_type(4), aligned(4)));
++
++
++#include <algorithm>
++#include <unordered_set>
++
++// nodes in (i0, i1] not in `fused` must neither read nor write memory overlapping `t` (t is written early, at i0)
++static bool ink_gemv_untouched_between(const ggml_cgraph * cgraph, int i0, int i1, const ggml_tensor * t,
++                                       const std::unordered_set<const ggml_tensor *> & fused) {
++    for (int k = i0 + 1; k <= i1; ++k) {
++        const ggml_tensor * nd = cgraph->nodes[k];
++        if (fused.count(nd)) {
++            continue;
++        }
++        if (nd->op == GGML_OP_NONE || nd->op == GGML_OP_RESHAPE || nd->op == GGML_OP_VIEW || nd->op == GGML_OP_PERMUTE ||
++            nd->op == GGML_OP_TRANSPOSE || ggml_is_empty(nd)) {
++            continue;
++        }
++        if (ink_gemv_overlap(nd, t)) {
++            return false;
++        }
++        for (int q = 0; q < GGML_MAX_SRC; ++q) {
++            const ggml_tensor * sq = nd->src[q];
++            if (sq && !fused.count(sq) && ink_gemv_overlap(sq, t)) {
++                return false;
++            }
++        }
++    }
++    return true;
++}
++
++// one block = 256/L rows of one expert; L lanes share a row, lane sub handles blocks sub, sub+L, ... (at most MAXIT).
++// PRE: issue all weight loads of a lane before the arithmetic. Each 36-byte block is read as 2x dwordx4 + 1 dword
++// (unaligned-by-16 vector loads are fine on gfx90a global memory).
++template <int L, int MAXIT, bool PRE, bool VEC>
++static __global__ void __launch_bounds__(256) ink_mmid_nvfp4(
++        const char * __restrict__ w, const int64_t w_nb1, const int64_t w_nb2, const int nb,
++        const block_q8_1 * __restrict__ y, const int64_t y_stride_blocks, const bool y_per_slot,
++        const int32_t * __restrict__ ids, const float * __restrict__ escale,
++        float * __restrict__ dst, const int64_t dst_nb1, const int nrows) {
++    constexpr int rows_per_block = 256 / L;
++    const int slot   = blockIdx.y;
++    const int expert = ids[slot];
++    const int tid    = threadIdx.x;
++    const int row    = blockIdx.x*rows_per_block + tid / L;
++    const int sub    = tid % L;
++    const char * wrow = w + expert*w_nb2 + (int64_t) (row < nrows ? row : 0)*w_nb1;
++
++    auto load_block = [&](const int bi, int * q) {
++        const char * bp = wrow + (int64_t) bi*sizeof(block_nvfp4);
++        if (VEC) {
++            q[0] = *(const int *) bp;
++            const ink_int4_a4 a0 = *(const ink_int4_a4 *) (bp + 4);
++            const ink_int4_a4 a1 = *(const ink_int4_a4 *) (bp + 20);
++            q[1] = a0.x; q[2] = a0.y; q[3] = a0.z; q[4] = a0.w;
++            q[5] = a1.x; q[6] = a1.y; q[7] = a1.z; q[8] = a1.w;
++        } else {
++#pragma unroll
++            for (int k = 0; k < 9; ++k) {
++                q[k] = ((const int *) bp)[k];
++            }
++        }
++    };
++
++    int q[PRE ? MAXIT : 1][9];
++    if (PRE) {
++#pragma unroll
++        for (int it = 0; it < MAXIT; ++it) {
++            const int bi = sub + L*it;
++            if (bi < nb) {
++                load_block(bi, q[PRE ? it : 0]);
++            }
++        }
++    }
++
++    // stage this slot's q8_1 activations in LDS (2*nb q8 blocks of 36 bytes)
++    extern __shared__ int ink_y_lds[];
++    const block_q8_1 * yrow = y + (y_per_slot ? slot*y_stride_blocks : 0);
++    const int n_int = nb*2*(int) (sizeof(block_q8_1)/sizeof(int));
++    for (int k = tid; k < n_int; k += 256) {
++        ink_y_lds[k] = ((const int *) yrow)[k];
++    }
++    __syncthreads();
++    const block_q8_1 * ys = (const block_q8_1 *) ink_y_lds;
++
++    float sum = 0.0f;
++#pragma unroll
++    for (int it = 0; it < MAXIT; ++it) {
++        const int bi = sub + L*it;
++        if (bi < nb) {
++            int * qb = q[PRE ? it : 0];
++            if (!PRE) {
++                load_block(bi, qb);
++            }
++            const uint32_t sc4 = (uint32_t) qb[0];
++#pragma unroll
++            for (int s = 0; s < 4; ++s) {
++                const int2 v0 = get_int_from_table_16(qb[1 + 2*s + 0], kvalues_mxfp4);
++                const int2 v1 = get_int_from_table_16(qb[1 + 2*s + 1], kvalues_mxfp4);
++                const block_q8_1 * b8 = ys + 2*bi + (s >> 1);
++                const int i8 = (s & 1) << 2;
++                const int * q8 = (const int *) b8->qs;
++                int sumi = ggml_cuda_dp4a(v0.x, q8[i8 + 0], 0);
++                sumi = ggml_cuda_dp4a(v0.y, q8[i8 + 2], sumi);
++                sumi = ggml_cuda_dp4a(v1.x, q8[i8 + 1], sumi);
++                sumi = ggml_cuda_dp4a(v1.y, q8[i8 + 3], sumi);
++                const float d = ink_ue4m3_half((sc4 >> (8*s)) & 0xFF) * __low2float(b8->ds);
++                sum += d * float(sumi);
++            }
++        }
++    }
++#pragma unroll
++    for (int off = L/2; off > 0; off >>= 1) {
++        sum += __shfl_xor(sum, off, 64);
++    }
++    if (row < nrows && sub == 0) {
++        const float v = escale ? sum * escale[expert] : sum;
++        dst[slot*dst_nb1 + row] = v;
++    }
++}
++
++// matches MUL_MAT_ID -> [RESHAPE(scale w)] -> REPEAT -> GET_ROWS(repeat, ids) -> MUL(mm, get_rows)
++static int ink_match_mmid_scale(const ggml_cgraph * cgraph, int i, const ggml_tensor ** scale_w, ggml_tensor ** out) {
++    const ggml_tensor * mm = cgraph->nodes[i];
++    int k = i + 1;
++    const ggml_tensor * rs = nullptr;
++    if (k < cgraph->n_nodes && cgraph->nodes[k]->op == GGML_OP_RESHAPE) {
++        rs = cgraph->nodes[k];
++        k++;
++    }
++    if (k + 2 >= cgraph->n_nodes) {
++        return 0;
++    }
++    const ggml_tensor * rep = cgraph->nodes[k];
++    const ggml_tensor * gr  = cgraph->nodes[k + 1];
++    ggml_tensor *       mul = cgraph->nodes[k + 2];
++    if (rep->op != GGML_OP_REPEAT || !ggml_are_same_shape(rep, rep->src[0]) || (rs && rep->src[0] != rs) || rep->ne[0] != 1 ||
++        rep->type != GGML_TYPE_F32 || !ggml_is_contiguous(rep->src[0]) ||
++        gr->op != GGML_OP_GET_ROWS || gr->src[0] != rep || gr->src[1] != mm->src[2] ||
++        mul->op != GGML_OP_MUL || mul->src[0] != mm || mul->src[1] != gr || !ggml_are_same_shape(mul, mm) ||
++        !ggml_is_contiguous(mul)) {
++        return 0;
++    }
++    if (ggml_node_get_use_count(cgraph, i) != 1 || ggml_node_get_use_count(cgraph, k) != 1 || ggml_node_get_use_count(cgraph, k + 1) != 1 ||
++        (mm->flags & GGML_TENSOR_FLAG_OUTPUT)) {
++        return 0;
++    }
++    if (rs && ggml_node_get_use_count(cgraph, i + 1) != 1) {
++        return 0;
++    }
++    *scale_w = rep->src[0];
++    *out     = mul;
++    return k + 2 - i;
++}
++
++
++// ---------------------------------------------------------------------------------------------
++// BF16 x f32 single-token GEMV: L lanes per row (L = 256: one row per block with an LDS reduction),
++// 16-byte weight loads (8 bf16), activations read from global (cached).
++// Several MUL_MATs that share the same activation vector are merged into one launch (segments);
++// the later ones are then computed early, which is checked against buffer reuse like the other early fusions.
++// ---------------------------------------------------------------------------------------------
++
++#define INK_BF16_MAX_SEG 8
++
++struct ink_bf16_segs {
++    const char * w[INK_BF16_MAX_SEG];
++    int64_t      nb1[INK_BF16_MAX_SEG];
++    float      * dst[INK_BF16_MAX_SEG];
++    int          row0[INK_BF16_MAX_SEG + 1];
++    int          nseg;
++};
++
++template <int L>
++static __global__ void __launch_bounds__(256) ink_gemv_bf16(const ink_bf16_segs segs, const float * __restrict__ x, const int K8) {
++    constexpr int rows_per_block = L >= 256 ? 1 : 256 / L;
++    constexpr int LL = L >= 64 ? 64 : L; // lanes per row inside one wave
++    const int tid = threadIdx.x;
++    const int row = blockIdx.x*rows_per_block + (L >= 256 ? 0 : tid / L);
++    const int sub = L >= 256 ? tid : tid % L;
++    if (row >= segs.row0[segs.nseg]) {
++        return;
++    }
++    int sg = 0;
++#pragma unroll
++    for (int k = 1; k < INK_BF16_MAX_SEG; ++k) {
++        if (k < segs.nseg && row >= segs.row0[k]) {
++            sg = k;
++        }
++    }
++    const int r = row - segs.row0[sg];
++    const uint4  * wr = (const uint4 *) (segs.w[sg] + (int64_t) r*segs.nb1[sg]);
++    const float4 * x4 = (const float4 *) x;
++    float sum = 0.0f;
++    for (int c = sub; c < K8; c += L) {
++        const uint4  wv = wr[c];
++        const float4 xa = x4[2*c + 0];
++        const float4 xb = x4[2*c + 1];
++        sum = fmaf(__uint_as_float(wv.x << 16),         xa.x, sum);
++        sum = fmaf(__uint_as_float(wv.x & 0xFFFF0000u), xa.y, sum);
++        sum = fmaf(__uint_as_float(wv.y << 16),         xa.z, sum);
++        sum = fmaf(__uint_as_float(wv.y & 0xFFFF0000u), xa.w, sum);
++        sum = fmaf(__uint_as_float(wv.z << 16),         xb.x, sum);
++        sum = fmaf(__uint_as_float(wv.z & 0xFFFF0000u), xb.y, sum);
++        sum = fmaf(__uint_as_float(wv.w << 16),         xb.z, sum);
++        sum = fmaf(__uint_as_float(wv.w & 0xFFFF0000u), xb.w, sum);
++    }
++#pragma unroll
++    for (int off = LL/2; off > 0; off >>= 1) {
++        sum += __shfl_xor(sum, off, 64);
++    }
++    if (L >= 256) {
++        __shared__ float part[4];
++        if (tid % 64 == 0) {
++            part[tid / 64] = sum;
++        }
++        __syncthreads();
++        if (tid == 0) {
++            segs.dst[sg][r] = (part[0] + part[1]) + (part[2] + part[3]);
++        }
++    } else if (sub == 0) {
++        segs.dst[sg][r] = sum;
++    }
++}
++
++static bool ink_bf16_gemv_ok(const ggml_tensor * mm, const ggml_tensor * x) {
++    const ggml_tensor * src0 = mm->src[0];
++    const int64_t K = src0->ne[0];
++    const int64_t N = src0->ne[1];
++    return mm->op == GGML_OP_MUL_MAT && mm->src[1] == x && src0->type == GGML_TYPE_BF16 && x->type == GGML_TYPE_F32 &&
++        mm->type == GGML_TYPE_F32 && ggml_nelements(x) == K && ggml_is_contiguous(x) && src0->ne[2] == 1 && src0->ne[3] == 1 &&
++        K % 8 == 0 && src0->nb[0] == 2 && src0->nb[1] % 16 == 0 && ((uintptr_t) src0->data % 16) == 0 &&
++        ((uintptr_t) x->data % 16) == 0 && ggml_nelements(mm) == N && ggml_is_contiguous(mm) && N < (1 << 30) &&
++        !(mm->flags & GGML_TENSOR_FLAG_OUTPUT && false) && !ink_gemv_overlap(mm, x) && !ink_gemv_overlap(mm, src0);
++}
++
++static int ink_try_gemv_bf16(ggml_backend_cuda_context & ctx, ggml_cgraph * cgraph, int i) {
++    static const bool on    = ink_gemv_env_on("GGML_CUDA_INK_BF16");
++    static const bool merge = ink_gemv_env_on("GGML_CUDA_INK_BF16_MERGE");
++    if (!on) {
++        return 0;
++    }
++    ggml_tensor * mm = cgraph->nodes[i];
++    const ggml_tensor * x = mm->src[1];
++    if (!ink_bf16_gemv_ok(mm, x)) {
++        return 0;
++    }
++    const int64_t K = mm->src[0]->ne[0];
++
++    ggml_tensor * members[INK_BF16_MAX_SEG] = { mm };
++    int           member_idx[INK_BF16_MAX_SEG] = { i };
++    int nm = 1;
++    if (merge) {
++        // later single-token BF16 GEMVs on the same activation vector, computed early here
++        std::unordered_set<const ggml_tensor *> fused = { mm };
++        const int lim = std::min(cgraph->n_nodes, i + 200);
++        for (int k = i + 1; k < lim && nm < INK_BF16_MAX_SEG; ++k) {
++            ggml_tensor * nd = cgraph->nodes[k];
++            if (nd->op != GGML_OP_MUL_MAT || nd->src[1] != x || !ink_bf16_gemv_ok(nd, x) || nd->src[0]->ne[0] != K) {
++                continue;
++            }
++            fused.insert(nd);
++            bool ok = ink_gemv_untouched_between(cgraph, i, k, nd, fused);
++            for (int m = 0; m < nm && ok; ++m) {
++                ok = !ink_gemv_overlap(nd, members[m]);
++            }
++            if (!ok) {
++                fused.erase(nd);
++                continue;
++            }
++            members[nm]    = nd;
++            member_idx[nm] = k;
++            nm++;
++        }
++    }
++
++    ink_bf16_segs segs = {};
++    int rows = 0;
++    for (int m = 0; m < nm; ++m) {
++        segs.w[m]    = (const char *) members[m]->src[0]->data;
++        segs.nb1[m]  = members[m]->src[0]->nb[1];
++        segs.dst[m]  = (float *) members[m]->data;
++        segs.row0[m] = rows;
++        rows += (int) members[m]->src[0]->ne[1];
++    }
++    segs.row0[nm] = rows;
++    segs.nseg     = nm;
++
++    static const int env_l = getenv("GGML_CUDA_INK_BF16_L") ? atoi(getenv("GGML_CUDA_INK_BF16_L")) : 0;
++    const int K8 = (int) (K/8);
++    int lanes = env_l;
++    static const int env_small = getenv("GGML_CUDA_INK_BF16_SMALL_L") ? atoi(getenv("GGML_CUDA_INK_BF16_SMALL_L")) : 256;
++    if (lanes == 0) {
++        lanes = rows >= 2048 ? 32 : (rows >= 256 ? 64 : env_small);
++    }
++#define INK_LAUNCH_BF16(L_) ink_gemv_bf16<L_><<<(rows + ((L_) >= 256 ? 1 : 256/(L_)) - 1)/((L_) >= 256 ? 1 : 256/(L_)), 256, 0, ctx.stream()>>>( \
++        segs, (const float *) x->data, K8)
++    switch (lanes) {
++        case 16:  INK_LAUNCH_BF16(16);  break;
++        case 32:  INK_LAUNCH_BF16(32);  break;
++        case 64:  INK_LAUNCH_BF16(64);  break;
++        case 256: INK_LAUNCH_BF16(256); break;
++        default: GGML_ABORT("ink bf16: unsupported lanes");
++    }
++#undef INK_LAUNCH_BF16
++    CUDA_CHECK(cudaGetLastError());
++    for (int m = 1; m < nm; ++m) {
++        ggml_cuda_inkling_defer_skip(members[m]);
++    }
++    GGML_UNUSED(member_idx);
++    return -1;
++}
++
++int ggml_cuda_ink_try_gemv(ggml_backend_cuda_context & ctx, ggml_cgraph * cgraph, int i) {
++    if (cgraph->nodes[i]->op == GGML_OP_MUL_MAT) {
++        return ink_try_gemv_bf16(ctx, cgraph, i);
++    }
++    static const bool on = ink_gemv_env_on("GGML_CUDA_INK_NVFP4");
++    if (!on) {
++        return 0;
++    }
++    ggml_tensor * mm = cgraph->nodes[i];
++    if (mm->op != GGML_OP_MUL_MAT_ID) {
++        return 0;
++    }
++    const ggml_tensor * src0 = mm->src[0];
++    const ggml_tensor * src1 = mm->src[1];
++    const ggml_tensor * ids  = mm->src[2];
++    // single token: src1 [K, 1 or n_used, 1], ids [n_used, 1], dst [N, n_used, 1]
++    const int64_t K      = src0->ne[0];
++    const int64_t N      = src0->ne[1];
++    const int64_t n_used = ids->ne[0];
++    if (src0->type != GGML_TYPE_NVFP4 || src1->type != GGML_TYPE_F32 || mm->type != GGML_TYPE_F32 || ids->type != GGML_TYPE_I32 ||
++        src1->ne[2] != 1 || src1->ne[3] != 1 || ids->ne[1] != 1 || mm->ne[2] != 1 || mm->ne[1] != n_used || mm->ne[0] != N ||
++        (src1->ne[1] != 1 && src1->ne[1] != n_used) || src1->ne[0] != K || K % 64 != 0 || src0->nb[1] % 4 != 0 ||
++        src0->nb[2] % 4 != 0 || mm->nb[0] != sizeof(float) || ids->nb[0] != sizeof(int32_t) || src1->nb[0] != sizeof(float) ||
++        n_used > 65535) {
++        return 0;
++    }
++    const int nb = (int) (K / 64);
++    // shared memory for the activations: 2*nb q8_1 blocks
++    const size_t smem = (size_t) nb*2*sizeof(block_q8_1);
++    if (smem > 48*1024) {
++        return 0;
++    }
++
++    const ggml_tensor * scale_w = nullptr;
++    ggml_tensor *       out     = mm;
++    const int n_skip = ink_match_mmid_scale(cgraph, i, &scale_w, &out);
++
++    // q8_1 activations (same quantization as mul_mat_vec_q)
++    const int64_t K_pad   = GGML_PAD(K, MATRIX_ROW_PADDING);
++    const int64_t n_rows1 = src1->ne[1];
++    ggml_cuda_pool_alloc<char> y_q8(ctx.pool(), n_rows1*K_pad/QK8_1*sizeof(block_q8_1));
++    {
++        const int64_t s11 = src1->nb[1] / sizeof(float);
++        const int64_t s12 = src1->nb[2] / sizeof(float);
++        const int64_t s13 = src1->nb[3] / sizeof(float);
++        quantize_row_q8_1_cuda((const float *) src1->data, y_q8.get(), K, s11, s12, s13, K_pad, n_rows1, 1, 1, ctx.stream());
++    }
++
++    const dim3 block(256, 1, 1);
++    const float * esc = scale_w ? (const float *) scale_w->data : nullptr;
++    const int64_t ystride = K_pad/QK8_1;
++    const bool per_slot = n_rows1 == n_used && n_used > 1;
++    const int64_t dst_nb1 = out->nb[1]/sizeof(float);
++    // tunables for experiments: GGML_CUDA_INK_NVFP4_LGU / _LDN (lanes per row for nb >= 32 / nb < 32), _PRE, _VEC
++    static const int  env_lgu = getenv("GGML_CUDA_INK_NVFP4_LGU") ? atoi(getenv("GGML_CUDA_INK_NVFP4_LGU")) : 8;
++    static const int  env_ldn = getenv("GGML_CUDA_INK_NVFP4_LDN") ? atoi(getenv("GGML_CUDA_INK_NVFP4_LDN")) : 8;
++    static const bool env_pre = getenv("GGML_CUDA_INK_NVFP4_PRE") ? atoi(getenv("GGML_CUDA_INK_NVFP4_PRE")) != 0 : false;
++    static const bool env_vec = getenv("GGML_CUDA_INK_NVFP4_VEC") ? atoi(getenv("GGML_CUDA_INK_NVFP4_VEC")) != 0 : false;
++    const int lanes = nb >= 32 ? env_lgu : env_ldn;
++#define INK_LAUNCH_NVFP4_PV(L_, IT_, P_, V_)                                                                                    \
++        ink_mmid_nvfp4<L_, IT_, P_, V_><<<grid, block, smem, ctx.stream()>>>((const char *) src0->data, src0->nb[1],          \
++            src0->nb[2], nb, (const block_q8_1 *) y_q8.get(), ystride, per_slot, (const int32_t *) ids->data, esc,              \
++            (float *) out->data, dst_nb1, (int) N)
++#define INK_LAUNCH_NVFP4(L_, IT_) do {                                                                                          \
++        const dim3 grid((N + 256/(L_) - 1)/(256/(L_)), n_used, 1);                                                              \
++        if (env_pre) { if (env_vec) { INK_LAUNCH_NVFP4_PV(L_, IT_, true, true); } else { INK_LAUNCH_NVFP4_PV(L_, IT_, true, false); } } \
++        else         { if (env_vec) { INK_LAUNCH_NVFP4_PV(L_, IT_, false, true); } else { INK_LAUNCH_NVFP4_PV(L_, IT_, false, false); } } \
++    } while (0)
++    if (lanes == 2 && nb <= 2*18) {
++        INK_LAUNCH_NVFP4(2, 18);
++    } else if (lanes == 4 && nb <= 4*9) {
++        INK_LAUNCH_NVFP4(4, 9);
++    } else if (lanes == 8 && nb <= 8*5) {
++        INK_LAUNCH_NVFP4(8, 5);
++    } else if (lanes == 16 && nb <= 16*3) {
++        INK_LAUNCH_NVFP4(16, 3);
++    } else if (lanes == 32 && nb <= 32*2) {
++        INK_LAUNCH_NVFP4(32, 2);
++    } else {
++        GGML_ABORT("ink nvfp4: unsupported lanes/nb");
++    }
++#undef INK_LAUNCH_NVFP4
++#undef INK_LAUNCH_NVFP4_PV
++    CUDA_CHECK(cudaGetLastError());
++    return n_skip > 0 ? n_skip : -1;
++}
+diff --git a/ggml/src/ggml-cuda/inkling-gemv.cuh b/ggml/src/ggml-cuda/inkling-gemv.cuh
+new file mode 100644
+index 0000000..fd189ba
+--- /dev/null
++++ b/ggml/src/ggml-cuda/inkling-gemv.cuh
+@@ -0,0 +1,7 @@
++#pragma once
++
++#include "common.cuh"
++
++// Single-token GEMVs for Inkling-2 on gfx90a. Returns the number of following nodes consumed (> 0),
++// -1 if only node i was handled, 0 if not applicable.
++int ggml_cuda_ink_try_gemv(ggml_backend_cuda_context & ctx, ggml_cgraph * cgraph, int i);
+diff --git a/ksweep.sh b/ksweep.sh
+new file mode 100755
+index 0000000..143d09d
+--- /dev/null
++++ b/ksweep.sh
+@@ -0,0 +1,21 @@
++#!/bin/bash
++# per-kernel timing sweep (inside container): ksweep.sh <regex> "<ENV=.. ENV=..>" ...
++RE=$1; shift
++cd /lab/unsloth-llama
++for cfg in "$@"; do
++  rm -rf /lab/results/ksweep
++  env $cfg LD_LIBRARY_PATH=build/bin:/opt/rocm/lib timeout 300 rocprofv3 --kernel-trace --output-format csv -d /lab/results/ksweep -o run -- build/bin/llama-bench -m /data/model/Inkling-2-Mini-GGUF/Inkling-2-Mini-UD-Q8_K_XL.gguf -ngl 999 -fa 1 -p 0 -n 24 -r 1 > /dev/null 2>&1
++  python3 - "$RE" "$cfg" <<"PY"
++import csv,sys,re,collections,statistics
++rows=list(csv.DictReader(open("/lab/results/ksweep/run_kernel_trace.csv")))
++t=collections.defaultdict(list)
++for r in rows:
++    n=r["Kernel_Name"]
++    if re.search(sys.argv[1],n):
++        k=re.sub(r"\(.*","",n)[:60]+" grid="+r["Grid_Size_X"]+"x"+r["Grid_Size_Y"]
++        t[k].append((int(r["End_Timestamp"])-int(r["Start_Timestamp"]))/1000)
++for k,v in sorted(t.items()):
++    v=sorted(v)[len(v)//10:]  # drop warm-up outliers
++    print("%-28s %8.2f us med %8.2f us min  n=%d  %s"%(sys.argv[2][:28],statistics.median(v),min(v),len(v),k))
++PY
++done
+-- 
+2.43.0
+
