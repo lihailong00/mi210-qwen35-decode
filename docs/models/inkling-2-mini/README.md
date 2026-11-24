@@ -1,6 +1,6 @@
 # Inkling-2-Mini
 
-第二个模型。基线 decode 33.3 token/s；第一阶段（小算子融合，logits 与基线逐位相同）后 44.8 token/s；第二阶段（GEMV）后 50.7 token/s；第三阶段（剩余小算子、注意力偏置、decode 注意力、MoE 路由）后 83.6 token/s；第四阶段（NVFP4 GEMV 重写，逐位相同）后 **88.6** token/s，平均 KLD 0.00099。
+第二个模型。基线 decode 33.3 token/s；第一阶段（小算子融合，logits 与基线逐位相同）后 44.8 token/s；第二阶段（GEMV）后 50.7 token/s；第三阶段（剩余小算子、注意力偏置、decode 注意力、MoE 路由）后 83.6 token/s；第四阶段（NVFP4 GEMV 重写，逐位相同）后 88.6 token/s；第五阶段（再减一轮 launch、主机侧开销，逐位相同）后 **109.8** token/s，平均 KLD 0.00099。
 
 - **权重**：Unsloth 的 `Inkling-2-Mini-UD-Q8_K_XL.gguf`（ModelScope `unsloth/Inkling-2-Mini-GGUF` 根目录，Unsloth 循环层布局，22,867,451,616 字节，SHA-256 以 dfb04bf3 开头）。专家权重 NVFP4 共 11.47 GB，其余（注意力、最后 4 层的专家、词嵌入、LM head）为 BF16 共 11.35 GB。
 - **投机解码 drafter**：`dspark/dspark-Inkling-2-Mini-BF16.gguf`（架构 dflash，DSpark = DFlash 块 drafter + Markov 头，3 层，块大小 8，647,792,800 字节，SHA-256 以 b8985695 开头）。
@@ -244,11 +244,74 @@ decode 只到上限的约 15%。
 - `v_perm_b32` 选择子的特殊含义和 `fp contract(off)` 只在 gfx90a + ROCm 7.2.1 上验证过；换工具链后用 `kld.sh` 的 md5 复核。
 - `inkling-gemv.cu` 里还留着测速用的代码（`GGML_CUDA_INK_NVBENCH`）和多个试验用的实例化，编译时间变长，可以以后清理。
 
+## 第五阶段：再减一轮 launch 与主机侧开销
+
+代码在分支 `inkling-opt`（合并提交 4f9a18f，补丁 0006 是相对 b9fee35 的整体 diff）。四项按文件归属分给四个分支并行实现，各自经过独立审查后合并。本轮只接受逐位相同的改动：三种配置的 logits md5 都不变。
+
+| 分支 | 内容 | launch / token | 单独增益 |
+| --- | --- | --- | --- |
+| `r5-ctrl` | K/V/Q 三条 control 链的同一阶段作为同一次 launch 的不同 block；Q clip + K/V conv 一次 launch；conv 状态直接读、不再 GET_ROWS；同一 layer pass 的两到三个 mix 一次 launch；CONT 拷贝并进 norm | 1785 → 1331 | +9.9 |
+| `r5-attn` | sink 和 gate 投影提前到第一个 BF16 launch 里算；偏置 / mask 和 sigmoid×mul 并进注意力 kernel | 1785 → 1587 | +3.6 到 +4.9 |
+| `r5-moe` | 路由 GEMV + top-k 尾部一次 launch；专家加权求和并进后面的 conv kernel | 1785 → 1689 | +2.6 |
+| `r5-host` | 输入上传改为暂存后随 graph 排队；一个 ggml graph 只用一个 HIP graph；graph 变化时立即重新捕获；采样的 softmax / argmax 用辅助线程 | 不变 | +1.8（采样 +6） |
+
+合并后的结果：
+
+| 测试 | 第四阶段 | 第五阶段 |
+| --- | --- | --- |
+| llama-bench tg128 | 88.6 token/s | **109.8** token/s |
+| tg64，深度 2048 / 8192 | — | 101.8 / 98.6 |
+| llama-server 贪心 | 86.9 | **106.4** |
+| llama-server 采样（temp 1.0） | 80.7 | **103.6** |
+| kernel 数 / token | 1785 | 1037 |
+| pp512 | 658 | 658 |
+
+正确性（合并版）：`kld.sh` 默认 md5 b2b38cf906c9、`GGML_CUDA_INK_FATTN=0` 为 05c856b2ade6、再关 NVFP4 / BF16 为 01ec923fac19，与第四阶段完全相同；`GGML_CUDA_DISABLE_GRAPHS=1` 下默认 md5 也相同；1425 token prompt 的贪心输出与合并前相同。采样在固定种子下文本不变。
+
+### 减 launch 的做法
+
+- **多个互不依赖的小算子合成一次 launch**：用 `blockIdx` 选择算子，每个 block 跑原 kernel 的函数体，算术不变，也不会让任何一个 wave 变长。这是本轮的主要手段，每去掉一次 launch 约省 2.2–2.8 µs。
+- **提前计算放进持久 scratch**，而不是提前写 graph 的缓冲区，这样不必担心 ggml-alloc 的缓冲区复用；到原节点位置时再让消费者读 scratch。
+- **原版小 kernel 比一次空 launch 贵得多**：空 launch 约 2 µs，而 `moe_weighted_reduction_f32` 4.1 µs、路由 GEMV 5.1 µs，原因是运行时的循环次数让每次迭代都成为一轮"读取、等待、计算"。同样的算术改成固定循环次数、读取提前后是 2.1 / 3.1 µs。
+- BF16 GEMV 的合并结果取决于 ggml-alloc 的缓冲区布局，lane 数又决定求和顺序，所以参考 md5 只对 `kld.sh` 的布局有效。
+
+主要开关：`GGML_CUDA_INK_CTLGRP`、`_CONT_FOLD`、`_QKVR`、`_RS`、`_MIX_PAIR`、`_MIX_TRI`（control / conv / mix）；`GGML_CUDA_INK_BF16_EARLY`、`_FABIAS`、`_FAGATE`（注意力）；`GGML_CUDA_INK_ROUTER=1`、`_MOE_RED=0`、`_RED_CONV=0`（MoE）；`GGML_CUDA_INK_STAGED_INPUTS=0`、`GGML_CUDA_GRAPH_CHUNK_SIZE=512`、`GGML_CUDA_GRAPH_FAST_RECAPTURE=0`、`LLAMA_SAMPLER_THREADS=1`（主机侧）。
+
+### 主机侧开销的测量
+
+用 `GGML_CUDA_INK_HOSTPROF=1` / `LLAMA_INK_HOSTPROF=1` 可以打印每 token 的分解。第四阶段代码上的结果（µs / token，改前 → 改后）：
+
+| 项 | llama-bench | 说明 |
+| --- | --- | --- |
+| 整个 token | 11243 → 约 10990 | |
+| 等 GPU | 10993 → 约 10910 | 主线程 99% 的时间在 `hipStreamSynchronize` 里自旋 |
+| 主机合计 | 250 → 76 | 原先估计的 1–2 ms 是错的 |
+| 输入上传（12 次，共 12 KB） | 133 → 7.7 | 原来每次都是阻塞拷贝 |
+| `hipGraphLaunch` | 51.5（25 段）→ 12.9（1 段） | 每段在回放时还要占 5–7 µs 的 GPU 时间 |
+| logits 读回 | 约 40 | 本来就是异步的 |
+
+| 项 | llama-server | 说明 |
+| --- | --- | --- |
+| temp 1.0 的 dist 采样 | 991 → 299 | 关掉所有截断采样器时要对 20 万个候选做 softmax |
+| 贪心链 | 100 → 62 | |
+| set_logits + 其他服务端工作 | 约 145 | 没有动 |
+
+graph 每当 n_kv 的 256 对齐增长时要重新捕获一次，约 14 ms（平均 54 µs / token）；一段式 graph 让捕获的那个 token 从 14 ms 变成 21 ms。在 rocprofv3 下自动保持 512 节点分段（强制一段会慢 3 倍）。
+
+### 注意
+
+- 本轮的融合在 `GGML_CUDA_INK_VERIFY` 模式下会自动关闭，没有逐元素比对，只靠 logits md5 和长文本对比验证。
+- 持久 scratch、计数器和宿主侧的映射表是进程全局的，适用于按顺序求值的多个 context（目标模型 + drafter），不适用于两个线程同时求值。
+- 立即重新捕获要求所有融合在第一次见到新形状时就能在捕获中合法运行；出问题时用 `GGML_CUDA_GRAPH_FAST_RECAPTURE=0`。
+- 采样线程池在候选数 ≥ 32768 时才启用，最多 7 个辅助线程。
+- 没测：DSpark、多序列同时 decode、超过约 1750 token 以外的更长生成（只测了 tg64 深度 8192 的速度）。
+
 ## 下一步方向
 
-现在约 11.3 ms/token，带宽下限约 4.3 ms。剩下的主要部分：
+现在约 9.1 ms/token，其中读权重按 1.27 TB/s 算最少 4.6 ms，主机侧不到 0.1 ms。剩下约 1037 个 kernel/token（每个 layer pass 约 21 个）。各分支记录的未做项：
 
-1. BF16 投影 `ink_gemv_bf16<32>`：145 次/token、约 20 µs/次，是现在最大的一块；可以用同样的办法（短 wave、读取提前、只读上限对照）重新审视。
-2. 剩余约 1785 个 kernel/token 里的小 kernel：control gate、norm、conv、clip、router、`copyBuffer`（105 次）、conv 状态 GET_ROWS、gate 的 sigmoid×mul。
-3. DSpark 的多 token 验证 graph 没有融合，也没有专家去重。
-4. 是否把 inkling2 架构移植进本仓库的源码树：目前优化都在 Unsloth 合并版上，以补丁形式保存在 [patches/](patches/)。
+1. `conv_plain` 并进读它的 mix（96 次/token，估计 +1.3 token/s）；非循环层 mix 后面的 norm_mul；control norm 并进 mix 或 down GEMV。
+2. rel 投影并进 Q 的 BF16 launch（需要 clip kernel 读 scratch），随后 R clip 可以并进 Q clip 的 launch；循环层第 2、3 遍的 k/v 投影。
+3. SITU + q8 量化仍是独立的一次 launch（44 次/token），结构上并不进 GEMV。
+4. DSpark 的多 token 验证 graph 没有融合，也没有专家去重。
+5. 是否把 inkling2 架构移植进本仓库的源码树：目前优化都在 Unsloth 合并版上，以补丁形式保存在 [patches/](patches/)。
