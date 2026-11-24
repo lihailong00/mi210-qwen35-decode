@@ -1,6 +1,6 @@
 # Inkling-2-Mini
 
-第二个模型。基线 decode 33.3 token/s；第一阶段（小算子融合，logits 与基线逐位相同）后 44.8 token/s；第二阶段（GEMV）后 50.7 token/s；第三阶段（剩余小算子、注意力偏置、decode 注意力、MoE 路由）后 83.6 token/s；第四阶段（NVFP4 GEMV 重写，逐位相同）后 88.6 token/s；第五阶段（再减一轮 launch、主机侧开销，逐位相同）后 **109.8** token/s，平均 KLD 0.00099。
+第二个模型。基线 decode 33.3 token/s；第一阶段（小算子融合，logits 与基线逐位相同）后 44.8 token/s；第二阶段（GEMV）后 50.7 token/s；第三阶段（剩余小算子、注意力偏置、decode 注意力、MoE 路由）后 83.6 token/s；第四阶段（NVFP4 GEMV 重写，逐位相同）后 88.6 token/s；第五阶段（再减一轮 launch、主机侧开销，逐位相同）后 **109.8** token/s，平均 KLD 0.00099。prefill（pp2048）从 519 提到 **6280** token/s。
 
 - **权重**：Unsloth 的 `Inkling-2-Mini-UD-Q8_K_XL.gguf`（ModelScope `unsloth/Inkling-2-Mini-GGUF` 根目录，Unsloth 循环层布局，22,867,451,616 字节，SHA-256 以 dfb04bf3 开头）。专家权重 NVFP4 共 11.47 GB，其余（注意力、最后 4 层的专家、词嵌入、LM head）为 BF16 共 11.35 GB。
 - **投机解码 drafter**：`dspark/dspark-Inkling-2-Mini-BF16.gguf`（架构 dflash，DSpark = DFlash 块 drafter + Markov 头，3 层，块大小 8，647,792,800 字节，SHA-256 以 b8985695 开头）。
@@ -343,6 +343,44 @@ graph 每当 n_kv 的 256 对齐增长时要重新捕获一次，约 14 ms（平
 实际模型每 token 1037 次 launch = 401 次 GEMV 类 + 636 次小算子，两个 GEMV 之间多是 0–3 个小算子（0 个 96 处、1 个 112 处、2 个 84 处、3 个 100 处）。按上面的数推算，常驻 kernel 每 token 能省约 0.4–1.1 ms，即约 +5% 到 +14%（114–125 token/s）。代价是把整个单 token forward 重写成一个 kernel：寄存器用量取最大的那一段，会压低 GEMV 的占用率；mix 等 1024 线程的单 block kernel 要改写；常驻 kernel 占满所有 CU，和这张卡上的其他进程冲突。所以不做。
 
 更值得做的是测试里看到的另一点：把 GEMV 前后的小算子并进 GEMV 的读入或写出阶段（每个 GEMV block 本来就要读入整个输入向量，可以顺便算 norm；逐通道的 conv 可以在写出时做），省掉小算子的全局往返。候选：`ink_conv_plain`（96 次 / token）、`ink_norm_mul`（83）、control 相关（96）、clip（54）。
+
+## prefill 优化（pp2048：519 → 6280 token/s）
+
+代码在分支 `inkling-opt`（ab37db3），补丁 0007 是相对 4f9a18f 的整体 diff（不含各分支的 NOTES 和测试脚本）。目标是 2K prompt（llama-bench pp2048，ubatch 2048）达到 6000 token/s。分三轮完成，每一项都在独立分支上实现，并经过独立审查。
+
+| 阶段 | 内容 | pp2048（ubatch 2048） |
+| --- | --- | --- |
+| 起点 | Unsloth 的带状注意力参考实现、逐 token 的 mix、MMQ 专家矩阵乘 | 519 |
+| 第一轮 | 新 prefill 注意力（`inkling-pfattn.cu`，分块、只走窗口内的 key、矩阵单元、偏置现场计算）+ 批量 mix（`inkling-pfmix.cu`，逐位相同） | 2390 |
+| 第二轮 | MoE 分组 GEMM（`inkling-pfmoe.cu`：NVFP4 精确反量化成 bf16，bf16 矩阵单元，SITU 并进 gate_up 尾部）；小算子批量融合（`inkling-pfops.cu`，逐位相同）；稠密投影（`inkling-pfgemm.cu`）；注意力改 f16 矩阵单元（Q/P 拆成高低两部分保精度） | 5570 |
+| 第三轮（全部逐位相同） | 主机侧：相同 mask 视图只上传一次、mask 填充多线程、分段捕获、捕获时保留激活转换缓存；MoE 尾部（加权求和、bf16 交接、BF16 专家 SITU）；合并 forget/gain；gate 的 sigmoid×mul 并进注意力；conv/ctrl 读取提前 | **6280** |
+
+最终结果（ab37db3）：
+
+| prompt | ubatch 512 | ubatch 1024 | ubatch 2048 |
+| --- | --- | --- | --- |
+| pp512 | 4205 | 4290 | 4229 |
+| pp2048 | 3376 | 5384 | **6276** |
+| pp8192 | 2386 | 2582 | 2259 |
+
+12k token 的 prompt（llama-completion）约 2100 token/s。decode 不变（tg128 约 110，三种 md5 不变）。
+
+正确性：prefill 的数值不再与原版逐位相同（注意力、MoE、稠密投影改了求和顺序或中间精度），标准是"不超过原版自己只换 ubatch 大小时的差异"：原版 ubatch 1024/2048 对 512 的 8 段 KLD 为 0.0024–0.0029、top-1 相同率约 98.4%。最终版本 8 段 KLD：ubatch 2048 平均 0.00282、中位数 0.00051、top-1 相同 98.45%；ubatch 512 平均 0.00230、98.51%。第三轮全部逐位相同（prefill md5 与第二轮合并版一致）。检查脚本：`kldpp.sh`（2 段）、`kld8.sh`（8 段），对照原版 prefill logits。
+
+主要开关（均可单独关闭以还原前一版本）：`GGML_CUDA_INK_PFATTN`、`_PFATTN_F16`、`_PFATTN_GATE`、`_PFMIX`、`_PFMOE`（及 `_PFMOE_RED`、`_XBF`、`_DSPLIT`、`_SITU0`）、`_PFOPS`（及子开关）、`_PFGEMM`（及 `_PAIR`、`_CAPCACHE`；`_GATEO` 默认关）、`GGML_SCHED_INK_DEDUP`、`LLAMA_INK_MASK_THREADS`、`GGML_CUDA_INK_PFGRAPH_CHUNK`、`_PFGRAPH_LEAN`。
+
+经验：
+
+- 原来的瓶颈都在"参考实现"上：带状注意力逐 key 循环（2048 token 时占 62%），mix 被拆成约 120 万个小 block，MMQ 在 gfx90a 上每个 CU 只能放 1 个 block、每条 MFMA 配约 14 条标量指令（只到 int8 峰值的 14%）。
+- NVFP4（E2M1 × UE4M3）可以精确表示成 bf16，反量化后走 bf16 矩阵单元比 int8 路线快（4077 对 3767），而且激活用 bf16 比 q8_1 更精确，KLD 反而下降。
+- ggml 会把 MUL_MAT_ID 和每专家的 NVFP4 scale 乘法融合后直接调 MMQ，大多数调用根本到不了 `ggml_cuda_mul_mat_id`；要在那个融合点接入。
+- hipcc 会把 lambda 捕获的寄存器数组放到 LDS 或 scratch，占用率骤降；同一迭代里用到的全局读取会被下沉到使用处，要跨迭代使用加 `sched_barrier`。都要看 `.s` 文件确认。
+- AMD 上 `__fmul_rn` / `__fadd_rn` 仍会被收缩成 FMA，要自己写带 `fp contract(off)` 的辅助函数。
+- 主机侧 30 ms 的空隙不是缺少 graph 捕获（2048 token 的 ubatch 本来就在捕获和回放），而是 48 份相同的 8 MB mask 视图每层同步上传一次、mask 在 CPU 上单线程填充。
+- f16 矩阵单元在 gfx90a 上把次正规数当 0，Q 拆高低两部分时要给低位部分加缩放。
+- 只用 2 段文本测 KLD 时，平均值会被个别 token 的翻转左右；判断要用 8 段，并以原版自己换 ubatch 的差异为参照。
+
+没做的：pp8192 在 ubatch 2048 时反而比 1024 慢（2259 对 2582），长 prompt 没有专门优化；MoE GEMM 约 80 TFLOPS（峰值 181）；DSpark 的多 token 验证路径。
 
 ## 下一步方向
 
