@@ -1,6 +1,6 @@
 # Inkling-2-Mini
 
-第二个模型。基线 decode 33.3 token/s；第一阶段（小算子融合，logits 与基线逐位相同）后 44.8 token/s；第二阶段（GEMV）后 50.7 token/s；第三阶段（剩余小算子、注意力偏置、decode 注意力、MoE 路由）后 **83.6** token/s，平均 KLD 0.00099。
+第二个模型。基线 decode 33.3 token/s；第一阶段（小算子融合，logits 与基线逐位相同）后 44.8 token/s；第二阶段（GEMV）后 50.7 token/s；第三阶段（剩余小算子、注意力偏置、decode 注意力、MoE 路由）后 83.6 token/s；第四阶段（NVFP4 GEMV 重写，逐位相同）后 **88.6** token/s，平均 KLD 0.00099。
 
 - **权重**：Unsloth 的 `Inkling-2-Mini-UD-Q8_K_XL.gguf`（ModelScope `unsloth/Inkling-2-Mini-GGUF` 根目录，Unsloth 循环层布局，22,867,451,616 字节，SHA-256 以 dfb04bf3 开头）。专家权重 NVFP4 共 11.47 GB，其余（注意力、最后 4 层的专家、词嵌入、LM head）为 BF16 共 11.35 GB。
 - **投机解码 drafter**：`dspark/dspark-Inkling-2-Mini-BF16.gguf`（架构 dflash，DSpark = DFlash 块 drafter + Markov 头，3 层，块大小 8，647,792,800 字节，SHA-256 以 b8985695 开头）。
@@ -211,11 +211,44 @@ decode 只到上限的约 15%。
 - kernel 的耗时主要跟每个 wave 执行的指令数走，barrier 和额外的依赖读取几乎不花时间；精简指令路径比合并 launch 更有效（mix kernel 精简后 +5.7 token/s）。
 - 没做的：conv 状态的 GET_ROWS（48 次/token）、gate 的 sigmoid×mul（48 次/token）、NVFP4 GEMV 仍只有 0.64–0.80 TB/s。
 
+## NVFP4 GEMV 带宽（第四阶段）
+
+代码在分支 `inkling-opt`（提交 b9fee35，补丁 0005），只改 `inkling-gemv.cu`。三个方向各自独立实现并审查（减少指令数 +3.5、调整 lane 布局 +1.4、重新设计 +5.3 token/s），三者都与原 kernel 逐位相同，合并的是最快的重新设计版 `ink_mmid_nvfp4_v4`。
+
+做法：
+
+- 每个线程只处理一个 36 字节的权重块，64 条 lane 全部在用；三次读取在任何准备工作之前发出。原 kernel 是 8 条 lane 一行、每条 lane 串行 3–5 轮"读取、等待、计算"。
+- 4 个 E2M1 码的解码用两次 `v_perm_b32` 异或得到（利用选择子 8..15 的特殊含义），每 64 个值的指令数从 249 降到约 170；UE4M3 尺度查 LDS 里的 256 项表。
+- 4 个子块乘积先写进 LDS，第二阶段再按原 kernel 的顺序（8 条链，然后 4/2/1 的树）相加。这样 lane 的分配与 fp32 求和顺序解耦，所以结果逐位相同。
+- 只为 K=2304（36 块）和 K=1152（18 块）实例化；其他形状回退到旧 kernel。`GGML_CUDA_INK_NVFP4_V=1` 切回旧 kernel。
+
+| 测试 | 第三阶段 | 第四阶段 |
+| --- | --- | --- |
+| llama-bench tg128 | 83.4 token/s | **88.6** token/s |
+| llama-server 贪心 | 81.4 | **86.9** |
+| llama-server 采样 | 76.1 | **80.7** |
+
+| GEMV（单独循环测，含约 2 µs 的空 launch） | 旧 | 新 | 只读不算 |
+| --- | --- | --- | --- |
+| gate/up，23.9 MB | 30.5 µs（0.78 TB/s） | 22.3 µs（1.07 TB/s） | 20.6–20.9 µs |
+| down，11.9 MB | 18.6 µs（0.64 TB/s） | 13.4 µs（0.89 TB/s） | 12.0 µs |
+
+正确性：`kld.sh` 的 logits md5 与第三阶段相同（默认配置、`GGML_CUDA_INK_FATTN=0`、关闭 graph 三种情况），KLD 统计不变；1425 token prompt 的贪心输出相同；prompt 处理速度不变（pp512 约 658 token/s）。
+
+经验：
+
+- 这张卡上 kernel 的时间大致等于"读取模式的访存时间 + 一个 wave 串行执行的指令数 + 约 1 µs"。wave 越短、读取越早发出越好；down 原来慢是因为 18 块分给 8 条 lane 只用上 75% 的 lane 轮次。
+- 同样字节量只读不算也要 20.6 / 12.0 µs（扣掉空 launch 约 1.27 TB/s），新 kernel 离这个上限只剩约 1.5 µs/次，NVFP4 GEMV 基本到头。
+- 每条 lane 流式读连续一段（而不是跨行分布）明显更慢；从全局内存读激活或尺度表比放 LDS 慢；512/1024 线程的 block 更慢。
+- 改变求和顺序的 18-lane 版本更简单，但 top-1 相同率掉到 99.608%（关掉注意力 kernel 时），没有采用。
+- `v_perm_b32` 选择子的特殊含义和 `fp contract(off)` 只在 gfx90a + ROCm 7.2.1 上验证过；换工具链后用 `kld.sh` 的 md5 复核。
+- `inkling-gemv.cu` 里还留着测速用的代码（`GGML_CUDA_INK_NVBENCH`）和多个试验用的实例化，编译时间变长，可以以后清理。
+
 ## 下一步方向
 
-现在约 12.0 ms/token，带宽下限约 4.3 ms。剩下的主要部分（rocprofv3 估计）：
+现在约 11.3 ms/token，带宽下限约 4.3 ms。剩下的主要部分：
 
-1. GEMV 占一半以上：BF16 投影 `ink_gemv_bf16<32>` 145 次/token、约 20 µs/次；NVFP4 专家 88 次/token、约 23 µs/次（0.64–0.80 TB/s，BF16 专家 GEMV 能到 1.2–1.3 TB/s）。
+1. BF16 投影 `ink_gemv_bf16<32>`：145 次/token、约 20 µs/次，是现在最大的一块；可以用同样的办法（短 wave、读取提前、只读上限对照）重新审视。
 2. 剩余约 1785 个 kernel/token 里的小 kernel：control gate、norm、conv、clip、router、`copyBuffer`（105 次）、conv 状态 GET_ROWS、gate 的 sigmoid×mul。
 3. DSpark 的多 token 验证 graph 没有融合，也没有专家去重。
 4. 是否把 inkling2 架构移植进本仓库的源码树：目前优化都在 Unsloth 合并版上，以补丁形式保存在 [patches/](patches/)。

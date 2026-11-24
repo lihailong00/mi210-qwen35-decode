@@ -8,7 +8,7 @@
 | --- | --- | --- | --- | --- | --- | --- |
 | Qwen3.8-27B | llama.cpp，IQ3_S GGUF | 45.6 → **80.3** token/s | K=3 约 **155** token/s，输出与不开逐字节相同 | 1220 → **2125** token/s | 124 / 约 2980 | [qwen3.8-27b](docs/models/qwen3.8-27b/README.md) |
 | Qwen3.8-27B | vLLM，官方 FP8 | 9.9 → **42** token/s | K=3 **106–122** token/s，输出与 MTP=0 逐字节相同 | — | 约 53 / — | [qwen3.8-27b](docs/models/qwen3.8-27b/README.md)、[vllm-opt](vllm-opt/README.md) |
-| Inkling-2-Mini | llama.cpp（Unsloth 合并版），UD-Q8_K_XL GGUF | 33.3 → **83.6** token/s（小算子融合 + GEMV + 注意力 / 路由，KLD 0.0010） | DSpark n_max 2：贪心 38.3 token/s（验证未融合，比不开慢），输出与不开不同 | pp2048 513 token/s | 约 205–240 / — | [inkling-2-mini](docs/models/inkling-2-mini/README.md) |
+| Inkling-2-Mini | llama.cpp（Unsloth 合并版），UD-Q8_K_XL GGUF | 33.3 → **88.6** token/s（小算子融合 + GEMV + 注意力 / 路由，KLD 0.0010） | DSpark n_max 2：贪心 38.3 token/s（验证未融合，比不开慢），输出与不开不同 | pp2048 513 token/s | 约 205–240 / — | [inkling-2-mini](docs/models/inkling-2-mini/README.md) |
 
 正确性的标准是：非位精确的改动与基线 logits 的 KL 散度处在纯计算重排的噪声底线上；融合、多列 kernel 和投机解码要求逐位 / 逐字节相同。方法见 [docs/mi210/method.md](docs/mi210/method.md)。
 
