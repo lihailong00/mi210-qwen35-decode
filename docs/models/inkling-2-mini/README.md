@@ -1,6 +1,6 @@
 # Inkling-2-Mini
 
-第二个模型。基线 decode 33.3 token/s；第一阶段（小算子融合，logits 与基线逐位相同）后 44.8 token/s；第二阶段（GEMV）后 **50.7** token/s，KLD 在求和顺序的噪声底线上。
+第二个模型。基线 decode 33.3 token/s；第一阶段（小算子融合，logits 与基线逐位相同）后 44.8 token/s；第二阶段（GEMV）后 50.7 token/s；第三阶段（剩余小算子、注意力偏置、decode 注意力、MoE 路由）后 **83.6** token/s，平均 KLD 0.00099。
 
 - **权重**：Unsloth 的 `Inkling-2-Mini-UD-Q8_K_XL.gguf`（ModelScope `unsloth/Inkling-2-Mini-GGUF` 根目录，Unsloth 循环层布局，22,867,451,616 字节，SHA-256 以 dfb04bf3 开头）。专家权重 NVFP4 共 11.47 GB，其余（注意力、最后 4 层的专家、词嵌入、LM head）为 BF16 共 11.35 GB。
 - **投机解码 drafter**：`dspark/dspark-Inkling-2-Mini-BF16.gguf`（架构 dflash，DSpark = DFlash 块 drafter + Markov 头，3 层，块大小 8，647,792,800 字节，SHA-256 以 b8985695 开头）。
@@ -168,12 +168,54 @@ decode 只到上限的约 15%。
 - 从一个 CU 发出跨步 4 字节的写（每次写都落在不同 cache line）很慢；让每个线程写一段连续区间。
 - rocprofv3 下单个 kernel 的耗时会被放大、方差很大，取舍以 llama-bench 交替 A/B 为准（`ksweep.sh` 只用来看相对差别）。
 
+## decode 第三阶段（小算子、注意力、路由）
+
+代码在分支 `inkling-opt`（合并提交 39de315，补丁 0004 是相对 b888be8 的整体 diff）。四项分别在独立分支上实现并各自经过一轮独立审查，然后合并。全部只处理单 token、单序列，其余情况回退到原路径。
+
+| 项 | 新文件 | 内容 | 单独增益（从 50.6 起） | 正确性 |
+| --- | --- | --- | --- | --- |
+| 剩余小算子 | `inkling-ops.cu` | mix 连同最后的加权和与 CONT 拷贝一个 kernel；convolve 连同残差 ADD、K/V cache 写入、动态 tap 一个 kernel；精简的 mix / RMS_NORM+MUL / control norm / clip kernel；q8_1 激活由上游 kernel 直接写出 | → 65.2 | 逐位相同 |
+| 注意力偏置 | `inkling-attn.cu` | PAD + 表 GEMM + SUB + GET_ROWS + mask 相加 + FILL 合成一个 kernel，只算实际用到的 n_kv 个位置 | → 55.5 | 逐位相同 |
+| decode 注意力 | `inkling-fattn.cu` | 单 query 专用 kernel（每个 head 一个 block，按 mask 跳过尾部），n_kv > 256 时分块再合并 | → 53.1 | KLD |
+| MoE 路由 | `inkling-moe.cu` | SIGMOID 到 SCALE 的路由尾部一个 kernel；最后 4 层 BF16 专家的 GEMV | → 52.8 | 路由逐位相同，BF16 专家按 KLD |
+
+合并后的结果（各项节省的时间相加，约 7.9 ms/token）：
+
+| 测试 | 第二阶段 | 第三阶段 |
+| --- | --- | --- |
+| llama-bench tg128 | 50.7 token/s | **83.6** token/s |
+| llama-server 贪心 | 50.2 | **81.4** |
+| llama-server 采样 | 48.1 | **76.1** |
+| kernel 数 / token | 约 3450 | 约 1785 |
+
+正确性（`kld.sh`，3 个 chunk，对比原版 logits）：
+
+| 配置 | 结果 |
+| --- | --- |
+| 默认 | 平均 KLD 0.000992，最大 0.1235，top-1 相同 99.608% |
+| `GGML_CUDA_INK_FATTN=0`（tg128 78.6） | 平均 KLD 0.000786，top-1 相同 99.869%（与第二阶段相同） |
+| 再加 `GGML_CUDA_INK_BF16_EXPERTS=0` | 同上，与第二阶段 logits 逐位相同 |
+| `GGML_CUDA_INK_FATTN=0 GGML_CUDA_INK_NVFP4=0 GGML_CUDA_INK_BF16=0` | md5 01ec923fac19，与原版逐位相同 |
+
+1425 token 的 prompt（超过 1024 的滑动窗口）下，逐位相同的那部分融合开和关的贪心输出一致。
+
+主要开关：`GGML_CUDA_INK_OPS=0`（`inkling-ops.cu` 全部，另有 18 个子开关）、`GGML_CUDA_INK_ATTN_BIAS=0`、`GGML_CUDA_INK_FATTN=0`、`GGML_CUDA_INK_ROUTER=0`、`GGML_CUDA_INK_BF16_EXPERTS=0`。
+
+注意：
+
+- decode 注意力 kernel 的 V 求和用 fp32（原 kernel 用半精度累加），与原 kernel 的相对 rms 差约 2e-4。top-1 相同率 99.608% 离 99.5% 的线只有一个 token（3 个 chunk 中一个 token 是 0.13%），需要更严格时用 `GGML_CUDA_INK_FATTN=0`。
+- 注意力偏置里的 16 项点积要与 rocBLAS（ROCm 7.2.1，Tensile）的累加顺序一致才逐位相同：从 0 开始按 k=0..15 顺序 fmaf。换 ROCm 版本后用 `GGML_CUDA_INK_VERIFY=1 GGML_CUDA_DISABLE_GRAPHS=1` 重新核对。
+- `mul_mat_vec_f` 在 gfx90a 上 ncols_dst 为 1、2 时乘积先舍入再相加，为 3 时用 FMA；3 个 query 的 mix 按这个规律才能逐位相同。
+- 这些 kernel 假定 64 lane 的 wave（DPP、ds_bpermute、ballot），只适用于 gfx90a 这类 CDNA 设备；`inkling-fattn.cu` 有设备检查，`inkling-ops.cu` 没有。
+- `inkling-ops.cu` 的 dispatch 必须排在其他 Inkling 融合之前；K/V cache 的写入被提前到卷积 kernel 里。
+- kernel 的耗时主要跟每个 wave 执行的指令数走，barrier 和额外的依赖读取几乎不花时间；精简指令路径比合并 launch 更有效（mix kernel 精简后 +5.7 token/s）。
+- 没做的：conv 状态的 GET_ROWS（48 次/token）、gate 的 sigmoid×mul（48 次/token）、NVFP4 GEMV 仍只有 0.64–0.80 TB/s。
+
 ## 下一步方向
 
-现在约 19.7 ms/token，带宽下限约 4.3 ms。剩下的主要部分（rocprofv3 估计）：
+现在约 12.0 ms/token，带宽下限约 4.3 ms。剩下的主要部分（rocprofv3 估计）：
 
-1. 小算子仍有约 3400 个 kernel/token：残差 add、mix 输出的 view/cont 拷贝（memcpy）、注意力相对位置偏置的准备（pad 的是常量权重，可以提到加载时）、K/V cache 写入、3 个 query 的 mix、动态卷积。
-2. flash attention decode 约 22 µs/次（48 次/token）。
-3. NVFP4 GEMV 前的 q8_1 量化可以并进 GEMV（88 次 launch/token）；最后 4 层的 BF16 专家仍走 `mul_mat_vec_f`。
-4. DSpark 的多 token 验证 graph 没有融合，也没有专家去重；现在开 DSpark 比不开慢。
-5. 是否把 inkling2 架构移植进本仓库的源码树：目前优化都在 Unsloth 合并版上，以补丁形式保存在 [patches/](patches/)。
+1. GEMV 占一半以上：BF16 投影 `ink_gemv_bf16<32>` 145 次/token、约 20 µs/次；NVFP4 专家 88 次/token、约 23 µs/次（0.64–0.80 TB/s，BF16 专家 GEMV 能到 1.2–1.3 TB/s）。
+2. 剩余约 1785 个 kernel/token 里的小 kernel：control gate、norm、conv、clip、router、`copyBuffer`（105 次）、conv 状态 GET_ROWS、gate 的 sigmoid×mul。
+3. DSpark 的多 token 验证 graph 没有融合，也没有专家去重。
+4. 是否把 inkling2 架构移植进本仓库的源码树：目前优化都在 Unsloth 合并版上，以补丁形式保存在 [patches/](patches/)。
