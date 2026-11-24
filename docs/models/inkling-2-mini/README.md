@@ -306,6 +306,44 @@ graph 每当 n_kv 的 256 对齐增长时要重新捕获一次，约 14 ms（平
 - 采样线程池在候选数 ≥ 32768 时才启用，最多 7 个辅助线程。
 - 没测：DSpark、多序列同时 decode、超过约 1750 token 以外的更长生成（只测了 tg64 深度 8192 的速度）。
 
+## 持久化 kernel 可行性测试（结论：不值得做）
+
+想法：整个 decode 用一个常驻 kernel 跑，层与层之间用 kernel 内同步代替 launch，并在串行小算子执行时提前读下一个 GEMV 的权重。先用微基准测这件事值不值得做。代码：[mi210-tools/eval/inkling/pk.cpp](../../../mi210-tools/eval/inkling/pk.cpp)（`hipcc -O3 --offload-arch=gfx90a`），[runs.py](../../../mi210-tools/eval/inkling/runs.py) 用 rocprofv3 trace 统计每 token 的 kernel 序列。
+
+同步原语的开销（MI210，ROCm 7.2.1）：
+
+| 项 | 开销 |
+| --- | --- |
+| HIP graph 里一次空 kernel（1 / 385 个 block） | 1.33 / 1.60 µs |
+| HIP graph 里一次单 block 的依赖小算子（读全局、归约、写全局） | 3.61 µs |
+| 两个 block 之间的标志传递（单向） | 0.37 µs |
+| 自写的全局 barrier（104 / 385 个 block） | 1.08 / 1.31 µs |
+| cooperative groups `grid.sync()`（104 / 385 个 block） | 0.41 / 1.13 µs |
+
+一段 = S 个依赖的小算子（单 block，类似 RMS norm）+ 一个 3072×2304 的 BF16 GEMV（14.2 MB，每段换一份权重），µs / 段：
+
+| 做法 | S=1 | S=2 | S=4 | S=8 |
+| --- | --- | --- | --- | --- |
+| 只有 GEMV（下限） | 13.9 | 13.9 | 13.9 | 13.9 |
+| launch，小算子各自读写全局（现在的形态） | 18.2 | 23.4 | 34.1 | 52.9 |
+| launch，小算子合成一个 kernel，仍读写全局 | 18.3 | 22.5 | 31.1 | 46.0 |
+| launch，小算子合成一个 kernel，中间结果留在寄存器 | 16.6 | 17.4 | 18.1 | 22.0 |
+| 常驻 kernel，读写全局，预取权重 | 17.8 | 21.1 | 30.0 | 45.8 |
+| 常驻 kernel，中间结果留在寄存器，预取权重 | 14.8 | 15.3 | 16.6 | 18.3 |
+
+所有变体的输出与 launch 版逐位相同。
+
+结论：
+
+- 一次 launch 在 graph 里只要 1.3–1.6 µs，而全局 barrier 也要 1.1–1.3 µs，用 barrier 代替 launch 几乎省不了什么。
+- 小算子贵在全局内存往返（权重流把 8 MB 的 L2 冲掉，每次读写约 1.5–2 µs 延迟），不在 launch：同样 8 个小算子，读写全局约 4 µs / 个，中间结果留在寄存器只要约 0.5 µs / 个。这一点在普通 launch 模式下靠融合也能拿到。
+- 预取权重只有在小算子很短时才藏得住：小算子读写全局时，和预取争带宽，几乎不重叠。
+- 和最好的 launch 做法（中间结果留在片上）相比，常驻 kernel 每段只多省 1.5–3.8 µs。
+
+实际模型每 token 1037 次 launch = 401 次 GEMV 类 + 636 次小算子，两个 GEMV 之间多是 0–3 个小算子（0 个 96 处、1 个 112 处、2 个 84 处、3 个 100 处）。按上面的数推算，常驻 kernel 每 token 能省约 0.4–1.1 ms，即约 +5% 到 +14%（114–125 token/s）。代价是把整个单 token forward 重写成一个 kernel：寄存器用量取最大的那一段，会压低 GEMV 的占用率；mix 等 1024 线程的单 block kernel 要改写；常驻 kernel 占满所有 CU，和这张卡上的其他进程冲突。所以不做。
+
+更值得做的是测试里看到的另一点：把 GEMV 前后的小算子并进 GEMV 的读入或写出阶段（每个 GEMV block 本来就要读入整个输入向量，可以顺便算 norm；逐通道的 conv 可以在写出时做），省掉小算子的全局往返。候选：`ink_conv_plain`（96 次 / token）、`ink_norm_mul`（83）、control 相关（96）、clip（54）。
+
 ## 下一步方向
 
 现在约 9.1 ms/token，其中读权重按 1.27 TB/s 算最少 4.6 ms，主机侧不到 0.1 ms。剩下约 1037 个 kernel/token（每个 layer pass 约 21 个）。各分支记录的未做项：
