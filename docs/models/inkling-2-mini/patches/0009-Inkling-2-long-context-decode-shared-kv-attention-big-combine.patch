@@ -1,0 +1,690 @@
+diff --git a/ggml/src/ggml-cuda/inkling-fattn.cu b/ggml/src/ggml-cuda/inkling-fattn.cu
+index 6259f3c..4c195c5 100644
+--- a/ggml/src/ggml-cuda/inkling-fattn.cu
++++ b/ggml/src/ggml-cuda/inkling-fattn.cu
+@@ -35,12 +35,16 @@
+ //      the weight sum is accumulated alongside
+ //   4. the 16 subsets are added through LDS, normalized and written (single chunk), or written
+ //      unnormalized with (max, sum) per head and merged by ink_fattn_combine64 (several chunks).
++// Long n_kv (>= GGML_CUDA_INK_FATTN_GQA, default 6144) runs ink_fattn_gqa instead: one block per (kv head, chunk) for the
++// 3 query heads of the group, bit-identical partials; > 64 chunks are merged by ink_fattn_combine_big (see there).
+ // ---------------------------------------------------------------------------------------------
+ 
+ #define INK_FA_D       128
+ #define INK_FA_NREL    16  // relative position features (INK_ATTN_NREL of inkling-attn.cu)
+ #define INK_FA_THREADS 256
+ #define INK_FA_CHUNK   256 // positions per block
++#define INK_FA_GQA_MIN_DEFAULT 6144 // n_kv from which ink_fattn_gqa runs (GGML_CUDA_INK_FATTN_GQA); above the sliding-window
++                                    // caches of -ub <= 4096 (1024 + ub cells: mostly masked, fewer blocks are faster there)
+ 
+ static bool ink_fattn_env_on(const char * name) {
+     const char * v = getenv(name);
+@@ -83,17 +87,29 @@ static __device__ __forceinline__ float ink_fa_score(const half2 * kr, const hal
+     return acc;
+ }
+ 
+-// 4 V rows (8 columns each) times their weights
++// 4 V rows (8 columns each) times their weights.
++// The rounding is spelled out: columns 0..5 of the thread use fused multiply-adds, columns 6 and 7 a rounded product
++// and a separate add. This is exactly what the compiler (ROCm 7.2.1 clang) made of the former `va += w*v` source in
++// ink_fattn_f16 (v_pk_fma_f32 for three column pairs, v_pk_mul_f32/v_mul_f32 + v_pk_add_f32 for the fourth); written
++// out, the results of ink_fattn_f16 stay the same and ink_fattn_gqa reproduces them whatever the compiler would choose.
+ static __device__ __forceinline__ void ink_fa_vacc(float * va, float & wsum, const half2 (*vr)[4], const float * Wb) {
+ #pragma unroll
+     for (int i = 0; i < 4; ++i) {
+         const float w = Wb[16*i]; // 0 for masked rows and rows past the chunk
+         wsum += w;
+ #pragma unroll
+-        for (int e = 0; e < 4; ++e) {
++        for (int e = 0; e < 3; ++e) {
+             const float2 vf = __half22float2(vr[i][e]);
+-            va[2*e + 0] += w * vf.x;
+-            va[2*e + 1] += w * vf.y;
++            va[2*e + 0] = __builtin_fmaf(w, vf.x, va[2*e + 0]);
++            va[2*e + 1] = __builtin_fmaf(w, vf.y, va[2*e + 1]);
++        }
++        {
++#pragma clang fp contract(off)
++            const float2 vf = __half22float2(vr[i][3]);
++            const float  p0 = w * vf.x;
++            const float  p1 = w * vf.y;
++            va[6] = va[6] + p0;
++            va[7] = va[7] + p1;
+         }
+     }
+ }
+@@ -466,6 +482,490 @@ static __global__ void ink_fattn_combine64(const float * __restrict__ tmp, const
+     }
+ }
+ 
++// ---------------------------------------------------------------------------------------------
++// Long n_kv (several chunks): the 3 query heads of a kv group read the same K/V. ink_fattn_gqa runs one block per
++// (kv head, chunk of 256 positions) and computes the partials of all 3 heads from one load of K and V. Per head every
++// value is produced by the same operations in the same order as ink_fattn_f16 in multi-chunk mode (same thread roles,
++// same reductions, same chunk boundaries), so the partials and (max, sum) pairs are bit-identical; they are merged by
++// the same combine as before (ink_fattn_combine64, or ink_fattn_combine_big = ink_fattn_combine's arithmetic).
++// Differences to ink_fattn_f16: the per-head mask extent kend is computed for each head; K.Q iterations and V batches
++// run to the largest extent of the 3 heads, and a head only accumulates the V batches inside its own extent (the K.Q
++// values past a head's extent are never read). LDS: S/W of phases 1-3 and A of phase 4 share one buffer.
++// ---------------------------------------------------------------------------------------------
++template <bool BIAS>
++__launch_bounds__(INK_FA_THREADS, 2)
++static __global__ void ink_fattn_gqa(
++        const float * __restrict__ Q, const char * __restrict__ K, const char * __restrict__ V,
++        const half * __restrict__ mask, const float * __restrict__ sinks,
++        float * __restrict__ dst, float * __restrict__ meta,
++        const int n_kv, const int n_head,
++        const int q_stride, const uint32_t nb11, const int nb12, const uint32_t nb21, const int nb22,
++        const int mask_stride, const float scale,
++        const ggml_cuda_ink_attn_bias_args ba) {
++    constexpr int G  = 3;
++    constexpr int D  = INK_FA_D;
++    constexpr int C  = INK_FA_CHUNK;
++    constexpr int AS = D + 4;
++    constexpr int SW = 2*G*C;                      // S + W
++    constexpr int AW = 16*AS;                      // A of one head
++    constexpr int SM = SW > AW ? SW : AW;
++
++    __shared__ float smem[SM];
++    float * S = smem;           // [G][C]
++    float * W = smem + G*C;     // [G][C]
++    float * A = smem;           // [16][AS] (after phase 3, one head at a time)
++    __shared__ int   rend[G][4];
++    __shared__ float rmax[G][4];
++    __shared__ float rws[G][16];
++
++    const int g     = blockIdx.x;
++    const int p     = blockIdx.y;
++    const int tid   = threadIdx.x;
++    const int lane  = tid & 63;
++    const int wave  = tid >> 6;
++    const int lane4 = lane << 2;
++    const int h0    = g*G;
++
++    const int64_t k0  = (int64_t) p*C;
++    const int     len = (int) min((int64_t) C, n_kv - k0);
++
++    const uint32_t pos  = tid >> 3;
++    const uint32_t part = tid & 7;
++    // V role as in ink_fattn_f16 (rows 16*i + sub, columns 8*cg .. 8*cg + 7) but placed on the lanes so that the 16
++    // threads of one sub are adjacent: a V load instruction reads 4 whole rows (ink_fattn_f16: 16 quarter rows)
++    const uint32_t cg   = tid & 15;
++    const uint32_t sub  = tid >> 4;
++
++    const int64_t kv_own = k0 + min(tid, len - 1);
++    int bpos = 0;
++    if (BIAS) {
++        bpos = ba.idx[kv_own];
++    }
++    float4 qf[G][4];
++#pragma unroll
++    for (int j = 0; j < G; ++j) {
++        const float * Qp = Q + (int64_t) (h0 + j)*q_stride + part*8;
++        ggml_cuda_memcpy_1<sizeof(float4)>(&qf[j][0], Qp);
++        ggml_cuda_memcpy_1<sizeof(float4)>(&qf[j][1], Qp + 4);
++        ggml_cuda_memcpy_1<sizeof(float4)>(&qf[j][2], Qp + 64);
++        ggml_cuda_memcpy_1<sizeof(float4)>(&qf[j][3], Qp + 68);
++    }
++
++    float m[G];
++    float sink[G];
++    float4 br[G][4];
++    float  bs[G];
++    float  bm0 = 0.0f;
++#pragma unroll
++    for (int j = 0; j < G; ++j) {
++        m[j]    = 0.0f;
++        sink[j] = -INFINITY;
++        bs[j]   = 0.0f;
++    }
++    if (BIAS) {
++#pragma unroll
++        for (int j = 0; j < G; ++j) {
++            const float * rp = ba.R + (h0 + j)*INK_FA_NREL;
++#pragma unroll
++            for (int i = 0; i < 4; ++i) {
++                ggml_cuda_memcpy_1<sizeof(float4)>(&br[j][i], rp + 4*i);
++            }
++            bs[j] = ba.sinks[h0 + j];
++            if (p == 0) {
++                sink[j] = ba.fill_value;
++            }
++        }
++        bm0 = ggml_cuda_cast<float>(ba.mask0[kv_own]);
++    } else {
++#pragma unroll
++        for (int j = 0; j < G; ++j) {
++            m[j] = __half2float(mask[(int64_t) (h0 + j)*mask_stride + kv_own]);
++            if (sinks != nullptr && p == 0) {
++                sink[j] = sinks[h0 + j];
++            }
++        }
++    }
++
++    const char *   Ks    = K + (int64_t) g*nb12 + k0*nb11;
++    const uint32_t klast = (uint32_t) (len - 1)*nb11 + part*16;
++    const uint32_t kstep = 32*nb11;
++    uint32_t       koff  = pos*nb11 + part*16;
++    __align__(16) half2 kr0[8];
++    __align__(16) half2 kr1[8];
++    __align__(16) half2 kr2[8];
++    {
++        const uint32_t o0 = min(koff, klast);
++        const uint32_t o1 = min(koff + kstep, klast);
++        ggml_cuda_memcpy_1<4*sizeof(half2)>(kr0,     Ks + o0);
++        ggml_cuda_memcpy_1<4*sizeof(half2)>(kr0 + 4, Ks + o0 + 128);
++        ggml_cuda_memcpy_1<4*sizeof(half2)>(kr1,     Ks + o1);
++        ggml_cuda_memcpy_1<4*sizeof(half2)>(kr1 + 4, Ks + o1 + 128);
++    }
++    const char *   Vs    = V + (int64_t) g*nb22 + k0*nb21;
++    const uint32_t vlast = (uint32_t) (len - 1)*nb21 + cg*16;
++    const uint32_t vstep = 16*nb21;
++    uint32_t       voff  = sub*nb21 + cg*16;
++    __align__(16) half2 vr[4][4];
++#pragma unroll
++    for (int i = 0; i < 4; ++i) {
++        ggml_cuda_memcpy_1<4*sizeof(half2)>(vr[i], Vs + min(voff + i*vstep, vlast));
++    }
++
++    if (BIAS) {
++        const bool    padded = bpos >= ba.n_ext;
++        const float * wp     = ba.W + (int64_t) (padded ? 0 : bpos)*INK_FA_NREL;
++        float4 bw[4];
++#pragma unroll
++        for (int i = 0; i < 4; ++i) {
++            ggml_cuda_memcpy_1<sizeof(float4)>(&bw[i], wp + 4*i);
++        }
++#pragma unroll
++        for (int j = 0; j < G; ++j) {
++            float acc = 0.0f;
++#pragma unroll
++            for (int i = 0; i < 4; ++i) {
++                acc = fmaf(bw[i].x, br[j][i].x, acc);
++                acc = fmaf(bw[i].y, br[j][i].y, acc);
++                acc = fmaf(bw[i].z, br[j][i].z, acc);
++                acc = fmaf(bw[i].w, br[j][i].w, acc);
++            }
++            if (padded) {
++                acc = 0.0f;
++            }
++            const float b = acc - bs[j];
++            const float v = b + bm0;
++            m[j] = __half2float(ggml_cuda_cast<half>(v));
++        }
++    }
++
++    // ---- per head: number of leading positions that contain all unmasked ones
++    bool valid[G];
++#pragma unroll
++    for (int j = 0; j < G; ++j) {
++        valid[j] = tid < len && !(m[j] == -INFINITY);
++        const uint64_t bal = ggml_cuda_ballot(valid[j]);
++        if (lane == 0) {
++            rend[j][wave] = bal != 0 ? (tid & ~63) + 64 - __builtin_clzll(bal) : 0;
++        }
++    }
++    __syncthreads();
++    int kend[G];
++#pragma unroll
++    for (int j = 0; j < G; ++j) {
++        kend[j] = max(max(rend[j][0], rend[j][1]), max(rend[j][2], rend[j][3]));
++    }
++    const int kendA = max(max(kend[0], kend[1]), kend[2]);
++
++    // ---- 1. K.Q for the 3 heads from each loaded K row
++    half2 qh[G][8];
++    {
++        const half2 scale_h2 = make_half2(scale, scale);
++#pragma unroll
++        for (int j = 0; j < G; ++j) {
++#pragma unroll
++            for (int i = 0; i < 4; ++i) {
++                qh[j][2*i + 0] = make_half2(qf[j][i].x, qf[j][i].y);
++                qh[j][2*i + 1] = make_half2(qf[j][i].z, qf[j][i].w);
++            }
++#pragma unroll
++            for (int i = 0; i < 8; ++i) {
++                qh[j][i] *= scale_h2;
++            }
++        }
++    }
++    // three K buffers: iteration it + 3 is loaded into the buffer of iteration it right after its use
++    if (kendA > 64) {
++        const uint32_t o = min(koff + 2*kstep, klast);
++        ggml_cuda_memcpy_1<4*sizeof(half2)>(kr2,     Ks + o);
++        ggml_cuda_memcpy_1<4*sizeof(half2)>(kr2 + 4, Ks + o + 128);
++    }
++#define INK_FA_KSTEP(KB, IT)                                                                   \
++    {                                                                                          \
++        _Pragma("unroll")                                                                      \
++        for (int j = 0; j < G; ++j) {                                                          \
++            const float a = ink_fa_score(KB, qh[j], lane4);                                    \
++            if (part == 0) {                                                                   \
++                S[j*C + (IT)*32 + pos] = a;                                                    \
++            }                                                                                  \
++        }                                                                                      \
++        if (((IT) + 3)*32 < kendA) {                                                           \
++            const uint32_t o = min(koff + ((IT) + 3)*kstep, klast);                            \
++            ggml_cuda_memcpy_1<4*sizeof(half2)>(KB,     Ks + o);                               \
++            ggml_cuda_memcpy_1<4*sizeof(half2)>(KB + 4, Ks + o + 128);                         \
++        }                                                                                      \
++    }
++    for (int it = 0; it*32 < kendA; it += 3) {
++        INK_FA_KSTEP(kr0, it);
++        if ((it + 1)*32 < kendA) {
++            INK_FA_KSTEP(kr1, it + 1);
++        }
++        if ((it + 2)*32 < kendA) {
++            INK_FA_KSTEP(kr2, it + 2);
++        }
++    }
++#undef INK_FA_KSTEP
++    // V rows of batch 1 (in flight during phase 2)
++    __align__(16) half2 vn[4][4];
++#pragma unroll
++    for (int i = 0; i < 4; ++i) {
++        ggml_cuda_memcpy_1<4*sizeof(half2)>(vn[i], Vs + min(voff + 4*vstep + i*vstep, vlast));
++    }
++    __syncthreads();
++
++    // ---- 2. scores, max, weights per head
++    float s[G];
++    float mx[G];
++#pragma unroll
++    for (int j = 0; j < G; ++j) {
++        s[j] = -INFINITY;
++        if (valid[j]) {
++            s[j] = S[j*C + tid] + m[j];
++        }
++        float x = s[j];
++#pragma unroll
++        for (int b = 0; b < 6; ++b) {
++            x = ink_fa_max(x, ink_fa_perm(x, lane4 ^ (4 << b)));
++        }
++        mx[j] = x;
++    }
++    if (lane == 0) {
++#pragma unroll
++        for (int j = 0; j < G; ++j) {
++            rmax[j][wave] = mx[j];
++        }
++    }
++    __syncthreads();
++#pragma unroll
++    for (int j = 0; j < G; ++j) {
++        float x = ink_fa_max(ink_fa_max(rmax[j][0], rmax[j][1]), ink_fa_max(rmax[j][2], rmax[j][3]));
++        x = ink_fa_max(ink_fa_max(x, -FLT_MAX/2.0f), sink[j]);
++        mx[j] = x;
++        W[j*C + tid] = expf(s[j] - x);
++    }
++    __syncthreads();
++
++    // ---- 3. weighted V sums of the 3 heads from each loaded V row
++    float va[G][8];
++    float wsum[G];
++#pragma unroll
++    for (int j = 0; j < G; ++j) {
++#pragma unroll
++        for (int i = 0; i < 8; ++i) {
++            va[j][i] = 0.0f;
++        }
++        wsum[j] = 0.0f;
++    }
++    const float * Wc = W + sub;
++#pragma unroll
++    for (int j = 0; j < G; ++j) {
++        ink_fa_vacc(va[j], wsum[j], vr, Wc + j*C);
++    }
++    // two V buffers: batch b + 1 is loaded while batch b is accumulated (vr: even batches, vn: odd batches)
++    for (int b = 1; b*64 < kendA; b += 2) {
++        if ((b + 1)*64 < kendA) {
++#pragma unroll
++            for (int i = 0; i < 4; ++i) {
++                ggml_cuda_memcpy_1<4*sizeof(half2)>(vr[i], Vs + min(voff + 4*(b + 1)*vstep + i*vstep, vlast));
++            }
++        }
++#pragma unroll
++        for (int j = 0; j < G; ++j) {
++            if (b*64 < kend[j]) {
++                ink_fa_vacc(va[j], wsum[j], vn, Wc + j*C + b*64);
++            }
++        }
++        if ((b + 1)*64 < kendA) {
++            if ((b + 2)*64 < kendA) {
++#pragma unroll
++                for (int i = 0; i < 4; ++i) {
++                    ggml_cuda_memcpy_1<4*sizeof(half2)>(vn[i], Vs + min(voff + 4*(b + 2)*vstep + i*vstep, vlast));
++                }
++            }
++#pragma unroll
++            for (int j = 0; j < G; ++j) {
++                if ((b + 1)*64 < kend[j]) {
++                    ink_fa_vacc(va[j], wsum[j], vr, Wc + j*C + (b + 1)*64);
++                }
++            }
++        }
++    }
++
++    // ---- 4. totals, partial sums through LDS (A overlays S/W, one head at a time), unnormalized partials + (max, sum)
++    //      The weight sums of the 16 subs are added in the order of the lane butterfly of ink_fattn_f16 (its thread 0
++    //      writes the sum): ((w0 + w1) + (w2 + w3)) + ((w4 + w5) + (w6 + w7)) and so on, pairwise.
++    if (cg == 0) {
++#pragma unroll
++        for (int j = 0; j < G; ++j) {
++            rws[j][sub] = wsum[j];
++        }
++    }
++#pragma unroll
++    for (int j = 0; j < G; ++j) {
++        __syncthreads();
++#pragma unroll
++        for (int i = 0; i < 8; ++i) {
++            A[sub*AS + cg*8 + i] = va[j][i];
++        }
++        __syncthreads();
++        if (tid < D) {
++            float v = 0.0f;
++#pragma unroll
++            for (int sb = 0; sb < 16; ++sb) {
++                v += A[sb*AS + tid];
++            }
++            dst[((int64_t) p*n_head + h0 + j)*D + tid] = v;
++        }
++    }
++    if (tid == 0) {
++#pragma unroll
++        for (int j = 0; j < G; ++j) {
++            float t[16];
++#pragma unroll
++            for (int k = 0; k < 16; ++k) {
++                t[k] = rws[j][k];
++            }
++#pragma unroll
++            for (int st = 1; st < 16; st *= 2) {
++#pragma unroll
++                for (int k = 0; k < 16; k += 2*st) {
++                    t[k] = t[k] + t[k + st];
++                }
++            }
++            const float sum = t[0] + expf(sink[j] - mx[j]);
++            meta[((int64_t) p*n_head + h0 + j)*2 + 0] = mx[j];
++            meta[((int64_t) p*n_head + h0 + j)*2 + 1] = sum;
++        }
++    }
++}
++
++// Same arithmetic as ink_fattn_combine (global max, then the chunks accumulated in order, chunks with a zero factor
++// skipped), for hundreds of chunks: block = (head, 32 output columns). All threads load tiles of 256 chunks into LDS
++// (the next tile is loaded into registers while the current one is accumulated); the max and the scale factors are
++// computed in parallel over the chunks; lanes 0..31 of wave 0 run the in-order accumulation of num from LDS, wave 1 the
++// one of den. (The cost is the instruction count of that serial chain: keep it at one fma per chunk.)
++#define INK_FA_CB_T    256 // chunks per tile
++#define INK_FA_CB_COLS 32
++static __global__ void __launch_bounds__(256, 1) ink_fattn_combine_big(
++        const float * __restrict__ tmp, const float * __restrict__ meta, float * __restrict__ dst, const int n_chunks, const int n_head) {
++    constexpr int D  = INK_FA_D;
++    constexpr int T  = INK_FA_CB_T;
++    constexpr int NC = INK_FA_CB_COLS;
++    const int h   = blockIdx.x;
++    const int c0  = blockIdx.y*NC;
++    const int tid = threadIdx.x;
++
++    constexpr int VS = T + 4; // row stride of the transposed partials (column-major: one row per output column)
++    __shared__ __align__(16) float Vt[NC*VS];
++    __shared__ __align__(16) float Sc[T];
++    __shared__ __align__(16) float Sm[T];
++    __shared__ float Rm[256/64];
++
++    // thread tid loads chunk rows (tid >> 3) + 32*i, columns c0 + 4*(tid & 7) .. + 3; the first tile is in flight
++    // during the max pass
++    const int64_t rstride = (int64_t) n_head*D;
++    const float * tp      = tmp + (int64_t) h*D + c0 + 4*(tid & 7);
++    const int     rr      = tid >> 3;
++    float4 vt[T/32];
++    float  mt = 0.0f, st = 0.0f;
++    auto load_tile = [&](const int p0) {
++#pragma unroll
++        for (int i = 0; i < T/32; ++i) {
++            const int pp = min(p0 + rr + 32*i, n_chunks - 1);
++            ggml_cuda_memcpy_1<sizeof(float4)>(&vt[i], tp + pp*rstride);
++        }
++        const int pm = min(p0 + tid, n_chunks - 1);
++        mt = meta[((int64_t) pm*n_head + h)*2 + 0];
++        st = meta[((int64_t) pm*n_head + h)*2 + 1];
++    };
++    load_tile(0);
++
++    // global max (max is exact in any order: the chunk maxima are never NaN)
++    float mx = -INFINITY;
++    for (int p = tid; p < n_chunks; p += 256) {
++        mx = fmaxf(mx, meta[((int64_t) p*n_head + h)*2]);
++    }
++#pragma unroll
++    for (int b = 0; b < 6; ++b) {
++        mx = fmaxf(mx, ink_fa_perm(mx, (tid & 63)*4 ^ (4 << b)));
++    }
++    if ((tid & 63) == 0) {
++        Rm[tid >> 6] = mx;
++    }
++    __syncthreads();
++    mx = fmaxf(fmaxf(Rm[0], Rm[1]), fmaxf(Rm[2], Rm[3]));
++
++    // Per tile: Sc = factor of each chunk, Sm and the partials of chunks with a zero factor (and of the padding past the
++    // last chunk, factor 0) replaced by -1: fma(+0, -1, x) = x + (-0) = x exactly for every x (also -0), which is the
++    // skip of ink_fattn_combine. Then the dependent chain is one fma per chunk: wave 0 accumulates num (one column per
++    // lane, 4 chunks per LDS read), wave 1 den. num += sc*v and den += sc*sm are fused multiply-adds in
++    // ink_fattn_combine (v_pk_fma_f32): spelled out here.
++    float num = 0.0f;
++    float den = 0.0f;
++    for (int p0 = 0; p0 < n_chunks; p0 += T) {
++        {
++            const float sc = p0 + tid < n_chunks ? expf(mt - mx) : 0.0f;
++            Sc[tid] = sc;
++            Sm[tid] = sc != 0.0f ? st : -1.0f;
++        }
++        __syncthreads();
++#pragma unroll
++        for (int i = 0; i < T/32; ++i) {
++            const int  r  = rr + 32*i;
++            const bool nz = Sc[r] != 0.0f;
++            const int  cb = 4*(tid & 7);
++            Vt[(cb + 0)*VS + r] = nz ? vt[i].x : -1.0f;
++            Vt[(cb + 1)*VS + r] = nz ? vt[i].y : -1.0f;
++            Vt[(cb + 2)*VS + r] = nz ? vt[i].z : -1.0f;
++            Vt[(cb + 3)*VS + r] = nz ? vt[i].w : -1.0f;
++        }
++        __syncthreads();
++        if (p0 + T < n_chunks) {
++            load_tile(p0 + T);
++        }
++        const int n8 = min(T, (n_chunks - p0 + 7) & ~7); // padding chunks add exact zeros
++        if (tid < NC) {
++            const float * vp = Vt + tid*VS;
++            for (int q = 0; q < n8; q += 8) {
++                const float4 s0 = *(const float4 *) &Sc[q];
++                const float4 s1 = *(const float4 *) &Sc[q + 4];
++                const float4 v0 = *(const float4 *) &vp[q];
++                const float4 v1 = *(const float4 *) &vp[q + 4];
++                num = __builtin_fmaf(s0.x, v0.x, num);
++                num = __builtin_fmaf(s0.y, v0.y, num);
++                num = __builtin_fmaf(s0.z, v0.z, num);
++                num = __builtin_fmaf(s0.w, v0.w, num);
++                num = __builtin_fmaf(s1.x, v1.x, num);
++                num = __builtin_fmaf(s1.y, v1.y, num);
++                num = __builtin_fmaf(s1.z, v1.z, num);
++                num = __builtin_fmaf(s1.w, v1.w, num);
++            }
++        } else if (tid >= 64 && tid < 128) {
++            for (int q = 0; q < n8; q += 8) {
++                const float4 s0 = *(const float4 *) &Sc[q];
++                const float4 s1 = *(const float4 *) &Sc[q + 4];
++                const float4 m0 = *(const float4 *) &Sm[q];
++                const float4 m1 = *(const float4 *) &Sm[q + 4];
++                den = __builtin_fmaf(s0.x, m0.x, den);
++                den = __builtin_fmaf(s0.y, m0.y, den);
++                den = __builtin_fmaf(s0.z, m0.z, den);
++                den = __builtin_fmaf(s0.w, m0.w, den);
++                den = __builtin_fmaf(s1.x, m1.x, den);
++                den = __builtin_fmaf(s1.y, m1.y, den);
++                den = __builtin_fmaf(s1.z, m1.z, den);
++                den = __builtin_fmaf(s1.w, m1.w, den);
++            }
++        }
++        __syncthreads();
++    }
++    if (tid == 64) {
++        Rm[0] = den;
++    }
++    __syncthreads();
++    if (tid < NC) {
++        dst[h*D + c0 + tid] = num / Rm[0];
++    }
++}
++
+ #endif // INK_FA_AVAILABLE
+ 
+ static bool ink_fattn_overlap(const ggml_tensor * a, const ggml_tensor * b) {
+@@ -755,36 +1255,120 @@ int ggml_cuda_ink_try_fattn(ggml_backend_cuda_context & ctx, ggml_cgraph * cgrap
+         out = chk.get();
+     }
+ 
+-    const dim3 grid(n_head, n_chunks, 1);
+-    const dim3 block(INK_FA_THREADS, 1, 1);
++    // ---- long n_kv: shared-K/V path (one block per kv head and chunk, bit-identical partials) and the tiled combine
++    //      for more than 64 chunks (bit-identical to ink_fattn_combine). GGML_CUDA_INK_FATTN_GQA=<min n_kv> (0 = off),
++    //      GGML_CUDA_INK_FATTN_CBIG=0 keeps the loop combine.
++    static const int64_t gqa_min = [] {
++        const char * v = getenv("GGML_CUDA_INK_FATTN_GQA");
++        return v ? (int64_t) atoll(v) : (int64_t) INK_FA_GQA_MIN_DEFAULT;
++    }();
++    static const bool cbig_on  = ink_fattn_env_on("GGML_CUDA_INK_FATTN_CBIG");
++    static const bool gqa_chk  = getenv("GGML_CUDA_INK_FATTN_GQACHK") != nullptr && atoi(getenv("GGML_CUDA_INK_FATTN_GQACHK")) != 0 &&
++                                 getenv("GGML_CUDA_DISABLE_GRAPHS") != nullptr;
++    const bool use_gqa = gqa_min > 0 && n_kv >= gqa_min && n_kv > INK_FA_CHUNK;
++
+     const bool gate_in_main = with_gate && n_chunks == 1;
++    auto run = [&](const bool gqa, float * o) {
++        if (gqa) {
++            const dim3 grid(n_head/G, n_chunks, 1);
++            const dim3 block(INK_FA_THREADS, 1, 1);
++#define INK_FA_LAUNCH_GQA(BIAS_)                                                                                                  \
++            ink_fattn_gqa<BIAS_><<<grid, block, 0, stream>>>(                                                                     \
++                (const float *) Q->data, (const char *) K->data, (const char *) V->data, (const half *) mask->data,               \
++                sinks ? (const float *) sinks->data : nullptr, tmp.get(), meta.get(),                                             \
++                (int) n_kv, (int) n_head,                                                                                         \
++                (int) (Q->nb[2]/sizeof(float)), (int) K->nb[1], (int) K->nb[2], (int) V->nb[1], (int) V->nb[2],                   \
++                (int) (mask->nb[2]/sizeof(half)), scale, ba)
++            if (with_bias) { INK_FA_LAUNCH_GQA(true); } else { INK_FA_LAUNCH_GQA(false); }
++#undef INK_FA_LAUNCH_GQA
++        } else {
++            const dim3 grid(n_head, n_chunks, 1);
++            const dim3 block(INK_FA_THREADS, 1, 1);
+ #define INK_FA_LAUNCH(BIAS_, GATE_)                                                                                               \
+-    ink_fattn_f16<G, BIAS_, GATE_><<<grid, block, 0, stream>>>(                                                                   \
+-        (const float *) Q->data, (const char *) K->data, (const char *) V->data, (const half *) mask->data,                       \
+-        sinks ? (const float *) sinks->data : nullptr,                                                                            \
+-        n_chunks > 1 ? tmp.get() : out, n_chunks > 1 ? meta.get() : nullptr,                                                      \
+-        (int) n_kv, (int) n_head,                                                                                                 \
+-        (int) (Q->nb[2]/sizeof(float)), (int) K->nb[1], (int) K->nb[2], (int) V->nb[1], (int) V->nb[2],                           \
+-        (int) (mask->nb[2]/sizeof(half)), scale, ba, gate)
+-    if (with_bias) {
+-        if (gate_in_main) { INK_FA_LAUNCH(true, true); } else { INK_FA_LAUNCH(true, false); }
+-    } else {
+-        if (gate_in_main) { INK_FA_LAUNCH(false, true); } else { INK_FA_LAUNCH(false, false); }
+-    }
++            ink_fattn_f16<G, BIAS_, GATE_><<<grid, block, 0, stream>>>(                                                           \
++                (const float *) Q->data, (const char *) K->data, (const char *) V->data, (const half *) mask->data,               \
++                sinks ? (const float *) sinks->data : nullptr,                                                                    \
++                n_chunks > 1 ? tmp.get() : o, n_chunks > 1 ? meta.get() : nullptr,                                                \
++                (int) n_kv, (int) n_head,                                                                                         \
++                (int) (Q->nb[2]/sizeof(float)), (int) K->nb[1], (int) K->nb[2], (int) V->nb[1], (int) V->nb[2],                   \
++                (int) (mask->nb[2]/sizeof(half)), scale, ba, gate)
++            if (with_bias) {
++                if (gate_in_main) { INK_FA_LAUNCH(true, true); } else { INK_FA_LAUNCH(true, false); }
++            } else {
++                if (gate_in_main) { INK_FA_LAUNCH(false, true); } else { INK_FA_LAUNCH(false, false); }
++            }
+ #undef INK_FA_LAUNCH
+-    CUDA_CHECK(cudaGetLastError());
++        }
++        CUDA_CHECK(cudaGetLastError());
+ 
+-    if (n_chunks > 1) {
+-        if (n_chunks <= 64) {
+-            if (with_gate) {
+-                ink_fattn_combine64<true><<<n_head, 2*D, 0, stream>>>(tmp.get(), meta.get(), out, n_chunks, (int) n_head, gate);
++        if (n_chunks > 1) {
++            if (n_chunks <= 64) {
++                if (with_gate) {
++                    ink_fattn_combine64<true><<<n_head, 2*D, 0, stream>>>(tmp.get(), meta.get(), o, n_chunks, (int) n_head, gate);
++                } else {
++                    ink_fattn_combine64<false><<<n_head, D, 0, stream>>>(tmp.get(), meta.get(), o, n_chunks, (int) n_head, nullptr);
++                }
++            } else if (gqa && cbig_on) {
++                ink_fattn_combine_big<<<dim3(n_head, D/INK_FA_CB_COLS, 1), 256, 0, stream>>>(tmp.get(), meta.get(), o, n_chunks, (int) n_head);
+             } else {
+-                ink_fattn_combine64<false><<<n_head, D, 0, stream>>>(tmp.get(), meta.get(), out, n_chunks, (int) n_head, nullptr);
++                ink_fattn_combine<<<n_head, D, 0, stream>>>(tmp.get(), meta.get(), o, n_chunks, (int) n_head);
+             }
+-        } else {
+-            ink_fattn_combine<<<n_head, D, 0, stream>>>(tmp.get(), meta.get(), out, n_chunks, (int) n_head);
++            CUDA_CHECK(cudaGetLastError());
+         }
+-        CUDA_CHECK(cudaGetLastError());
++    };
++
++    if (use_gqa && gqa_chk) {
++        // debug: the old path into a scratch buffer first (the new output may overlay Q), then the new path; compare bits
++        static const int chk_level = atoi(getenv("GGML_CUDA_INK_FATTN_GQACHK"));
++        ggml_cuda_pool_alloc<float> ref(ctx.pool(), (size_t) n_head*D);
++        const size_t nt = (size_t) n_chunks*n_head*D, nm = (size_t) n_chunks*n_head*2;
++        std::vector<uint32_t> t0(nt), m0(nm), t1(nt), m1(nm);
++        run(false, ref.get());
++        CUDA_CHECK(cudaStreamSynchronize(stream));
++        CUDA_CHECK(cudaMemcpy(t0.data(), tmp.get(), nt*4, cudaMemcpyDeviceToHost));
++        CUDA_CHECK(cudaMemcpy(m0.data(), meta.get(), nm*4, cudaMemcpyDeviceToHost));
++        run(chk_level != 2, out);
++        CUDA_CHECK(cudaStreamSynchronize(stream));
++        CUDA_CHECK(cudaMemcpy(t1.data(), tmp.get(), nt*4, cudaMemcpyDeviceToHost));
++        CUDA_CHECK(cudaMemcpy(m1.data(), meta.get(), nm*4, cudaMemcpyDeviceToHost));
++        {
++            long long dt = 0, dmx = 0, dsm = 0;
++            int first = -1;
++            for (size_t k = 0; k < nt; ++k) { if (t0[k] != t1[k]) { dt++; if (first < 0) first = (int) k; } }
++            for (size_t k = 0; k < nm; k += 2) { dmx += m0[k] != m1[k]; dsm += m0[k+1] != m1[k+1]; }
++            if (dt || dmx || dsm) {
++                float a, b; memcpy(&a, &t0[first < 0 ? 0 : first], 4); memcpy(&b, &t1[first < 0 ? 0 : first], 4);
++                fprintf(stderr, "  partials differ: tmp %lld/%zu (first %d: chunk %d head %d col %d: %.9g vs %.9g) max %lld sum %lld of %zu\n",
++                        dt, nt, first, first/(int)(n_head*D), (first/D) % (int) n_head, first % D, a, b, dmx, dsm, nm/2);
++            }
++        }
++        const size_t n = (size_t) n_head*D;
++        std::vector<uint32_t> a(n), b(n);
++        CUDA_CHECK(cudaMemcpy(a.data(), out, n*sizeof(float), cudaMemcpyDeviceToHost));
++        CUDA_CHECK(cudaMemcpy(b.data(), ref.get(), n*sizeof(float), cudaMemcpyDeviceToHost));
++        long long nd = 0;
++        for (size_t k = 0; k < n; ++k) {
++            nd += a[k] != b[k];
++        }
++        static long long chk_nodes = 0, chk_bad = 0, chk_diff = 0, chk_max_kv = 0, chk_el = 0;
++        static bool chk_reg = false;
++        if (!chk_reg) {
++            chk_reg = true;
++            atexit([] {
++                fprintf(stderr, "ink_fattn gqa check: %lld nodes, %lld elements, max n_kv %lld: %lld nodes differ, %lld elements differ\n",
++                        chk_nodes, chk_el, chk_max_kv, chk_bad, chk_diff);
++            });
++        }
++        chk_nodes++;
++        chk_el += (long long) n;
++        chk_bad += nd != 0;
++        chk_diff += nd;
++        chk_max_kv = std::max(chk_max_kv, (long long) n_kv);
++        if (nd != 0) {
++            fprintf(stderr, "ink_fattn gqa check: node %s n_kv %lld: %lld of %zu elements differ\n", dst->name, (long long) n_kv, nd, n);
++        }
++    } else {
++        run(use_gqa, out);
+     }
+     if (check) {
+         ink_fattn_check(ctx, dst, out, n_kv, n_chunks);

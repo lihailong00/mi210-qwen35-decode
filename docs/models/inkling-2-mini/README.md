@@ -1,6 +1,6 @@
 # Inkling-2-Mini
 
-第二个模型。基线 decode 33.3 token/s；第一阶段（小算子融合，logits 与基线逐位相同）后 44.8 token/s；第二阶段（GEMV）后 50.7 token/s；第三阶段（剩余小算子、注意力偏置、decode 注意力、MoE 路由）后 83.6 token/s；第四阶段（NVFP4 GEMV 重写，逐位相同）后 88.6 token/s；第五阶段（再减一轮 launch、主机侧开销，逐位相同）后 **109.8** token/s，平均 KLD 0.00099。prefill（pp2048）从 519 提到 **6280** token/s。长 prompt（128K）从 1515 提到 **4013** token/s。
+第二个模型。基线 decode 33.3 token/s；第一阶段（小算子融合，logits 与基线逐位相同）后 44.8 token/s；第二阶段（GEMV）后 50.7 token/s；第三阶段（剩余小算子、注意力偏置、decode 注意力、MoE 路由）后 83.6 token/s；第四阶段（NVFP4 GEMV 重写，逐位相同）后 88.6 token/s；第五阶段（再减一轮 launch、主机侧开销，逐位相同）后 **109.8** token/s，平均 KLD 0.00099。prefill（pp2048）从 519 提到 **6280** token/s。长 prompt（128K）从 1515 提到 **4013** token/s。128K 上下文时的 decode 从 52 提到 **71** token/s。
 
 - **权重**：Unsloth 的 `Inkling-2-Mini-UD-Q8_K_XL.gguf`（ModelScope `unsloth/Inkling-2-Mini-GGUF` 根目录，Unsloth 循环层布局，22,867,451,616 字节，SHA-256 以 dfb04bf3 开头）。专家权重 NVFP4 共 11.47 GB，其余（注意力、最后 4 层的专家、词嵌入、LM head）为 BF16 共 11.35 GB。
 - **投机解码 drafter**：`dspark/dspark-Inkling-2-Mini-BF16.gguf`（架构 dflash，DSpark = DFlash 块 drafter + Markov 头，3 层，块大小 8，647,792,800 字节，SHA-256 以 b8985695 开头）。
@@ -428,6 +428,34 @@ graph 每当 n_kv 的 256 对齐增长时要重新捕获一次，约 14 ms（平
 - 用 HIP 的旧式内存池（NO_VMM）时，第一次分配的缓冲区会一直保留；第一个长 ubatch 和稳定状态的分块数不同，会多占显存。分配要按稳定状态的大小来。
 
 没做的：全注意力层在 128K 时约 70 TFLOPS（split Q/P 方案的上限约 90）；多序列同时 prefill 仍走原来的 mask 路径。
+
+## 长上下文 decode（128K：52 → 71 token/s，逐位相同）
+
+代码在分支 `inkling-opt`（8ab7481），补丁 0009 只改 `inkling-fattn.cu`。
+
+**问题**：decode 速度随上下文下降（llama-bench tg64，ubatch 2048）：0 时 107.7，8K 97.2，32K 83.0，64K 69.1，128K 51.8。只有 8 个全注意力层随长度增长；128K 时每个 token 读 KV 约 4.3 GB，按带宽约 3.6 ms，实际多出约 10 ms。
+
+**原因**（profile 确认）：我起初以为同组 3 个 query head 各读一遍 KV，实测 FETCH_SIZE 显示 KV 只读了一遍（相邻 block 在 L2 里共享了）。真正的原因是：(1) kernel 读取只有约 0.75 TB/s（128K 时每次 720 µs）；(2) 超过 64 个分块时退回循环合并，每次 402 µs。两项合计 8 × 1.12 ms ≈ 9 ms。
+
+**做法**：
+
+- `ink_fattn_gqa`：KV 长度 ≥ 6144 时，一个 block 处理（kv head，256 个 key 的分块），同时算 3 个 query head；V 一次读 4 整行，每个 CU 4 个 block。128K 时每次 442–460 µs（约 1.2 TB/s）。分块边界、每个 head 的算术和归约顺序都与原 kernel 相同。
+- `ink_fattn_combine_big`：分块并行的合并，算术与原循环合并相同，513 块时 402 → 21 µs。
+- 第一版有约 3% 的值不一致：编译器对原来的 `va += w*v` 在 4 对列中 3 对生成融合乘加、1 对分开乘加。现在 `ink_fa_vacc` 显式写出这种舍入，两个 kernel 都不再依赖编译器的选择（原 kernel 的结果不变）。
+
+| 上下文 | 修复前 | 修复后 |
+| --- | --- | --- |
+| 0 | 107.6 | 107.2 |
+| 8K | 97.3 | 97.2 |
+| 32K | 82.5 | **89.8** |
+| 64K | 69.1 | **82.8** |
+| 128K | 51.6 | **70.9** |
+
+正确性：逐位相同。27K 和 109K prompt 的贪心续写（160 个 token）新旧路径逐字节相同；逐元素比对模式（`GGML_CUDA_INK_FATTN_GQACHK=1`，关闭 graph）在 144 个节点上 0 差异，覆盖到 KV 长度 109K；短上下文 decode 和 prefill 的 md5 都不变。显存不变。
+
+开关：`GGML_CUDA_INK_FATTN_GQA=<最小 KV 长度>`（默认 6144，0 = 原 kernel）、`GGML_CUDA_INK_FATTN_CBIG=0`（原循环合并）。
+
+剩下的差距（128K 时 14.1 ms 对短上下文 9.3 ms）：全注意力读 KV 3.8 ms（按 1.33 TB/s 的读取上限最少 3.2 ms）；滑动窗口层在上下文超过约 2K 后固定多出约 0.54 ms（KV 视图是窗口 + ubatch 大小，大部分被遮住）；约 0.5 ms 没有分析。
 
 ## 下一步方向
 
