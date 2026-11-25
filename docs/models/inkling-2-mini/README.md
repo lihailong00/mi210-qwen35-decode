@@ -1,6 +1,6 @@
 # Inkling-2-Mini
 
-第二个模型。基线 decode 33.3 token/s；第一阶段（小算子融合，logits 与基线逐位相同）后 44.8 token/s；第二阶段（GEMV）后 50.7 token/s；第三阶段（剩余小算子、注意力偏置、decode 注意力、MoE 路由）后 83.6 token/s；第四阶段（NVFP4 GEMV 重写，逐位相同）后 88.6 token/s；第五阶段（再减一轮 launch、主机侧开销，逐位相同）后 **109.8** token/s，平均 KLD 0.00099。prefill（pp2048）从 519 提到 **6280** token/s。
+第二个模型。基线 decode 33.3 token/s；第一阶段（小算子融合，logits 与基线逐位相同）后 44.8 token/s；第二阶段（GEMV）后 50.7 token/s；第三阶段（剩余小算子、注意力偏置、decode 注意力、MoE 路由）后 83.6 token/s；第四阶段（NVFP4 GEMV 重写，逐位相同）后 88.6 token/s；第五阶段（再减一轮 launch、主机侧开销，逐位相同）后 **109.8** token/s，平均 KLD 0.00099。prefill（pp2048）从 519 提到 **6280** token/s。长 prompt（128K）从 1515 提到 **4013** token/s。
 
 - **权重**：Unsloth 的 `Inkling-2-Mini-UD-Q8_K_XL.gguf`（ModelScope `unsloth/Inkling-2-Mini-GGUF` 根目录，Unsloth 循环层布局，22,867,451,616 字节，SHA-256 以 dfb04bf3 开头）。专家权重 NVFP4 共 11.47 GB，其余（注意力、最后 4 层的专家、词嵌入、LM head）为 BF16 共 11.35 GB。
 - **投机解码 drafter**：`dspark/dspark-Inkling-2-Mini-BF16.gguf`（架构 dflash，DSpark = DFlash 块 drafter + Markov 头，3 层，块大小 8，647,792,800 字节，SHA-256 以 b8985695 开头）。
@@ -381,6 +381,53 @@ graph 每当 n_kv 的 256 对齐增长时要重新捕获一次，约 14 ms（平
 - 只用 2 段文本测 KLD 时，平均值会被个别 token 的翻转左右；判断要用 8 段，并以原版自己换 ubatch 的差异为参照。
 
 没做的：pp8192 在 ubatch 2048 时反而比 1024 慢（2259 对 2582），长 prompt 没有专门优化；MoE GEMM 约 80 TFLOPS（峰值 181）；DSpark 的多 token 验证路径。
+
+## 长 prompt 的 prefill（pp131072：1515 → 4013 token/s）
+
+代码在分支 `inkling-opt`（a5a587b），补丁 0008 是相对 ab37db3 的整体 diff（不含 NOTES 和测试脚本）。分两个阶段，各自经过独立审查。
+
+**问题**：40 个滑动窗口层的 KV 在一个环形缓存里（大小约为窗口 + 一个 ubatch）。第二个 ubatch 起缓存绕回，位置不再连续，`inkling2.cpp` 就退出带状注意力，改走"拷贝 KV + 原版通用注意力 + 重算偏置表"的路径，每个后续 ubatch 多约 0.7 秒。llama.cpp 的 `--swa-full`（滑动窗口层也用全长缓存）可以绕开，但 128K 时要多占约 21 GB 显存，1M 时不可能，所以没有采用。
+
+| 阶段 | 内容 |
+| --- | --- |
+| 1 | 带状注意力算子加环形布局参数（逻辑 key j 对应缓存行 (j+rot) mod n），相对位置距离按真实位置计算；mask 改为在 kernel 里按位置判断（因果 + 1024 窗口，只有 0 / -inf），CPU 不再填充和上传 n_q × n_kv 的 mask；可见区间很长时按 key 拆成两段再合并 |
+| 2 | 全注意力层中距离超过 1024 的 key 不需要 mask 和偏置，用专门的 kernel 计算（3 个 LDS 缓冲、每个 tile 一次 barrier、最大值不变时不重新缩放）；P 不再拆成高低两部分（模式 2，默认），`GGML_CUDA_INK_PFFAR_HM=1` 恢复精确拆分 |
+
+| 测试（ubatch 2048） | 修复前 | 阶段 1 | 阶段 2（a5a587b） |
+| --- | --- | --- | --- |
+| pp2048 | 6294 | 6375 | 6371 |
+| pp8192 | 2242 | 5705 | 5754 |
+| pp32768 | 1894 | 5224 | 5442 |
+| pp131072 | 1514 | 3534 | **4013** |
+| 109K 真实文本（llama-completion） | 1573 | 3801 | **4252** |
+| llama-server，34K prompt | 1248 | 4980 | 5138 |
+
+显存峰值不变（110K 时与修复前相同）。decode 不变（三种 md5 不变，tg128 约 110）。
+
+正确性：
+
+- 2K（`kldpp.sh`）：ubatch 2048 / 1024 的 md5 与之前相同；ubatch 512 变了（2K 的 prompt 在 ubatch 512 时就会让环形缓存绕回，现在改走新路径），8 段 KLD 0.0025、top-1 相同 98.40%，在标准内。
+- 长上下文（新脚本 `kldlong.sh`，对照原版同设置的 logits）：
+
+| 对比 | 16K 平均 / 中位数 / top-1 | 32K 平均 / 中位数 / top-1 |
+| --- | --- | --- |
+| 原版自己：ubatch 1024 对 2048 | 0.00222 / 0.00036 / 98.47% | 0.00108 / 0.00002 / 99.37% |
+| 原版自己：ubatch 512 对 2048 | 0.00214 / 0.00033 / 98.55% | 0.00109 / 0.00002 / 99.37% |
+| 新版本（默认） | 0.00221 / 0.00036 / 98.44% | 0.00118 / 0.00002 / 99.30% |
+| 新版本，`PFFAR_HM=1` | 0.00216 / 0.00033 / 98.29% | 0.00111 / 0.00002 / 99.36% |
+
+平均值、中位数和 99% 分位在原版自身波动范围内；top-1 相同率略低于这个范围（差约 1 个标准误）。
+
+开关：`LLAMA_INK_PFRING=0`（完全还原 ab37db3 的图和 mask）、`GGML_CUDA_INK_PFRING=0`（环形节点改由带环形支持的原版带状 kernel 计算）、`GGML_CUDA_INK_PFRING_SPLIT`、`GGML_CUDA_INK_PFFAR=0`（关闭远距离 kernel）、`GGML_CUDA_INK_PFFAR_HM=1|2|3`。
+
+经验：
+
+- 单序列 prefill 时，环形缓存里的 KV 总是"一段旋转过的连续位置"，所以只需一个旋转偏移量，不需要逐格的位置表。
+- 原版 mask 对这个模型只有因果和窗口两种规则，按位置现场计算与 CPU 生成的 mask 逐位一致（ubatch 2048 的 md5 不变）。
+- 用 `--swa-full` 先验证原因、得到速度参照，再做不占显存的正式修复。
+- 用 HIP 的旧式内存池（NO_VMM）时，第一次分配的缓冲区会一直保留；第一个长 ubatch 和稳定状态的分块数不同，会多占显存。分配要按稳定状态的大小来。
+
+没做的：全注意力层在 128K 时约 70 TFLOPS（split Q/P 方案的上限约 90）；多序列同时 prefill 仍走原来的 mask 路径。
 
 ## 下一步方向
 

@@ -1,0 +1,1361 @@
+diff --git a/ggml/include/ggml.h b/ggml/include/ggml.h
+index eca234a..eb370d8 100644
+--- a/ggml/include/ggml.h
++++ b/ggml/include/ggml.h
+@@ -2278,6 +2278,22 @@ extern "C" {
+             float                 scale,
+             int64_t               rel_extent);
+ 
++    // p8-long: ring layout with an on-device causal / sliding-window mask for a banded node built with mask == NULL:
++    //   logical key j in [0, n_log) is row (j + rot) % k->ne[1] of k and v (same for v), rel_dist = q_idx + (n_log - n_batch) - j,
++    //   key j is visible to q_idx iff rel_dist >= 0 and (n_swa == 0 or rel_dist < n_swa) (no other mask term)
++    //   requires n_batch <= n_log <= k->ne[1], 0 <= rot < k->ne[1], ne3 == 1
++    GGML_API void ggml_flash_attn_ext_banded_set_ring(
++            struct ggml_tensor * a,
++            int32_t              n_log,
++            int32_t              rot,
++            int32_t              n_swa);
++
++    // n_log of the ring layout (0: none, the K/V rows are the keys and the mask src applies), rot and n_swa if non-NULL
++    GGML_API int32_t ggml_flash_attn_ext_banded_get_ring(
++            const struct ggml_tensor * a,
++            int32_t                  * rot,
++            int32_t                  * n_swa);
++
+     // same as ggml_flash_attn_ext, but each q slice attends to its own list of K/V rows
+     // q:       [n_embd_k, n_batch, n_head,    ne3]
+     // k:       [n_embd_k, n_rows,  n_head_kv, 1  ] shared by all q slices
+diff --git a/ggml/src/ggml-cpu/ggml-cpu.cpp b/ggml/src/ggml-cpu/ggml-cpu.cpp
+index 7eaa391..b4b6d7f 100644
+--- a/ggml/src/ggml-cpu/ggml-cpu.cpp
++++ b/ggml/src/ggml-cpu/ggml-cpu.cpp
+@@ -495,6 +495,9 @@ static bool ggml_backend_cpu_device_supports_op(ggml_backend_dev_t dev, const st
+             return ggml_is_contiguous(op->src[0]);
+         case GGML_OP_SSM_SCAN:
+             return ggml_get_op_params_i32(op, 0) == 1 || op->src[3]->ne[0] == 1;
++        case GGML_OP_FLASH_ATTN_EXT_BANDED:
++            // p8-long: the ring layout (ggml_flash_attn_ext_banded_set_ring) is not implemented here
++            return ggml_flash_attn_ext_banded_get_ring(op, NULL, NULL) == 0;
+         default:
+             return true;
+     }
+diff --git a/ggml/src/ggml-cuda/fattn-banded.cu b/ggml/src/ggml-cuda/fattn-banded.cu
+index 2a768be..c99d252 100644
+--- a/ggml/src/ggml-cuda/fattn-banded.cu
++++ b/ggml/src/ggml-cuda/fattn-banded.cu
+@@ -65,7 +65,10 @@ static __global__ void flash_attn_ext_banded_f32(
+         uint64_t r_nb1,
+         uint64_t r_nb2,
+         uint64_t r_nb3,
+-        int64_t rel_ne3) {
++        int64_t rel_ne3,
++        int64_t lg_ncell,
++        int64_t lg_rot,
++        int64_t lg_win) {
+     constexpr int values_per_lane = D / WARP_SIZE;
+     static_assert(D == 64 || D == 128, "banded FA supports head dimensions 64 and 128");
+     static_assert(D % WARP_SIZE == 0, "head dimension must be divisible by warp size");
+@@ -97,13 +100,25 @@ static __global__ void flash_attn_ext_banded_f32(
+     const int64_t q_offset = n_kv - n_q;
+ 
+     for (int64_t ik = 0; ik < n_kv; ++ik) {
+-        if (mask && __half2float(*(const half *) (mask + uint64_t(ik)*sizeof(half) +
++        // p8-long ring layout (lg_ncell > 0): n_kv = n_log logical keys, on-device causal / window mask, key ik at row
++        // (ik + lg_rot) % lg_ncell
++        int64_t ikr = ik;
++        if (lg_ncell > 0) {
++            const int64_t d = iq + q_offset - ik;
++            if (d < 0 || (lg_win > 0 && d >= lg_win)) {
++                continue;
++            }
++            ikr = ik + lg_rot;
++            if (ikr >= lg_ncell) {
++                ikr -= lg_ncell;
++            }
++        } else if (mask && __half2float(*(const half *) (mask + uint64_t(ik)*sizeof(half) +
+                 uint64_t(iq)*m_nb1 + uint64_t(ih % mask_ne2)*m_nb2 +
+                 uint64_t(ib % mask_ne3)*m_nb3)) == -INFINITY) {
+             continue;
+         }
+ 
+-        const char * k_row = k + uint64_t(ik)*k_nb1 + uint64_t(ih_kv)*k_nb2 + uint64_t(ib)*k_nb3;
++        const char * k_row = k + uint64_t(ikr)*k_nb1 + uint64_t(ih_kv)*k_nb2 + uint64_t(ib)*k_nb3;
+         float dot = 0.0f;
+ #pragma unroll
+         for (int j = 0; j < values_per_lane; ++j) {
+@@ -143,7 +158,7 @@ static __global__ void flash_attn_ext_banded_f32(
+             value_scale = expf(score - row_max);
+         }
+ 
+-        const char * v_row = v + uint64_t(ik)*v_nb1 + uint64_t(ih_kv)*v_nb2 + uint64_t(ib)*v_nb3;
++        const char * v_row = v + uint64_t(ikr)*v_nb1 + uint64_t(ih_kv)*v_nb2 + uint64_t(ib)*v_nb3;
+ #pragma unroll
+         for (int j = 0; j < values_per_lane; ++j) {
+             const int d = lane + j*WARP_SIZE;
+@@ -217,7 +232,10 @@ static __global__ void flash_attn_ext_banded_f32_split(
+         uint64_t r_nb1,
+         uint64_t r_nb2,
+         uint64_t r_nb3,
+-        int64_t rel_ne3) {
++        int64_t rel_ne3,
++        int64_t lg_ncell,
++        int64_t lg_rot,
++        int64_t lg_win) {
+     constexpr int values_per_lane = D / WARP_SIZE;
+     static_assert(D == 64 || D == 128, "banded FA supports head dimensions 64 and 128");
+ 
+@@ -247,13 +265,25 @@ static __global__ void flash_attn_ext_banded_f32_split(
+     const int64_t ik1 = ik0 + chunk < n_kv ? ik0 + chunk : n_kv;
+ 
+     for (int64_t ik = ik0 + warp; ik < ik1; ik += NW) {
+-        if (mask && __half2float(*(const half *) (mask + uint64_t(ik)*sizeof(half) +
++        // p8-long ring layout (lg_ncell > 0): n_kv = n_log logical keys, on-device causal / window mask, key ik at row
++        // (ik + lg_rot) % lg_ncell
++        int64_t ikr = ik;
++        if (lg_ncell > 0) {
++            const int64_t d = iq + q_offset - ik;
++            if (d < 0 || (lg_win > 0 && d >= lg_win)) {
++                continue;
++            }
++            ikr = ik + lg_rot;
++            if (ikr >= lg_ncell) {
++                ikr -= lg_ncell;
++            }
++        } else if (mask && __half2float(*(const half *) (mask + uint64_t(ik)*sizeof(half) +
+                 uint64_t(iq)*m_nb1 + uint64_t(ih % mask_ne2)*m_nb2 +
+                 uint64_t(ib % mask_ne3)*m_nb3)) == -INFINITY) {
+             continue;
+         }
+ 
+-        const char * k_row = k + uint64_t(ik)*k_nb1 + uint64_t(ih_kv)*k_nb2 + uint64_t(ib)*k_nb3;
++        const char * k_row = k + uint64_t(ikr)*k_nb1 + uint64_t(ih_kv)*k_nb2 + uint64_t(ib)*k_nb3;
+         float dot = 0.0f;
+ #pragma unroll
+         for (int j = 0; j < values_per_lane; ++j) {
+@@ -293,7 +323,7 @@ static __global__ void flash_attn_ext_banded_f32_split(
+             value_scale = expf(score - row_max);
+         }
+ 
+-        const char * v_row = v + uint64_t(ik)*v_nb1 + uint64_t(ih_kv)*v_nb2 + uint64_t(ib)*v_nb3;
++        const char * v_row = v + uint64_t(ikr)*v_nb1 + uint64_t(ih_kv)*v_nb2 + uint64_t(ib)*v_nb3;
+ #pragma unroll
+         for (int j = 0; j < values_per_lane; ++j) {
+             const int d = lane + j*WARP_SIZE;
+@@ -883,6 +913,13 @@ bool ggml_cuda_flash_attn_ext_banded_supported(int device, const ggml_tensor * d
+     if (sinks && (sinks->type != GGML_TYPE_F32 || sinks->nb[0] != sizeof(float))) {
+         return false;
+     }
++    int32_t lg_rot = 0, lg_win = 0;
++    const int32_t n_log = ggml_flash_attn_ext_banded_get_ring(dst, &lg_rot, &lg_win);
++    if (n_log != 0) {
++        // p8-long ring layout
++        return !m && n_log >= q->ne[1] && n_log <= k->ne[1] && v->ne[1] == k->ne[1] && lg_rot >= 0 && lg_rot < k->ne[1] &&
++            lg_win >= 0 && q->ne[3] == 1;
++    }
+     return !m || (m->type == GGML_TYPE_F16 && ggml_is_contiguous(m) &&
+         q->ne[2] % m->ne[2] == 0 && q->ne[3] % m->ne[3] == 0);
+ #endif
+@@ -1056,8 +1093,13 @@ void ggml_cuda_flash_attn_ext_banded(ggml_backend_cuda_context & ctx, ggml_tenso
+     const ggml_tensor * rel = dst->src[6];
+     const ggml_tensor * sinks = dst->src[4];
+ 
++    int32_t lg_rot = 0, lg_win = 0;
++    const int32_t lg_nlog = ggml_flash_attn_ext_banded_get_ring(dst, &lg_rot, &lg_win);
++    // p8-long ring layout: only the f32 / f32_split kernels below implement it
++    const int64_t lg_ncell = lg_nlog > 0 ? k->ne[1] : 0;
++
+     // only the MMA kernel reads src[6]; delegating otherwise drops the bias
+-    if (ggml_cuda_flash_attn_ext_banded_use_mma(ctx.device, dst)) {
++    if (lg_nlog == 0 && ggml_cuda_flash_attn_ext_banded_use_mma(ctx.device, dst)) {
+         ggml_cuda_flash_attn_ext(ctx, dst);
+         return;
+     }
+@@ -1067,7 +1109,7 @@ void ggml_cuda_flash_attn_ext_banded(ggml_backend_cuda_context & ctx, ggml_tenso
+     // the tensor extent (not op_params) is authoritative after graph cloning
+     const int64_t rel_extent = rel->ne[0];
+ 
+-    if (sinks && fattn_banded_mma_usable(ctx.device, dst)) {
++    if (lg_nlog == 0 && sinks && fattn_banded_mma_usable(ctx.device, dst)) {
+         fattn_banded_mma_launch(ctx, dst, scale, rel_extent);
+         return;
+     }
+@@ -1076,7 +1118,7 @@ void ggml_cuda_flash_attn_ext_banded(ggml_backend_cuda_context & ctx, ggml_tenso
+         constexpr int split_warps   = 4;
+         constexpr int min_chunk     = 64;
+         const int64_t n_rows        = q->ne[1]*q->ne[2]*q->ne[3];
+-        const int64_t n_kv          = k->ne[1];
++        const int64_t n_kv          = lg_nlog > 0 ? lg_nlog : k->ne[1];
+         const int64_t target_blocks = int64_t(ggml_cuda_info().devices[ctx.device].nsm)*16;
+         int64_t n_chunks = n_rows < target_blocks ? (target_blocks + n_rows - 1)/n_rows : 1;
+         n_chunks = std::min<int64_t>(n_chunks, (n_kv + min_chunk - 1)/min_chunk);
+@@ -1100,7 +1142,7 @@ void ggml_cuda_flash_attn_ext_banded(ggml_backend_cuda_context & ctx, ggml_tenso
+                 q->nb[1], q->nb[2], q->nb[3], k->nb[0], k->nb[1], k->nb[2], k->nb[3], \
+                 v->nb[0], v->nb[1], v->nb[2], v->nb[3], \
+                 m ? m->nb[1] : 0, m ? m->nb[2] : 0, m ? m->nb[3] : 0, \
+-                rel->nb[0], rel->nb[1], rel->nb[2], rel->nb[3], rel->ne[3]); \
++                rel->nb[0], rel->nb[1], rel->nb[2], rel->nb[3], rel->ne[3], lg_ncell, (int64_t) lg_rot, (int64_t) lg_win); \
+             flash_attn_ext_banded_f32_merge<DD><<<mblocks, mthreads, 0, stream>>>( \
+                 part.get(), (float *) dst->data, n_rows, q->ne[2], q->ne[1], n_chunks, \
+                 sinks ? (const float *) sinks->data : nullptr, \
+@@ -1125,7 +1167,7 @@ void ggml_cuda_flash_attn_ext_banded(ggml_backend_cuda_context & ctx, ggml_tenso
+     flash_attn_ext_banded_f32<D, warps_per_block><<<blocks, threads, 0, stream>>>( \
+         (const char *) q->data, (const char *) k->data, (const char *) v->data, \
+         m ? (const char *) m->data : nullptr, (const char *) rel->data, (float *) dst->data, \
+-        scale, k->type, v->type, rel->type, q->ne[1], k->ne[1], q->ne[2], k->ne[2], q->ne[3], \
++        scale, k->type, v->type, rel->type, q->ne[1], lg_nlog > 0 ? (int64_t) lg_nlog : k->ne[1], q->ne[2], k->ne[2], q->ne[3], \
+         rel_extent, m ? m->ne[2] : 1, m ? m->ne[3] : 1, \
+         q->nb[1], q->nb[2], q->nb[3], k->nb[0], k->nb[1], k->nb[2], k->nb[3], \
+         v->nb[0], v->nb[1], v->nb[2], v->nb[3], \
+@@ -1133,7 +1175,7 @@ void ggml_cuda_flash_attn_ext_banded(ggml_backend_cuda_context & ctx, ggml_tenso
+         sinks ? (const float *) sinks->data : nullptr, \
+         sinks && sinks->ne[1] > 1 ? int64_t(sinks->nb[1] / sizeof(float)) : 0, \
+         sinks && sinks->ne[2] > 1 ? int64_t(sinks->nb[2] / sizeof(float)) : 0, \
+-        rel->nb[0], rel->nb[1], rel->nb[2], rel->nb[3], rel->ne[3])
++        rel->nb[0], rel->nb[1], rel->nb[2], rel->nb[3], rel->ne[3], lg_ncell, (int64_t) lg_rot, (int64_t) lg_win)
+ 
+     if (q->ne[0] == 64) {
+         LAUNCH_BANDED(64);
+diff --git a/ggml/src/ggml-cuda/inkling-pfattn.cu b/ggml/src/ggml-cuda/inkling-pfattn.cu
+index f53fc54..8faa1e2 100644
+--- a/ggml/src/ggml-cuda/inkling-pfattn.cu
++++ b/ggml/src/ggml-cuda/inkling-pfattn.cu
+@@ -79,8 +79,32 @@ struct ink_pf_args {
+     // Only the 16p kernel (single chunk) and the merge kernel support it.
+     const float   * gate;
+     float         * gout;
++    // p8-long ring layout (ggml_flash_attn_ext_banded_set_ring; 16p kernel only): n_kv = n_log logical keys, key j at
++    // K/V row (j + rot) % n_cells, mask (mask == nullptr) visible iff 0 <= iq + n_kv - n_q - j < lg_win. Without the
++    // ring: lg = 0, rot = 0, n_cells = INT_MAX (identity row map)
++    int             lg;
++    int             rot;
++    int             n_cells;
++    int             lg_win;
++    // p8-long stage 2 FAR (16p kernel + ring layout of a full-attention node only; 0 elsewhere): the key tiles that are
++    // beyond the relative extent for every query of a 64-query tile (ink_pf_nfar) are done by ink_pf_far_kernel in
++    // far_ch chunks (partials 0..far_ch-1, written first); the 16p kernel (n_chunks 1) starts after them and folds its
++    // result into partial far_ch-1 (online-softmax combine, no extra partial buffer); the merge kernel combines the
++    // far_ch partials
++    int             far_ch;
++    int             far_hm; // far kernel f16 mode: 1 split Q and P (exact products), 2 P not split, 3 Q and P not split
+ };
+ 
++// p8-long FAR: number of leading key tiles of query tile qt (64 queries) that are visible to all its queries without
++// mask and bias: every key ik <= 32*kt + 31 of them has dist = iq + off - ik >= extent for iq >= 64*qt
++static __host__ __device__ __forceinline__ int ink_pf_nfar(const int qt, const int off, const int extent, const int n_kt) {
++    const long long x = 64ll*qt + off - 31 - extent;
++    if (x < 0) {
++        return 0;
++    }
++    return (int) std::min<long long>(x/32 + 1, n_kt);
++}
++
+ // p7-small: op_sigmoid of unary.cu times the attention output, without contraction (bit-identical to the stock
+ // unary_gated_op_kernel<op_sigmoid, float>: dst = op_sigmoid(g) * x)
+ static __device__ __forceinline__ float ink_pf_gated(const float x, const float g) {
+@@ -169,6 +193,28 @@ static __global__ void __launch_bounds__(256) ink_pf_flags2_kernel(const char *
+     }
+ }
+ 
++// p8-long: the flags of the ring layout's on-device mask (same values as ink_pf_flags_kernel on the equivalent mask):
++// the distances d = iq + off - ik of a tile form the interval [d_min, d_max]; visible iff 0 <= d < win
++static __global__ void ink_pf_flags_ring_kernel(uint8_t * __restrict__ flags, const int n_q, const int n_kv, const int bq,
++        const int n_qt, const int n_kt, const int win) {
++    const int idx = blockIdx.x*blockDim.x + threadIdx.x;
++    if (idx >= n_qt*n_kt) {
++        return;
++    }
++    const int qt   = idx / n_kt;
++    const int kt   = idx % n_kt;
++    const int off  = n_kv - n_q;
++    const int q_lo = qt*bq;
++    const int q_hi = min(q_lo + bq, n_q) - 1;
++    const int k_lo = kt*INK_PF_BK;
++    const int k_hi = min(k_lo + INK_PF_BK, n_kv) - 1;
++    const long long d_max = (long long) q_hi + off - k_lo;
++    const long long d_min = (long long) q_lo + off - k_hi;
++    const bool vis = d_max >= 0 && d_min < win;
++    const bool all = d_min >= 0 && d_max < win;
++    flags[idx] = !vis ? 0 : (all ? 1 : 2);
++}
++
+ template <int NQG>
+ static __global__ void __launch_bounds__(192*NQG) ink_pf_attn_kernel(const ink_pf_args a) {
+ #if defined(INK_PF_DEVICE)
+@@ -1056,8 +1102,10 @@ static __global__ void __launch_bounds__(768) ink_pf_attn16p_kernel(const ink_pf
+     }
+     __syncthreads();
+     int kbeg = 0, kend = 0;
+-    if (s_rng[1] >= 0) {
+-        const int first = s_rng[0];
++    // p8-long FAR: the leading far tiles are done by ink_pf_far_kernel
++    const int first0 = a.far_ch ? max(s_rng[0], ink_pf_nfar(qt, off, a.rel_extent, a.n_kt)) : s_rng[0];
++    if (s_rng[1] >= first0) {
++        const int first = first0;
+         const int tot   = s_rng[1] - first + 1;
+         const int per   = (tot + a.n_chunks - 1)/a.n_chunks;
+         kbeg = min(first + c*per, s_rng[1] + 1);
+@@ -1094,7 +1142,7 @@ static __global__ void __launch_bounds__(768) ink_pf_attn16p_kernel(const ink_pf
+ 
+     const char * kbase = a.k + (long long) g*a.k_nb2;
+     const char * vbase = a.v + (long long) g*a.v_nb2;
+-    const char * mrow  = a.mask + iqc*a.m_nb1;
++    const char * mrow  = a.lg ? nullptr : a.mask + iqc*a.m_nb1;
+     const char * rrow  = INL ? nullptr : a.rel + ih*a.r_nb1 + iqc*a.r_nb2;
+ 
+     float4 Rf = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+@@ -1103,19 +1151,24 @@ static __global__ void __launch_bounds__(768) ink_pf_attn16p_kernel(const ink_pf
+         Rf = *((const float4 *) (a.r_feat + ih*a.rf_nb1 + iqc*a.rf_nb2) + kq);
+     }
+ 
++    // p8-long: K/V row of logical key r (identity without the ring layout: rot 0, n_cells INT_MAX)
++    auto kv_row = [&](const int r) {
++        const int c = r + a.rot;
++        return c >= a.n_cells ? c - a.n_cells : c;
++    };
+     // staging: threads 0..511 own K items of tile ktk, threads 512..767 V items of tile ktv (-1: none)
+     uint4 pre[2];
+     auto load_tiles = [&](const int ktk, const int ktv) {
+         if (tid < 512) {
+             if (ktk >= 0) {
+-                const int r = min(ktk*INK_PF_BK + (tid >> 4), a.n_kv - 1);
++                const int r = kv_row(min(ktk*INK_PF_BK + (tid >> 4), a.n_kv - 1));
+                 pre[0] = *(const uint4 *) (kbase + r*a.k_nb1 + 16*(tid & 15));
+             }
+         } else if (ktv >= 0) {
+             const int i2 = tid - 512;
+             const int kv0 = ktv*INK_PF_BK;
+-            const int r0 = min(kv0 + 2*(i2 & 15) + 0, a.n_kv - 1);
+-            const int r1 = min(kv0 + 2*(i2 & 15) + 1, a.n_kv - 1);
++            const int r0 = kv_row(min(kv0 + 2*(i2 & 15) + 0, a.n_kv - 1));
++            const int r1 = kv_row(min(kv0 + 2*(i2 & 15) + 1, a.n_kv - 1));
+             pre[0] = *(const uint4 *) (vbase + r0*a.v_nb1 + 16*(i2 >> 4));
+             pre[1] = *(const uint4 *) (vbase + r1*a.v_nb1 + 16*(i2 >> 4));
+         }
+@@ -1351,10 +1404,19 @@ static __global__ void __launch_bounds__(768) ink_pf_attn16p_kernel(const ink_pf
+             }
+         }
+         if (flag == 2 && !mv_done) {
++            if (a.lg) {
++                // p8-long: on-device causal / window mask of the ring layout
+ #pragma unroll
+-            for (int e = 0; e < 8; ++e) {
+-                const int ik = min(kv0 + 16*(e >> 2) + 4*kq + (e & 3), a.n_kv - 1);
+-                mv[e] = ink_pf_h2f(*(const uint16_t *) (mrow + 2*ik));
++                for (int e = 0; e < 8; ++e) {
++                    const int d = iq + off - (kv0 + 16*(e >> 2) + 4*kq + (e & 3));
++                    mv[e] = d >= 0 && d < a.lg_win ? 0.0f : -INFINITY;
++                }
++            } else {
++#pragma unroll
++                for (int e = 0; e < 8; ++e) {
++                    const int ik = min(kv0 + 16*(e >> 2) + 4*kq + (e & 3), a.n_kv - 1);
++                    mv[e] = ink_pf_h2f(*(const uint16_t *) (mrow + 2*ik));
++                }
+             }
+         }
+         const bool full_band = dlo >= 0 && dhi < a.rel_extent;
+@@ -1427,7 +1489,7 @@ static __global__ void __launch_bounds__(768) ink_pf_attn16p_kernel(const ink_pf
+         O[dt] *= INK_PF_PISC; // exact (power of two)
+     }
+     const int row = iq*a.n_head + ih;
+-    if (a.n_chunks == 1) {
++    if (a.n_chunks == 1 && a.far_ch == 0) {
+         float f   = 1.0f;
+         float sum = lsum;
+         if (a.sinks) {
+@@ -1459,17 +1521,347 @@ static __global__ void __launch_bounds__(768) ink_pf_attn16p_kernel(const ink_pf
+             *(float4 *) (dp + 16*dt) = make_float4(O[dt][0]*inv, O[dt][1]*inv, O[dt][2]*inv, O[dt][3]*inv);
+         }
+     } else {
+-        const size_t pr = (size_t) row*a.n_chunks + c;
++        const size_t pr = a.far_ch ? (size_t) row*a.far_ch + a.far_ch - 1 : (size_t) row*a.n_chunks + c;
+         float * dp = a.part_o + pr*INK_PF_D + 4*kq;
++        if (a.far_ch) {
++            // p8-long FAR: fold into the far kernel's last partial of this row (written by the preceding launch)
++            const float m1 = a.part_ml[2*pr + 0];
++            const float l1 = a.part_ml[2*pr + 1];
++            const float m  = fmaxf(m1, mrun);
++            const float f1 = m == -INFINITY ? 0.0f : expf(m1 - m);
++            const float f2 = m == -INFINITY ? 0.0f : expf(mrun - m);
++#pragma unroll
++            for (int dt = 0; dt < 8; ++dt) {
++                const float4 o1 = *(const float4 *) (dp + 16*dt);
++                *(float4 *) (dp + 16*dt) = make_float4(fmaf(o1.x, f1, O[dt][0]*f2), fmaf(o1.y, f1, O[dt][1]*f2),
++                                                       fmaf(o1.z, f1, O[dt][2]*f2), fmaf(o1.w, f1, O[dt][3]*f2));
++            }
++            if (kq == 0) {
++                a.part_ml[2*pr + 0] = m;
++                a.part_ml[2*pr + 1] = fmaf(l1, f1, lsum*f2);
++            }
++        } else {
++#pragma unroll
++            for (int dt = 0; dt < 8; ++dt) {
++                *(float4 *) (dp + 16*dt) = make_float4(O[dt][0], O[dt][1], O[dt][2], O[dt][3]);
++            }
++            if (kq == 0) {
++                a.part_ml[2*pr + 0] = mrun;
++                a.part_ml[2*pr + 1] = lsum;
++            }
++        }
++    }
++#else
++    (void) a;
++#endif // INK_PF_DEVICE
++}
++
++// p8-long stage 2 FAR: the leading key tiles of a full-attention ring node that need neither mask nor bias
++// (ink_pf_nfar). Same block layout and arithmetic per tile as the 16p kernel's fast path (split Q / P f16 MFMA, exp2
++// softmax), but: K / V staged in INK_PF_FNB LDS buffers (one barrier per tile), and the QK MFMAs of tile t+1 are
++// issued in the same wave next to the softmax VALU of tile t. Writes partials 0..far_ch-1 (merge kernel).
++#ifndef INK_PF_FNB
++#define INK_PF_FNB 3
++#endif
++#ifndef INK_PF_FSG
++#define INK_PF_FSG 0 // 1: sched_group_barrier interleave of the QK MFMAs (tile t+1) with the softmax VALU (tile t)
++#endif
++#ifndef INK_PF_FPRIO
++#define INK_PF_FPRIO INK_PF_PRIO
++#endif
++#ifndef INK_PF_FGRP
++#define INK_PF_FGRP 0 // 1: waves 4..7 run softmax(t), PV(t), QK(t+1) (the others QK(t+1), softmax(t), PV(t))
++#endif
++#ifndef INK_PF_FLAZY
++#define INK_PF_FLAZY 1 // softmax without rescale / cross-lane max when no running max of the wave grows
++#endif
++template <int FM>
++static __global__ void __launch_bounds__(768) ink_pf_far_kernel(const ink_pf_args a) {
++#if defined(INK_PF_DEVICE)
++    constexpr int BQB = 64;
++    static_assert(INK_PF_FNB == 3, "far kernel: 3 buffers");
++
++    __shared__ __attribute__((aligned(16))) uint16_t K_s[INK_PF_FNB][INK_PF_BK*INK_PF_KS];
++    __shared__ __attribute__((aligned(16))) uint32_t Vt_s[INK_PF_FNB][INK_PF_D*INK_PF_VS/2];
++
++    const int tid  = threadIdx.x;
++    const int lane = tid & 63;
++    const int w    = tid >> 6;
++    const int hw   = w % 3;
++    const int qg   = w / 3;
++    const int c16  = lane & 15;
++    const int kq   = lane >> 4;
++    const int g    = blockIdx.y;
++    const int qt   = a.n_qt - 1 - (int) blockIdx.x / a.far_ch;
++    const int c    = (int) blockIdx.x % a.far_ch;
++    const int ih   = g*3 + hw;
++    const int iq   = qt*BQB + qg*16 + c16;
++    const bool qok = iq < a.n_q;
++    const int iqc  = qok ? iq : a.n_q - 1;
++    const int off  = a.n_kv - a.n_q;
++    const int nfar = ink_pf_nfar(qt, off, a.rel_extent, a.n_kt);
++    const int per  = (nfar + a.far_ch - 1)/a.far_ch;
++    const int kbeg = min(c*per, nfar);
++    const int n    = min(kbeg + per, nfar) - kbeg;
++    const bool grpB = ((w >> 2) & 1) != 0;
++
++    ink_pf_h4 Qh[8];
++    ink_pf_h4 Ql[8];
++    {
++        const float4 * qp = (const float4 *) (a.q + iqc*a.q_nb1 + ih*a.q_nb2) + 8*kq;
++#pragma unroll
++        for (int u = 0; u < 8; ++u) {
++            float4 x = qp[u];
++            if (!qok) {
++                x = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
++            }
++            const float xs[4] = {x.x, x.y, x.z, x.w};
++#pragma unroll
++            for (int j = 0; j < 4; ++j) {
++                const _Float16 h = (_Float16) xs[j];
++                Qh[u][j] = h;
++                Ql[u][j] = (_Float16) ((xs[j] - (float) h)*4096.0f);
++            }
++        }
++    }
++
++    ink_pf_f4v O[8];
++#pragma unroll
++    for (int dt = 0; dt < 8; ++dt) {
++        O[dt] = (ink_pf_f4v) {0.0f, 0.0f, 0.0f, 0.0f};
++    }
++    float mrun = -INFINITY;
++    float lsum = 0.0f;
++
++    const char * kbase = a.k + (long long) g*a.k_nb2;
++    const char * vbase = a.v + (long long) g*a.v_nb2;
++    auto kv_row = [&](const int r) {
++        const int cc = r + a.rot;
++        return cc >= a.n_cells ? cc - a.n_cells : cc;
++    };
++    // all keys of the far range are < n_kv (dist >= extent > 0 for the first query of the tile)
++    uint4 pre[2];
++    auto load_tile = [&](const int kt) {
++        const int kv0 = kt*INK_PF_BK;
++        if (tid < 512) {
++            const int r = kv_row(kv0 + (tid >> 4));
++            pre[0] = *(const uint4 *) (kbase + r*a.k_nb1 + 16*(tid & 15));
++        } else {
++            const int i2 = tid - 512;
++            const int r0 = kv_row(kv0 + 2*(i2 & 15) + 0);
++            const int r1 = kv_row(kv0 + 2*(i2 & 15) + 1);
++            pre[0] = *(const uint4 *) (vbase + r0*a.v_nb1 + 16*(i2 >> 4));
++            pre[1] = *(const uint4 *) (vbase + r1*a.v_nb1 + 16*(i2 >> 4));
++        }
++    };
++    auto store_tile = [&](const int buf) {
++        if (tid < 512) {
++            const int key = tid >> 4;
++            const uint4 x = pre[0];
++            uint2 * p = (uint2 *) (K_s[buf] + key*INK_PF_KS + 8*(tid & 15));
++            p[0] = make_uint2(x.x, x.y);
++            p[1] = make_uint2(x.z, x.w);
++        } else {
++            const int i2 = tid - 512;
++            const int kp = i2 & 15;
++            const int d0 = 8*(i2 >> 4);
++            const uint4 x0 = pre[0];
++            const uint4 x1 = pre[1];
++            const uint32_t a0[4] = {x0.x, x0.y, x0.z, x0.w};
++            const uint32_t a1[4] = {x1.x, x1.y, x1.z, x1.w};
++#pragma unroll
++            for (int e = 0; e < 4; ++e) {
++                Vt_s[buf][((d0 + 2*e + 0)*INK_PF_VS)/2 + kp] = (a0[e] & 0xFFFFu) | (a1[e] << 16);
++                Vt_s[buf][((d0 + 2*e + 1)*INK_PF_VS)/2 + kp] = (a0[e] >> 16) | (a1[e] & 0xFFFF0000u);
++            }
++        }
++    };
++
++    // S^T = K Q^T of buffer buf, scaled (no mask / bias in the far range)
++    auto qk = [&](const int buf, float * s) {
++        if constexpr (INK_PF_FPRIO) {
++            __builtin_amdgcn_s_setprio(1);
++        }
++#pragma unroll
++        for (int b = 0; b < 2; ++b) {
++            ink_pf_f4v S  = (ink_pf_f4v) {0.0f, 0.0f, 0.0f, 0.0f};
++            ink_pf_f4v Sl = (ink_pf_f4v) {0.0f, 0.0f, 0.0f, 0.0f};
++            const uint16_t * kp = K_s[buf] + (16*b + c16)*INK_PF_KS + 32*kq;
++            ink_pf_h4 kf[8];
++#pragma unroll
++            for (int u = 0; u < 8; ++u) {
++                kf[u] = *(const ink_pf_h4 *) (kp + 4*u);
++            }
++#pragma unroll
++            for (int u = 0; u < 8; ++u) {
++                S  = __builtin_amdgcn_mfma_f32_16x16x16f16(kf[u], Qh[u], S, 0, 0, 0);
++                if constexpr (FM < 3) {
++                    Sl = __builtin_amdgcn_mfma_f32_16x16x16f16(kf[u], Ql[u], Sl, 0, 0, 0);
++                }
++            }
++#pragma unroll
++            for (int v = 0; v < 4; ++v) {
++                s[4*b + v] = FM < 3 ? fmaf(Sl[v], 1.0f/4096.0f, S[v])*a.scale : S[v]*a.scale;
++            }
++        }
++        if constexpr (INK_PF_FPRIO) {
++            __builtin_amdgcn_s_setprio(0);
++        }
++    };
++
++    ink_pf_h4 Ph[2], Pl[2];
++    float msl_run = 0.0f;
++    // P (scaled by 2^14) as f16 operand(s). FM 1: Ph + Pl (exact); FM >= 2: Ph only, and the row sum takes the rounded
++    // value (subnormal f16 -> 0, as the MFMA flushes it), so the output is the exact softmax of logits perturbed by at
++    // most 2^-11 relative in p
++    auto psplit = [&](const float p, const int e, float & psum) {
++        const float    ps = p*INK_PF_PSC;
++        const _Float16 h  = (_Float16) ps;
++        Ph[e >> 2][e & 3] = h;
++        if constexpr (FM == 1) {
++            psum += p;
++            Pl[e >> 2][e & 3] = (_Float16) (ps - (float) h);
++        } else {
++            const float hr = (float) h;
++            psum += hr >= 6.103515625e-05f ? hr*INK_PF_PISC : 0.0f;
++        }
++    };
++    auto softmax = [&](const float * sc) {
++        float tmax = -INFINITY;
++#pragma unroll
++        for (int e = 0; e < 8; ++e) {
++            tmax = fmaxf(tmax, sc[e]);
++        }
++#if INK_PF_FLAZY
++        // the running max of no query of the wave grows: alpha = 1 (no rescale, no cross-lane max)
++        if (__ballot(tmax > mrun) == 0) {
++            float psum = 0.0f;
++#pragma unroll
++            for (int e = 0; e < 8; ++e) {
++                const float p = __builtin_amdgcn_exp2f(fmaf(sc[e], 1.4426950408889634f, -msl_run));
++                psplit(p, e, psum);
++            }
++            lsum += psum;
++            return;
++        }
++#endif
++        tmax = fmaxf(tmax, __shfl_xor(tmax, 16, 64));
++        tmax = fmaxf(tmax, __shfl_xor(tmax, 32, 64));
++        const float mnew  = fmaxf(mrun, tmax);
++        const float msub  = mnew == -INFINITY ? 0.0f : mnew;
++        constexpr float L2E = 1.4426950408889634f;
++        const float msl   = msub*L2E;
++        const float alpha = __builtin_amdgcn_exp2f(fmaf(mrun, L2E, -msl));
++        mrun = mnew;
++        msl_run = msl;
++        float psum = 0.0f;
++#pragma unroll
++        for (int e = 0; e < 8; ++e) {
++            const float p = __builtin_amdgcn_exp2f(fmaf(sc[e], L2E, -msl));
++            psplit(p, e, psum);
++        }
++        lsum = lsum*alpha + psum;
+ #pragma unroll
+         for (int dt = 0; dt < 8; ++dt) {
+-            *(float4 *) (dp + 16*dt) = make_float4(O[dt][0], O[dt][1], O[dt][2], O[dt][3]);
++            O[dt] *= alpha;
+         }
+-        if (kq == 0) {
+-            a.part_ml[2*pr + 0] = mrun;
+-            a.part_ml[2*pr + 1] = lsum;
++    };
++
++    auto pv = [&](const int buf) {
++        if constexpr (INK_PF_FPRIO) {
++            __builtin_amdgcn_s_setprio(1);
++        }
++        const uint16_t * vp = (const uint16_t *) Vt_s[buf] + c16*INK_PF_VS + 4*kq;
++        ink_pf_h4 vf[2][2];
++        vf[0][0] = *(const ink_pf_h4 *) (vp);
++        vf[0][1] = *(const ink_pf_h4 *) (vp + 16);
++#pragma unroll
++        for (int dt = 0; dt < 8; ++dt) {
++            if (dt < 7) {
++                vf[(dt + 1) & 1][0] = *(const ink_pf_h4 *) (vp + 16*(dt + 1)*INK_PF_VS);
++                vf[(dt + 1) & 1][1] = *(const ink_pf_h4 *) (vp + 16*(dt + 1)*INK_PF_VS + 16);
++            }
++#pragma unroll
++            for (int b = 0; b < 2; ++b) {
++                const ink_pf_h4 vh = vf[dt & 1][b];
++                O[dt] = __builtin_amdgcn_mfma_f32_16x16x16f16(vh, Ph[b], O[dt], 0, 0, 0);
++                if constexpr (FM == 1) {
++                    O[dt] = __builtin_amdgcn_mfma_f32_16x16x16f16(vh, Pl[b], O[dt], 0, 0, 0);
++                }
++            }
++        }
++        if constexpr (INK_PF_FPRIO) {
++            __builtin_amdgcn_s_setprio(0);
++        }
++    };
++
++    if (n > 0) {
++        load_tile(kbeg);
++        store_tile(0);
++        if (n > 1) {
++            load_tile(kbeg + 1);
++            store_tile(1);
++        }
++        if (n > 2) {
++            load_tile(kbeg + 2);
++        }
++        __syncthreads();
++        float sc[8];
++        qk(0, sc);
++        int b0 = 0;
++        for (int t = 0; t < n; ++t) {
++            const int b1 = b0 == 2 ? 0 : b0 + 1;
++            const int b2 = b1 == 2 ? 0 : b1 + 1;
++            // tile t+1 (stale buffer contents when t+1 == n: the scores are discarded)
++            float scn[8];
++            if (INK_PF_FGRP && grpB) {
++                softmax(sc);
++                pv(b0);
++                qk(b1, scn);
++            } else {
++                qk(b1, scn);
++                softmax(sc);
++#if INK_PF_FSG
++                // 32 MFMAs of qk next to the softmax VALU: 1 MFMA, 3 VALU
++#pragma unroll
++                for (int i = 0; i < 32; ++i) {
++                    __builtin_amdgcn_sched_group_barrier(0x008, 1, 0);
++                    __builtin_amdgcn_sched_group_barrier(0x002, 3, 0);
++                }
++#endif
++                pv(b0);
++            }
++            if (t + 2 < n) {
++                store_tile(b2);
++            }
++            if (t + 3 < n) {
++                load_tile(kbeg + t + 3);
++            }
++            __syncthreads();
++#pragma unroll
++            for (int e = 0; e < 8; ++e) {
++                sc[e] = scn[e];
++            }
++            b0 = b1;
+         }
+     }
++
++    lsum += __shfl_xor(lsum, 16, 64);
++    lsum += __shfl_xor(lsum, 32, 64);
++    if (!qok) {
++        return;
++    }
++    const int    row = iq*a.n_head + ih;
++    const size_t pr  = (size_t) row*a.far_ch + c;
++    float * dp = a.part_o + pr*INK_PF_D + 4*kq;
++#pragma unroll
++    for (int dt = 0; dt < 8; ++dt) {
++        *(float4 *) (dp + 16*dt) = make_float4(O[dt][0]*INK_PF_PISC, O[dt][1]*INK_PF_PISC, O[dt][2]*INK_PF_PISC, O[dt][3]*INK_PF_PISC);
++    }
++    if (kq == 0) {
++        a.part_ml[2*pr + 0] = mrun;
++        a.part_ml[2*pr + 1] = lsum;
++    }
+ #else
+     (void) a;
+ #endif // INK_PF_DEVICE
+@@ -1481,7 +1873,7 @@ static __global__ void ink_pf_merge_kernel(const ink_pf_args a) {
+     const int d   = threadIdx.x;
+     const int iq  = row / a.n_head;
+     const int ih  = row % a.n_head;
+-    const int nc  = a.n_chunks;
++    const int nc  = a.far_ch ? a.far_ch : a.n_chunks;
+     const float * ml = a.part_ml + (size_t) row*nc*2;
+     const float * po = a.part_o + (size_t) row*nc*INK_PF_D + d;
+     float m = -INFINITY;
+@@ -1545,12 +1937,25 @@ static void ink_pf_launch16_4(const ink_pf_args & a, const dim3 grid, const bool
+ static void ink_pf_run(const ink_pf_args & a, const int ver, const int nqg, const bool inl, hipStream_t stream, const int hm = 0,
+                        const bool pp = false) {
+     const int bq = ink_pf_bq(ver, nqg);
+-    if (a.m_al16 && bq <= 64) {
++    if (a.lg) {
++        // p8-long ring layout: flags from positions (16p kernel only, see ink_pf_ring_ok)
++        const int nt = a.n_qt*a.n_kt;
++        ink_pf_flags_ring_kernel<<<(nt + 255)/256, 256, 0, stream>>>((uint8_t *) a.flags, a.n_q, a.n_kv, bq, a.n_qt, a.n_kt, a.lg_win);
++    } else if (a.m_al16 && bq <= 64) {
+         ink_pf_flags2_kernel<<<dim3(a.n_qt, (a.n_kv + 511)/512), 256, 0, stream>>>(a.mask, (uint8_t *) a.flags, a.n_q, a.n_kv, bq, a.m_nb1, a.n_kt);
+     } else {
+         ink_pf_flags_kernel<<<dim3(a.n_kt, a.n_qt), 256, 0, stream>>>(a.mask, (uint8_t *) a.flags, a.n_q, a.n_kv, bq, a.m_nb1, a.n_kt);
+     }
+     const dim3 grid(a.n_qt*a.n_chunks, a.n_head/3);
++    if (a.far_ch > 0) {
++        // p8-long FAR (16p kernel + ring layout only, see ink_pf_exec)
++        const dim3 gf(a.n_qt*a.far_ch, a.n_head/3);
++        switch (a.far_hm) {
++            case 2:  ink_pf_far_kernel<2><<<gf, 768, 0, stream>>>(a); break;
++            case 3:  ink_pf_far_kernel<3><<<gf, 768, 0, stream>>>(a); break;
++            default: ink_pf_far_kernel<1><<<gf, 768, 0, stream>>>(a); break;
++        }
++    }
+     if (ver == 1) {
+         if (nqg == 2) {
+             ink_pf_attn_kernel<2><<<grid, 384, 0, stream>>>(a);
+@@ -1571,7 +1976,7 @@ static void ink_pf_run(const ink_pf_args & a, const int ver, const int nqg, cons
+             if (inl) { ink_pf_attn16_kernel<1, true><<<grid, 192, 0, stream>>>(a); } else { ink_pf_attn16_kernel<1, false><<<grid, 192, 0, stream>>>(a); }
+         }
+     }
+-    if (a.n_chunks > 1) {
++    if (a.n_chunks > 1 || a.far_ch > 0) {
+         ink_pf_merge_kernel<<<a.n_q*a.n_head, INK_PF_D, 0, stream>>>(a);
+     }
+ }
+@@ -1619,7 +2024,10 @@ static void ink_pf_check(ggml_backend_cuda_context & ctx, const ggml_tensor * ds
+     const ggml_tensor * M = dst->src[3];
+     const ggml_tensor * S = dst->src[4];
+     const ggml_tensor * R = dst->src[6];
+-    const auto hq = ink_pf_fetch(Q), hk = ink_pf_fetch(K), hv = ink_pf_fetch(V), hm = ink_pf_fetch(M), ho = ink_pf_fetch(dst);
++    int32_t lg_rot = 0, lg_win = 0;
++    const int64_t lg_nlog = ggml_flash_attn_ext_banded_get_ring(dst, &lg_rot, &lg_win);
++    const auto hq = ink_pf_fetch(Q), hk = ink_pf_fetch(K), hv = ink_pf_fetch(V), ho = ink_pf_fetch(dst);
++    const auto hm = M ? ink_pf_fetch(M) : std::vector<char>();
+     const auto hr = W ? std::vector<char>() : ink_pf_fetch(R);
+     const auto hw = W ? ink_pf_fetch(W) : std::vector<char>();
+     const auto hf = W ? ink_pf_fetch(F) : std::vector<char>();
+@@ -1627,12 +2035,21 @@ static void ink_pf_check(ggml_backend_cuda_context & ctx, const ggml_tensor * ds
+     if (S) {
+         hs = ink_pf_fetch(S);
+     }
+-    const int64_t n_q = Q->ne[1], n_kv = K->ne[1], n_head = Q->ne[2], E = R->ne[0];
++    const int64_t n_q = Q->ne[1], n_kv = lg_nlog > 0 ? lg_nlog : K->ne[1], n_head = Q->ne[2], E = R->ne[0];
+     const int64_t off = n_kv - n_q;
+     float scale;
+     memcpy(&scale, dst->op_params, sizeof(scale));
+     auto h2f = [](const char * p) { return ggml_fp16_to_fp32(*(const ggml_fp16_t *) p); };
+-    for (int64_t ik = 0; ik < n_kv; ++ik) {
++    // p8-long ring layout: K/V row of logical key ik, and the on-device mask
++    auto row_of = [&](const int64_t ik) { return lg_nlog > 0 ? (ik + lg_rot) % K->ne[1] : ik; };
++    auto mask_at = [&](const int64_t iq, const int64_t ik) -> float {
++        if (lg_nlog > 0) {
++            const int64_t d = iq + off - ik;
++            return d >= 0 && (lg_win == 0 || d < lg_win) ? 0.0f : -INFINITY;
++        }
++        return h2f(hm.data() + iq*M->nb[1] + 2*ik);
++    };
++    for (int64_t ik = 0; ik < K->ne[1]; ++ik) {
+         for (int64_t g = 0; g < K->ne[2]; ++g) {
+             for (int64_t d = 0; d < 128; ++d) {
+                 if (!std::isfinite(h2f(hk.data() + ik*K->nb[1] + g*K->nb[2] + 2*d)) || !std::isfinite(h2f(hv.data() + ik*V->nb[1] + g*V->nb[2] + 2*d))) {
+@@ -1645,7 +2062,7 @@ static void ink_pf_check(ggml_backend_cuda_context & ctx, const ggml_tensor * ds
+     }
+     for (int64_t iq = 0; iq < n_q; ++iq) {
+         for (int64_t ik = 0; ik < n_kv; ++ik) {
+-            const float m = h2f(hm.data() + iq*M->nb[1] + 2*ik);
++            const float m = mask_at(iq, ik);
+             ink_pf_chk.finite_mask += std::isfinite(m) && m != 0.0f;
+         }
+     }
+@@ -1662,13 +2079,14 @@ static void ink_pf_check(ggml_backend_cuda_context & ctx, const ggml_tensor * ds
+         std::fill(acc.begin(), acc.end(), 0.0);
+         const float * qr = (const float *) (hq.data() + iq*Q->nb[1] + ih*Q->nb[2]);
+         for (int64_t ik = 0; ik < n_kv; ++ik) {
+-            const float mval = h2f(hm.data() + iq*M->nb[1] + 2*ik);
++            const float mval = mask_at(iq, ik);
+             if (mval == -INFINITY) {
+                 continue;
+             }
++            const int64_t ir = row_of(ik);
+             double dot = 0.0;
+             for (int d = 0; d < 128; ++d) {
+-                dot += (double) qr[d]*h2f(hk.data() + ik*K->nb[1] + g*K->nb[2] + 2*d);
++                dot += (double) qr[d]*h2f(hk.data() + ir*K->nb[1] + g*K->nb[2] + 2*d);
+             }
+             double s = dot*scale;
+             const int64_t dist = iq + off - ik;
+@@ -1689,7 +2107,7 @@ static void ink_pf_check(ggml_backend_cuda_context & ctx, const ggml_tensor * ds
+             }
+             const double mn = std::max(mx, s), f = std::exp(mx - mn), p = std::exp(s - mn);
+             for (int d = 0; d < 128; ++d) {
+-                acc[d] = acc[d]*f + p*h2f(hv.data() + ik*V->nb[1] + g*V->nb[2] + 2*d);
++                acc[d] = acc[d]*f + p*h2f(hv.data() + ir*V->nb[1] + g*V->nb[2] + 2*d);
+             }
+             sum = sum*f + p;
+             mx  = mn;
+@@ -1748,6 +2166,15 @@ static int ink_pf_ver() {
+     return ver;
+ }
+ 
++// p8-long: the ring layout is implemented by the default kernel (ver 2, NQG 4, f16 split mode 1, ping-pong) only;
++// GGML_CUDA_INK_PFRING=0 leaves ring nodes to the stock banded kernel
++static bool ink_pf_ring_ok() {
++    static const bool ok = ink_pf_env_int("GGML_CUDA_INK_PFRING", 1) != 0 && ink_pf_env_int("GGML_CUDA_INK_PFATTN_VER", 2) != 1 &&
++        ink_pf_env_int("GGML_CUDA_INK_PFATTN_NQG", 4) != 1 && ink_pf_env_int("GGML_CUDA_INK_PFATTN_NQG", 4) != 2 &&
++        ink_pf_env_int("GGML_CUDA_INK_PFATTN_F16", 1) == 1 && ink_pf_env_int("GGML_CUDA_INK_PFATTN_PP", 1) != 0;
++    return ok;
++}
++
+ // pure function of the node: does the kernel take it
+ static bool ink_pf_guard(const int device, const ggml_tensor * dst) {
+     if (!ink_pf_enabled() || dst->op != GGML_OP_FLASH_ATTN_EXT_BANDED) {
+@@ -1762,14 +2189,24 @@ static bool ink_pf_guard(const int device, const ggml_tensor * dst) {
+     const ggml_tensor * M = dst->src[3];
+     const ggml_tensor * S = dst->src[4];
+     const ggml_tensor * R = dst->src[6];
+-    if (!Q || !K || !V || !M || !R || dst->src[5]) {
++    int32_t lg_rot = 0, lg_win = 0;
++    const int32_t lg_nlog = ggml_flash_attn_ext_banded_get_ring(dst, &lg_rot, &lg_win);
++    if (!Q || !K || !V || (!M && lg_nlog == 0) || !R || dst->src[5]) {
+         return ink_pf_reject(dst, __LINE__);
+     }
+     const int64_t n_q = Q->ne[1], n_kv = K->ne[1], n_head = Q->ne[2], n_head_kv = K->ne[2];
+     if (n_q < INK_PF_MIN_Q || n_q > (1 << 20) || n_kv < 1 || n_kv > (1 << 20)) {
+         return ink_pf_reject(dst, __LINE__);
+     }
+-    if (Q->type != GGML_TYPE_F32 || K->type != GGML_TYPE_F16 || V->type != GGML_TYPE_F16 || M->type != GGML_TYPE_F16 ||
++    if (lg_nlog != 0) {
++        // p8-long ring layout: n_kv here is the number of cells, the keys are the n_log logical ones
++        if (!ink_pf_ring_ok() || M || lg_nlog < n_q || lg_nlog > n_kv || lg_rot < 0 || lg_rot >= n_kv || lg_win < 0) {
++            return ink_pf_reject(dst, __LINE__);
++        }
++    } else if (M->type != GGML_TYPE_F16) {
++        return ink_pf_reject(dst, __LINE__);
++    }
++    if (Q->type != GGML_TYPE_F32 || K->type != GGML_TYPE_F16 || V->type != GGML_TYPE_F16 ||
+         R->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32) {
+         return ink_pf_reject(dst, __LINE__);
+     }
+@@ -1782,7 +2219,7 @@ static bool ink_pf_guard(const int device, const ggml_tensor * dst) {
+         !ink_pf_al16(V->data, V->nb[1], V->nb[2])) {
+         return ink_pf_reject(dst, __LINE__);
+     }
+-    if (M->ne[0] < n_kv || M->ne[1] < n_q || M->ne[2] != 1 || M->ne[3] != 1 || M->nb[0] != sizeof(half)) {
++    if (M && (M->ne[0] < n_kv || M->ne[1] < n_q || M->ne[2] != 1 || M->ne[3] != 1 || M->nb[0] != sizeof(half))) {
+         return ink_pf_reject(dst, __LINE__);
+     }
+     if (R->ne[0] < 1 || R->ne[0] > INT_MAX || R->ne[1] != n_head || R->ne[2] != n_q || R->ne[3] != 1 || R->nb[0] != sizeof(float)) {
+@@ -1797,7 +2234,7 @@ static bool ink_pf_guard(const int device, const ggml_tensor * dst) {
+         return ink_pf_reject(dst, __LINE__);
+     }
+     // 32-bit row indices inside the kernel
+-    if ((double) n_q*Q->nb[1] > 2e9 || (double) n_kv*K->nb[1] > 2e9 || (double) n_kv*V->nb[1] > 2e9 || (double) n_q*M->nb[1] > 2e9) {
++    if ((double) n_q*Q->nb[1] > 2e9 || (double) n_kv*K->nb[1] > 2e9 || (double) n_kv*V->nb[1] > 2e9 || (M && (double) n_q*M->nb[1] > 2e9)) {
+         return ink_pf_reject(dst, __LINE__);
+     }
+     return true;
+@@ -1924,7 +2361,10 @@ static bool ink_pf_exec(ggml_backend_cuda_context & ctx, ggml_tensor * dst, cons
+     const ggml_tensor * M = mask_src ? mask_src : dst->src[3];
+     const ggml_tensor * S = dst->src[4];
+     const ggml_tensor * R = dst->src[6];
+-    const int64_t n_q = Q->ne[1], n_kv = K->ne[1], n_head = Q->ne[2], n_head_kv = K->ne[2];
++    int32_t lg_rot = 0, lg_win = 0;
++    const int32_t lg_nlog = ggml_flash_attn_ext_banded_get_ring(dst, &lg_rot, &lg_win);
++    // p8-long ring layout: the keys are the n_log logical ones
++    const int64_t n_q = Q->ne[1], n_kv = lg_nlog > 0 ? lg_nlog : K->ne[1], n_head = Q->ne[2], n_head_kv = K->ne[2];
+ 
+     const ggml_tensor * mm  = ink_pf_inline.count(dst) ? ink_pf_bias_mm(dst) : nullptr;
+     const bool          inl = mm != nullptr;
+@@ -1948,34 +2388,103 @@ static bool ink_pf_exec(ggml_backend_cuda_context & ctx, ggml_tensor * dst, cons
+     }();
+     const int hm = ver == 2 && nqg == 4 ? hm_env : 0;
+ 
++    // p8-long stage 2 FAR: full-attention ring node (no window) with a long key range: the key tiles beyond the relative
++    // extent of every query of a tile go to ink_pf_far_kernel (no mask / bias, triple-buffered K / V), split into far_ch
++    // chunks; the 16p kernel does the rest. GGML_CUDA_INK_PFFAR=<min n_kv> (default 4096, 0 = off),
++    // GGML_CUDA_INK_PFFAR_HM=1 (split Q / P, same products as the 16p kernel) / 2 (default: P not split, row sum of the
++    // rounded P: the exact softmax of logits moved by <= 2^-12 relative in p; long-context KLD at the level of fp32
++    // reassociation, see NOTES-p8-long.md) / 3 (neither split; opt-in)
++    static const int far_min = ink_pf_env_int("GGML_CUDA_INK_PFFAR", 4096);
++    static const int far_hm  = std::min(3, std::max(1, ink_pf_env_int("GGML_CUDA_INK_PFFAR_HM", 2)));
++    const int nsm_dev = ggml_cuda_info().devices[ctx.device].nsm;
++    int far_ch = 0;
++    // partial buffers are allocated for the chunk count of a long key range (far_ch_ss, a function of n_q only): the
++    // legacy pool keeps every buffer it ever allocated, so a smaller request in the first long ubatches (far_ch 1 at
++    // n_kv 4096) would leave an extra unused buffer behind (+26 MiB peak at 110K, ub 2048)
++    int far_ch_ss = 0;
++    if (far_min > 0 && lg_nlog > 0 && lg_win == 0 && ver == 2 && nqg == 4 && hm == 1 && n_kv >= far_min &&
++            ink_pf_env_int("GGML_CUDA_INK_PFATTN_CHUNKS", 0) <= 0) {
++        // average far tiles per query tile; chunks c in 1..8 (>= 32 tiles each) filling whole rounds of 1 block per CU
++        long long nf_sum = 0;
++        for (int qt = 0; qt < n_qt; ++qt) {
++            nf_sum += ink_pf_nfar(qt, (int) (n_kv - n_q), (int) R->ne[0], n_kt);
++        }
++        const double nf_avg = (double) nf_sum/n_qt;
++        const int    base   = n_qt*(int) n_head_kv;
++        double best = 0.0, best_ss = 0.0;
++        bool   lim  = false;
++        for (int c = 1; c <= 8; ++c) {
++            if (c > 1 && nf_avg/c < 32.0) {
++                lim = true;
++            }
++            const int    blocks = base*c;
++            const double eff    = (double) blocks/((double) ((blocks + nsm_dev - 1)/nsm_dev)*nsm_dev);
++            if (!lim && eff > best + 0.02) {
++                best   = eff;
++                far_ch = c;
++            }
++            if (eff > best_ss + 0.02) {
++                best_ss   = eff;
++                far_ch_ss = c;
++            }
++        }
++        if (nf_avg < 8.0) {
++            far_ch = 0;
++        }
++    }
++
+     int n_chunks = ink_pf_env_int("GGML_CUDA_INK_PFATTN_CHUNKS", 0);
+     if (n_chunks <= 0) {
+         const int base   = n_qt*(int) n_head_kv;
+         // f16 kernel: split the key range only below 2 blocks per CU (ub 2048: no split, no merge pass)
+         const int target = (hm ? 2 : 4)*ggml_cuda_info().devices[ctx.device].nsm;
+         n_chunks = (target + base - 1)/base;
++        // p8-long: ring layout with a long visible key span per query block (full-attention layers at long context):
++        // split the key range so that the blocks fill whole rounds of one block per CU (ub 2048, 104 CUs: 256 blocks
++        // = 2.46 rounds -> 2 chunks, 512 blocks = 4.92 rounds). GGML_CUDA_INK_PFRING_SPLIT=<min span in keys>, 0 = off
++        static const int split_min = ink_pf_env_int("GGML_CUDA_INK_PFRING_SPLIT", 4096);
++        const int64_t span = lg_win > 0 ? std::min<int64_t>(n_kv, (int64_t) lg_win + bq) : n_kv;
++        if (lg_nlog > 0 && hm && n_chunks == 1 && split_min > 0 && span >= split_min && far_ch == 0) {
++            const int nsm = ggml_cuda_info().devices[ctx.device].nsm;
++            double best = 0.0;
++            for (int c = 1; c <= 4; ++c) {
++                const int    blocks = base*c;
++                const double eff    = (double) blocks/((double) ((blocks + nsm - 1)/nsm)*nsm);
++                if (eff > best + 0.02) {
++                    best     = eff;
++                    n_chunks = c;
++                }
++            }
++        }
+     }
+     n_chunks = std::max(1, std::min(n_chunks, std::max(1, n_kt/8)));
++    if (far_ch > 0) {
++        // the 16p kernel's range is about extent + 64 keys per query tile: one chunk, folded into the last far partial
++        n_chunks = 1;
++    }
++    const int n_part = far_ch > 0 ? far_ch : n_chunks;
+ 
+     ggml_cuda_pool_alloc<uint8_t> flags(ctx.pool(), (size_t) n_qt*n_kt);
+     ggml_cuda_pool_alloc<float>   part_o(ctx.pool());
+     ggml_cuda_pool_alloc<float>   part_ml(ctx.pool());
+-    if (n_chunks > 1) {
+-        part_o.alloc((size_t) n_q*n_head*n_chunks*INK_PF_D);
+-        part_ml.alloc((size_t) n_q*n_head*n_chunks*2);
++    GGML_ASSERT(far_ch == 0 || n_chunks == 1);
++    if (n_part > 1 || far_ch > 0) {
++        const int n_alloc = far_ch > 0 ? std::max(far_ch, far_ch_ss) : n_part;
++        part_o.alloc((size_t) n_q*n_head*n_alloc*INK_PF_D);
++        part_ml.alloc((size_t) n_q*n_head*n_alloc*2);
+     }
+ 
+     ink_pf_args a;
+     a.q          = (const char *) Q->data;
+     a.k          = (const char *) K->data;
+     a.v          = (const char *) V->data;
+-    a.mask       = (const char *) M->data;
++    a.mask       = M ? (const char *) M->data : nullptr;
+     a.flags      = flags.get();
+     a.rel        = (const char *) R->data;
+     a.sinks      = S ? (const float *) S->data : nullptr;
+     a.dst        = (float *) dst->data;
+-    a.part_o     = n_chunks > 1 ? part_o.get() : nullptr;
+-    a.part_ml    = n_chunks > 1 ? part_ml.get() : nullptr;
++    a.part_o     = n_part > 1 || far_ch > 0 ? part_o.get() : nullptr;
++    a.part_ml    = n_part > 1 || far_ch > 0 ? part_ml.get() : nullptr;
+     a.scale      = scale;
+     a.n_q        = (int) n_q;
+     a.n_kv       = (int) n_kv;
+@@ -1991,7 +2500,7 @@ static bool ink_pf_exec(ggml_backend_cuda_context & ctx, ggml_tensor * dst, cons
+     a.k_nb2      = K->nb[2];
+     a.v_nb1      = V->nb[1];
+     a.v_nb2      = V->nb[2];
+-    a.m_nb1      = M->nb[1];
++    a.m_nb1      = M ? M->nb[1] : 0;
+     a.r_nb0      = R->nb[0];
+     a.r_nb1      = R->nb[1];
+     a.r_nb2      = R->nb[2];
+@@ -1999,10 +2508,17 @@ static bool ink_pf_exec(ggml_backend_cuda_context & ctx, ggml_tensor * dst, cons
+     a.r_feat     = inl ? (const char *) mm->src[1]->data : nullptr;
+     a.rf_nb1     = inl ? mm->src[1]->nb[1] : 0;
+     a.rf_nb2     = inl ? mm->src[1]->nb[2] : 0;
+-    a.m_al8      = (uintptr_t) M->data % 8 == 0 && M->nb[1] % 8 == 0;
++    a.m_al8      = M && (uintptr_t) M->data % 8 == 0 && M->nb[1] % 8 == 0;
+     // GGML_CUDA_INK_PFATTN_FLAGS2=0 (or F16=0): old mask pre-pass kernel (same flags)
+     static const bool flags2 = ink_pf_env_int("GGML_CUDA_INK_PFATTN_FLAGS2", 1) != 0;
+-    a.m_al16     = flags2 && hm != 0 && (uintptr_t) M->data % 16 == 0 && M->nb[1] % 16 == 0;
++    a.m_al16     = M && flags2 && hm != 0 && (uintptr_t) M->data % 16 == 0 && M->nb[1] % 16 == 0;
++    a.lg         = lg_nlog > 0;
++    a.rot        = lg_nlog > 0 ? lg_rot : 0;
++    a.n_cells    = lg_nlog > 0 ? (int) K->ne[1] : INT_MAX;
++    a.lg_win     = lg_nlog > 0 && lg_win > 0 ? lg_win : INT_MAX;
++    a.far_ch     = far_ch;
++    a.far_hm     = far_hm;
++    GGML_ASSERT(!a.lg || (ver == 2 && nqg == 4 && hm == 1));
+     // p7-small GATE (ver 2 kernels and the merge kernel only; ggml_cuda_ink_pfattn_gate_try checks ver == 2)
+     GGML_ASSERT(gate == nullptr || ver == 2);
+     a.gate       = gate;
+@@ -2023,6 +2539,7 @@ static bool ink_pf_exec(ggml_backend_cuda_context & ctx, ggml_tensor * dst, cons
+ 
+     // GGML_CUDA_INK_PFATTN_PP=0: f16 split kernel without the wave-group ping-pong (same arithmetic)
+     static const bool pp = ink_pf_env_int("GGML_CUDA_INK_PFATTN_PP", 1) != 0;
++    GGML_ASSERT(!a.lg || pp);
+     ink_pf_run(a, ver, nqg, inl, ctx.stream(), hm, pp);
+     CUDA_CHECK(cudaGetLastError());
+ 
+diff --git a/ggml/src/ggml.c b/ggml/src/ggml.c
+index 4754074..c762fbe 100644
+--- a/ggml/src/ggml.c
++++ b/ggml/src/ggml.c
+@@ -5551,6 +5551,35 @@ struct ggml_tensor * ggml_flash_attn_ext_banded(
+     return result;
+ }
+ 
++// p8-long: op params 8..10 of the banded node (0 = no ring layout)
++void ggml_flash_attn_ext_banded_set_ring(
++        struct ggml_tensor * a,
++        int32_t              n_log,
++        int32_t              rot,
++        int32_t              n_swa) {
++    GGML_ASSERT(a->op == GGML_OP_FLASH_ATTN_EXT_BANDED);
++    GGML_ASSERT(a->src[3] == NULL);
++    GGML_ASSERT(n_log >= a->src[0]->ne[1] && n_log <= a->src[1]->ne[1] && a->src[1]->ne[1] == a->src[2]->ne[1]);
++    GGML_ASSERT(rot >= 0 && rot < a->src[1]->ne[1] && n_swa >= 0 && a->src[0]->ne[3] == 1);
++    ggml_set_op_params_i32(a, 8,  n_log);
++    ggml_set_op_params_i32(a, 9,  rot);
++    ggml_set_op_params_i32(a, 10, n_swa);
++}
++
++int32_t ggml_flash_attn_ext_banded_get_ring(
++        const struct ggml_tensor * a,
++        int32_t                  * rot,
++        int32_t                  * n_swa) {
++    GGML_ASSERT(a->op == GGML_OP_FLASH_ATTN_EXT_BANDED);
++    if (rot) {
++        *rot = ggml_get_op_params_i32(a, 9);
++    }
++    if (n_swa) {
++        *n_swa = ggml_get_op_params_i32(a, 10);
++    }
++    return ggml_get_op_params_i32(a, 8);
++}
++
+ struct ggml_tensor * ggml_flash_attn_ext(
+         struct ggml_context * ctx,
+         struct ggml_tensor  * q,
+diff --git a/src/llama-graph.cpp b/src/llama-graph.cpp
+index b708a46..240ae5a 100644
+--- a/src/llama-graph.cpp
++++ b/src/llama-graph.cpp
+@@ -1531,7 +1531,14 @@ bool llm_graph_input_mem_hybrid_iswa_rel::can_reuse(const llm_graph_params & par
+     res &= self_rel_pos_swa->ne[0] == attn_ctx->get_swa()->get_n_kv();
+     res &= self_rel_pos_swa->ne[1] == params.ubatch.n_tokens;
+ 
+-    if (banded) {
++    if (banded && ring) {
++        // p8-long: the ring layout is baked into the banded nodes (op params)
++        for (int i = 0; i < 2; ++i) {
++            uint32_t rot = 0;
++            const uint32_t n_log = (i ? attn_ctx->get_swa() : attn_ctx->get_base())->get_n_kv_ring(rot);
++            res &= n_log == n_kv_ring[i] && rot == ring_rot[i];
++        }
++    } else if (banded) {
+         res &= attn_ctx->get_base()->get_n_kv_pos_contiguous() == n_kv_banded[0];
+         res &= attn_ctx->get_swa()->get_n_kv_pos_contiguous()  == n_kv_banded[1];
+     }
+diff --git a/src/llama-graph.h b/src/llama-graph.h
+index ecf1699..3b7ef6f 100644
+--- a/src/llama-graph.h
++++ b/src/llama-graph.h
+@@ -826,6 +826,13 @@ public:
+     uint32_t n_kv_banded[2] = { 0, 0 };
+     bool     banded         = false;
+ 
++    // p8-long (LLAMA_INK_PFRING): [base, swa] ring layout of the banded attention (logical keys, 0 = none; rotation),
++    // see ggml_flash_attn_ext_banded_set_ring. Used instead of n_kv_banded when ring is set; the KQ masks then stay
++    // unallocated unless a layer falls back to them
++    uint32_t n_kv_ring[2] = { 0, 0 };
++    uint32_t ring_rot[2]  = { 0, 0 };
++    bool     ring         = false;
++
+     const uint32_t extent;
+     const uint32_t extent_swa;
+ 
+diff --git a/src/llama-kv-cache.cpp b/src/llama-kv-cache.cpp
+index f843850..afea750 100644
+--- a/src/llama-kv-cache.cpp
++++ b/src/llama-kv-cache.cpp
+@@ -1356,6 +1356,76 @@ uint32_t llama_kv_cache::get_n_kv_pos_contiguous(const slot_info & sinfo, const
+     return pos_max + 1;
+ }
+ 
++uint32_t llama_kv_cache::get_n_kv_ring(const slot_info & sinfo, const llama_ubatch & ubatch, uint32_t n_kv, uint32_t & rot) const {
++    rot = 0;
++    if (sinfo.n_stream() != 1 || ubatch.n_seqs_unq != 1 || ubatch.n_tokens == 0 ||
++        ubatch.pos == nullptr || ubatch.n_seq_id == nullptr ||
++        ubatch.seq_id == nullptr || ubatch.seq_id[0] == nullptr) {
++        return 0;
++    }
++
++    const llama_seq_id seq_id = ubatch.seq_id[0][0];
++    if (seq_id < 0 || (size_t) seq_id >= seq_to_stream.size()) {
++        return 0;
++    }
++
++    const uint32_t stream = seq_to_stream[seq_id];
++    if (sinfo.strm[0] < 0 || (uint32_t) sinfo.strm[0] != stream || stream >= v_cells.size()) {
++        return 0;
++    }
++
++    const auto & cells = v_cells[stream];
++    if (n_kv == 0 || n_kv > cells.size()) {
++        return 0;
++    }
++
++    const llama_pos pos_min = cells.seq_pos_min(seq_id);
++    const llama_pos pos_max = cells.seq_pos_max(seq_id);
++    if (pos_min < 0 || pos_max < pos_min || (int64_t) pos_max - pos_min + 1 > (int64_t) n_kv) {
++        return 0;
++    }
++    const uint32_t n_log = (uint32_t) (pos_max - pos_min + 1);
++
++    // the ubatch is the monotonic tail of the run, one sequence
++    if (n_log < ubatch.n_tokens) {
++        return 0;
++    }
++    const llama_pos pos_start = pos_max + 1 - (llama_pos) ubatch.n_tokens;
++    for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
++        if (ubatch.pos[i] != pos_start + (llama_pos) i ||
++            ubatch.n_seq_id[i] < 1 || ubatch.seq_id[i] == nullptr || ubatch.seq_id[i][0] != seq_id) {
++            return 0;
++        }
++    }
++
++    // exactly n_log cells of the view hold the sequence, the one with pos_min starts the run
++    uint32_t n_seq_cells = 0;
++    int64_t  c0          = -1;
++    for (uint32_t c = 0; c < n_kv; ++c) {
++        if (!cells.is_empty(c) && cells.seq_has(c, seq_id)) {
++            ++n_seq_cells;
++            if (cells.pos_get(c) == pos_min) {
++                c0 = c;
++            }
++        }
++    }
++    if (c0 < 0 || n_seq_cells != n_log) {
++        return 0;
++    }
++    for (uint32_t j = 0; j < n_log; ++j) {
++        uint32_t c = (uint32_t) c0 + j;
++        if (c >= n_kv) {
++            c -= n_kv;
++        }
++        if (cells.is_empty(c) || !cells.seq_has(c, seq_id) || cells.pos_get(c) != pos_min + (llama_pos) j) {
++            return 0;
++        }
++    }
++
++    rot = (uint32_t) c0;
++    return n_log;
++}
++
+ uint32_t llama_kv_cache::get_n_kv_slices(const llama_ubatch & ubatch) {
+     if (ubatch.n_seqs_unq == 1) {
+         return 1;
+@@ -3198,6 +3268,19 @@ uint32_t llama_kv_cache_context::get_n_kv_pos_contiguous() const {
+     return result <= (uint32_t) n_kv ? result : 0;
+ }
+ 
++uint32_t llama_kv_cache_context::get_n_kv_ring(uint32_t & rot) const {
++    rot = 0;
++    if (ubatches.empty() || sinfos.empty() || i_cur >= ubatches.size() || i_cur >= sinfos.size()) {
++        // reserve: the shapes of a full run without rotation
++        if (kv != nullptr && lctx == nullptr && kv->get_n_stream() == 1) {
++            return n_kv;
++        }
++        return 0;
++    }
++
++    return kv->get_n_kv_ring(sinfos[i_cur], ubatches[i_cur], n_kv, rot);
++}
++
+ uint32_t llama_kv_cache_context::get_n_kv_rows() const {
+     return n_kv_rows;
+ }
+diff --git a/src/llama-kv-cache.h b/src/llama-kv-cache.h
+index 605b55f..c549ead 100644
+--- a/src/llama-kv-cache.h
++++ b/src/llama-kv-cache.h
+@@ -197,6 +197,11 @@ public:
+     // active cell count when position p lives in physical cell p; 0 for any non-contiguous layout
+     uint32_t get_n_kv_pos_contiguous(const slot_info & sinfo, const llama_ubatch & ubatch) const;
+ 
++    // p8-long: ring layout of the ubatch's sequence within the first n_kv cells: returns n_log > 0 and sets rot when
++    // cell (rot + j) % n_kv holds position p0 + j of the sequence for j < n_log, no other cell of the view holds the
++    // sequence, and the ubatch is the tail p0 + n_log - n_tokens .. p0 + n_log - 1 (see ggml_flash_attn_ext_banded_set_ring)
++    uint32_t get_n_kv_ring(const slot_info & sinfo, const llama_ubatch & ubatch, uint32_t n_kv, uint32_t & rot) const;
++
+     // attention over the cells of each sequence of the ubatch instead of the whole cache (see ggml_flash_attn_ext_rows)
+     // the ubatch splits into n_slices groups of tokens with one sequence each
+     // if it cannot (f.ex. interleaved or coupled sequences), it is a single slice over the cells of all its sequences
+@@ -425,6 +430,8 @@ public:
+ 
+     uint32_t get_n_kv() const;
+     uint32_t get_n_kv_pos_contiguous() const;
++    // p8-long: see llama_kv_cache::get_n_kv_ring (over the n_kv cells of this context)
++    uint32_t get_n_kv_ring(uint32_t & rot) const;
+     uint32_t get_n_kv_rows() const;
+     uint32_t get_size() const;
+ 
+diff --git a/src/models/inkling2.cpp b/src/models/inkling2.cpp
+index 70bc81e..c532c42 100644
+--- a/src/models/inkling2.cpp
++++ b/src/models/inkling2.cpp
+@@ -27,6 +27,18 @@ static bool inkling2_rel_bias_src() {
+     return on;
+ }
+ 
++// p8-long: LLAMA_INK_PFRING (default 1; needs the inline-bias path above): the banded attention reads the cache in its
++// ring layout (SWA ring buffer after it wraps) with the causal / sliding-window mask evaluated on the device from
++// positions (ggml_flash_attn_ext_banded_set_ring), so the dense KQ masks are neither filled nor uploaded.
++// LLAMA_INK_PFRING=0 restores the previous graph exactly.
++static bool inkling2_ring() {
++    static const bool on = [] {
++        const char * v = getenv("LLAMA_INK_PFRING");
++        return (v == nullptr || atoi(v) != 0) && inkling2_rel_bias_src();
++    }();
++    return on;
++}
++
+ void llama_model_inkling2::load_arch_hparams(llama_model_loader & ml) {
+     ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS, hparams.f_norm_rms_eps);
+     ml.get_key(LLM_KV_ATTENTION_QK_CLIP,           hparams.f_qk_clip);
+@@ -313,8 +325,16 @@ llama_model_inkling2::graph::graph(const llm_graph_params & params) : llm_graph_
+     auto * attn = inp->get_attn();
+     // banded FA needs a position-contiguous cache; small ubatches stay dense for graph reuse
+     inp->banded = cparams.flash_attn && n_tokens > n_tokens_banded_min;
++    // p8-long: ring layout + on-device mask (causal, standard sliding window, no ALiBi / 2D positions)
++    inp->ring = inp->banded && inkling2_ring() && cparams.causal_attn && !hparams.use_alibi && hparams.n_pos_per_embd() == 1 &&
++        hparams.swa_type == LLAMA_SWA_TYPE_STANDARD;
+     for (int i = 0; i < 2 && inp->banded; ++i) {
+-        inp->n_kv_banded[i] = (i ? attn->mctx->get_swa() : attn->mctx->get_base())->get_n_kv_pos_contiguous();
++        const auto * cache = i ? attn->mctx->get_swa() : attn->mctx->get_base();
++        if (inp->ring) {
++            inp->n_kv_ring[i] = cache->get_n_kv_ring(inp->ring_rot[i]);
++        } else {
++            inp->n_kv_banded[i] = cache->get_n_kv_pos_contiguous();
++        }
+     }
+     std::vector<std::pair<std::pair<bool, ggml_backend_dev_t>, bool>> banded_dev_ok;
+     const auto use_banded = [&](int il, bool swa) {
+@@ -323,7 +343,7 @@ llama_model_inkling2::graph::graph(const llm_graph_params & params) : llm_graph_
+         const auto type_ok = [](ggml_type t) {
+             return t == GGML_TYPE_F32 || t == GGML_TYPE_F16 || t == GGML_TYPE_BF16;
+         };
+-        if (!(inp->n_kv_banded[swa] > 0 && (hd == 64 || hd == 128) && hparams.n_embd_head_v(il) == hd &&
++        if (!((inp->ring ? inp->n_kv_ring[swa] : inp->n_kv_banded[swa]) > 0 && (hd == 64 || hd == 128) && hparams.n_embd_head_v(il) == hd &&
+                 type_ok(cache->type_k()) && type_ok(cache->type_v()) && !cache->get_k_scale(il) && !cache->get_v_scale(il) &&
+                 (swa ? attn->self_attn_mask_swa.raw : attn->self_attn_mask.raw)->ne[3] == 1)) {
+             return false;
+@@ -342,10 +362,13 @@ llama_model_inkling2::graph::graph(const llm_graph_params & params) : llm_graph_
+         ggml_tensor * pq = ggml_new_tensor_4d(ctx0, GGML_TYPE_F32, hd, 1, nh, 1);
+         ggml_tensor * pk = ggml_new_tensor_4d(ctx0, cache->type_k(), hd, 1, nkv, 1);
+         ggml_tensor * pv = ggml_new_tensor_4d(ctx0, cache->type_v(), hd, 1, nkv, 1);
+-        ggml_tensor * pm = ggml_new_tensor_4d(ctx0, GGML_TYPE_F16, 1, 1, 1, 1);
++        ggml_tensor * pm = inp->ring ? nullptr : ggml_new_tensor_4d(ctx0, GGML_TYPE_F16, 1, 1, 1, 1);
+         ggml_tensor * pr = ggml_new_tensor_4d(ctx0, GGML_TYPE_F32, 1, nh, 1, 1);
+         ggml_tensor * op = ggml_flash_attn_ext_banded(ctx0, pq, pk, pv, pm, pr, 1.0f, 1);
+         ggml_flash_attn_ext_add_sinks(op, ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, nh, 1, 1));
++        if (inp->ring) {
++            ggml_flash_attn_ext_banded_set_ring(op, 1, 0, swa ? (int32_t) hparams.n_swa : 0);
++        }
+         ggml_prec_set_acc(op, GGML_PREC_F32);
+         const bool ok = ggml_backend_dev_supports_op(dev, op);
+         banded_dev_ok.push_back({ { swa, dev }, ok });
+@@ -508,9 +531,12 @@ llama_model_inkling2::graph::graph(const llm_graph_params & params) : llm_graph_
+                 ggml_build_forward_expand(gf, cache->cpy_k(ctx0, Kcur, is_swa ? attn->get_k_idxs_swa() : attn->get_k_idxs(), il));
+                 ggml_build_forward_expand(gf, cache->cpy_v(ctx0, Vcur, is_swa ? attn->get_v_idxs_swa() : attn->get_v_idxs(), il));
+ 
+-                const int64_t n_kv_b = inp->n_kv_banded[is_swa];
+                 ggml_tensor * k_all = cache->get_k(ctx0, il);
+                 ggml_tensor * v_all = cache->get_v(ctx0, il);
++                // p8-long ring layout: without rotation the first n_log cells, else the whole view (rows wrap)
++                const int64_t n_log  = inp->ring ? inp->n_kv_ring[is_swa] : 0;
++                const int64_t rot    = inp->ring ? inp->ring_rot[is_swa]  : 0;
++                const int64_t n_kv_b = inp->ring ? (rot == 0 ? n_log : k_all->ne[2]) : inp->n_kv_banded[is_swa];
+                 GGML_ASSERT(n_kv_b <= k_all->ne[2]);
+                 ggml_tensor * q_fa = ggml_permute(ctx0, ggml_reshape_4d(ctx0, Qcur, n_embd_head, n_head, n_tokens, 1), 0, 2, 1, 3);
+                 ggml_tensor * k_fa = ggml_permute(ctx0, ggml_view_4d(ctx0, k_all, k_all->ne[0], k_all->ne[1], n_kv_b, k_all->ne[3],
+@@ -524,14 +550,20 @@ llama_model_inkling2::graph::graph(const llm_graph_params & params) : llm_graph_
+                     v_fa = ggml_permute(ctx0, ggml_view_4d(ctx0, v_all, v_all->ne[0], v_all->ne[1], n_kv_b, v_all->ne[3],
+                             v_all->nb[1], v_all->nb[2], v_all->nb[3], 0), 0, 2, 1, 3);
+                 }
+-                ggml_tensor * mask = is_swa ? attn->self_attn_mask_swa.raw : attn->self_attn_mask.raw;
+-                ggml_tensor * m = ggml_cont(ctx0, ggml_view_4d(ctx0, mask, n_kv_b, mask->ne[1], mask->ne[2], mask->ne[3],
+-                        mask->nb[1], mask->nb[2], mask->nb[3], 0));
++                ggml_tensor * m = nullptr;
++                if (!inp->ring) {
++                    ggml_tensor * mask = is_swa ? attn->self_attn_mask_swa.raw : attn->self_attn_mask.raw;
++                    m = ggml_cont(ctx0, ggml_view_4d(ctx0, mask, n_kv_b, mask->ne[1], mask->ne[2], mask->ne[3],
++                            mask->nb[1], mask->nb[2], mask->nb[3], 0));
++                }
+                 // exp(s + b)/(exp(t) + sum(exp(s + b))): the dense mask b - t with a zero sink
+                 ggml_tensor * rel_b = ggml_mul_mat(ctx0, layer.attn_rel_bias, Rcur);
+                 rel_b = ggml_reshape_4d(ctx0, rel_b, rel_b->ne[0], n_head, n_tokens, 1);
+                 cur = ggml_flash_attn_ext_banded(ctx0, q_fa, k_fa, v_fa, m, rel_b, 1.0f/sqrtf(n_embd_head), rel_b->ne[0]);
+                 ggml_flash_attn_ext_add_sinks(cur, ggml_reshape_3d(ctx0, sinks, n_head, n_tokens, 1));
++                if (inp->ring) {
++                    ggml_flash_attn_ext_banded_set_ring(cur, (int32_t) n_log, (int32_t) rot, is_swa ? (int32_t) hparams.n_swa : 0);
++                }
+                 // extra (unused by the stock kernels) dependency: keeps Rcur alive up to this node, so a backend may
+                 // evaluate the bias from attn_rel_bias and Rcur inside the attention kernel and skip rel_b (CUDA pf-attn)
+                 if (inkling2_rel_bias_src()) {
