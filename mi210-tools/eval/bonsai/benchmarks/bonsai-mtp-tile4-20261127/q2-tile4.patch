@@ -1,0 +1,385 @@
+--- a/ggml/src/ggml-cuda/mmvq-q2-0.cu
++++ b/ggml/src/ggml-cuda/mmvq-q2-0.cu
+@@ -9,16 +9,29 @@
+ 
+ static constexpr int q2_0_repack_kind = 0x7200;
+ 
++static constexpr int q2_0_tile4_kind = 0x72b4;
++
++template<bool TILED>
++static __device__ __forceinline__ int64_t q2_0_offset(int row, int k, int width) {
++    if constexpr (TILED) {
++        return (int64_t) (row / 4) * 4 * width + 4 * k + row % 4;
++    }
++    return (int64_t) row * width + k;
++}
++
+ // Same-size, lossless SoA copy: eight packed bytes per 32 values followed by
+ // one fp16 scale per 64 values. Transpose the two-bit codes within each word
+ // so a shift and byte permutation feed four signed values directly to dp4a.
+-static __global__ void q2_0_repack_kernel(const block_q2_0 * src, uint2 * codes, half * scales, const int64_t nblocks) {
++template<bool TILED>
++static __global__ void q2_0_repack_kernel(const block_q2_0 * src, uint2 * codes, half * scales, const int64_t nblocks, int blocks_per_row) {
+     const int64_t i = (int64_t) blockIdx.x*blockDim.x + threadIdx.x;
+     if (i >= nblocks) {
+         return;
+     }
+     const block_q2_0 & b = src[i];
+-    scales[i] = b.d;
++    const int row = i / blocks_per_row;
++    const int block = i % blocks_per_row;
++    scales[TILED ? q2_0_offset<true>(row, block, blocks_per_row) : i] = b.d;
+ #pragma unroll
+     for (int chunk = 0; chunk < 2; ++chunk) {
+         uint32_t words[2] = {};
+@@ -31,16 +44,17 @@
+                 words[word] |= q << (8*(j%4) + 2*(j/4));
+             }
+         }
+-        codes[2*i + chunk] = make_uint2(words[0], words[1]);
+-    }
+-}
+-
++        codes[TILED ? q2_0_offset<true>(row, 2*block + chunk, 2*blocks_per_row) : 2*i + chunk] = make_uint2(words[0], words[1]);
++    }
++}
++
++template<bool TILED>
+ static void q2_0_repack(const void * src, void * dst, const ggml_tensor * w, hipStream_t stream) {
+     const int64_t nblocks = ggml_nelements(w)/QK2_0;
+     auto * codes = (uint2 *) dst;
+     auto * scales = (half *) (codes + 2*nblocks);
+-    q2_0_repack_kernel<<<(nblocks + 255)/256, 256, 0, stream>>>(
+-        (const block_q2_0 *) src, codes, scales, nblocks);
++    q2_0_repack_kernel<TILED><<<(nblocks + 255)/256, 256, 0, stream>>>(
++        (const block_q2_0 *) src, codes, scales, nblocks, w->ne[0] / QK2_0);
+     CUDA_CHECK(cudaGetLastError());
+ }
+ 
+@@ -116,7 +130,83 @@
+     }
+ }
+ 
+-template<int R>
++// Four lanes read the same Q8 activation and adjacent codes from four weight rows.
++// Accumulate 128 logical K slots per row, as in the row-major single-token path.
++template<int THREADS, bool GATE, bool BIAS>
++__launch_bounds__(THREADS)
++static __global__ void q2_0_tile4_gemv(const uint2 * codes, const half * scales,
++        const uint2 * gate_codes, const half * gate_scales, const block_q8_1 * x,
++        float * dst, const float * bias, int chunks) {
++    constexpr int slots = THREADS / 4;
++    constexpr int parts = 128 / slots;
++    const int tid = threadIdx.x;
++    const int row0 = blockIdx.x * 4;
++    const int row = row0 + tid % 4;
++    const int slot = tid / 4;
++    float sums[parts] = {};
++    float gates[parts] = {};
++    for (int base = 0; base < chunks; base += 128) {
++#pragma unroll
++        for (int part = 0; part < parts; ++part) {
++            const int k = base + part * slots + slot;
++            if (k < chunks) {
++                const block_q8_1 act = x[k];
++                const int64_t wi = q2_0_offset<true>(row, k, chunks);
++                const int64_t si = q2_0_offset<true>(row, k / 2, chunks / 2);
++                sums[part] += q2_0_dot(codes[wi], __half2float(scales[si]), act);
++                if constexpr (GATE) {
++                    gates[part] += q2_0_dot(gate_codes[wi], __half2float(gate_scales[si]), act);
++                }
++            }
++        }
++    }
++#pragma unroll
++    for (int delta = parts / 2; delta > 0; delta /= 2) {
++#pragma unroll
++        for (int i = 0; i < delta; ++i) {
++            sums[i] += sums[i + delta];
++            if constexpr (GATE) {
++                gates[i] += gates[i + delta];
++            }
++        }
++    }
++    __shared__ float partial[4][slots + 1];
++    __shared__ float gate_partial[GATE ? 4 : 1][slots + 1];
++    partial[tid % 4][slot] = sums[0];
++    if constexpr (GATE) {
++        gate_partial[tid % 4][slot] = gates[0];
++    }
++    __syncthreads();
++    const int out = tid / slots;
++    const int lane = tid % slots;
++    float value = warp_reduce_sum<slots>(partial[out][lane]);
++    if constexpr (GATE || BIAS) {
++        value += BIAS ? bias[row0 + out] : 0.0f;
++    }
++    if constexpr (GATE) {
++        const float gate = warp_reduce_sum<slots>(gate_partial[out][lane]);
++        value *= ggml_cuda_op_silu_single(gate + 0.0f);
++    }
++    if (lane == 0) {
++        dst[row0 + out] = value;
++    }
++}
++
++template<bool TILED, bool GATE, bool BIAS>
++static void q2_0_gemv_dispatch(const uint2 * codes, const half * scales, const uint2 * gate,
++        const half * gate_scales, const block_q8_1 * x, float * dst, const float * bias,
++        int K, int N, cudaStream_t stream) {
++    const int chunks = K / QK8_1;
++    if constexpr (!TILED) {
++        q2_0_gemv_kernel<2, GATE, BIAS><<<N / 2, 128, 0, stream>>>(codes, scales, gate, gate_scales, x, dst, bias, chunks);
++    } else if (K <= 5120) {
++        q2_0_tile4_gemv<128, GATE, BIAS><<<N / 4, 128, 0, stream>>>(codes, scales, gate, gate_scales, x, dst, bias, chunks);
++    } else {
++        q2_0_tile4_gemv<256, GATE, BIAS><<<N / 4, 256, 0, stream>>>(codes, scales, gate, gate_scales, x, dst, bias, chunks);
++    }
++}
++
++template<bool TILED>
+ static void q2_0_launch(
+         const void * packed, const void * packed_gate, const block_q8_1 * x, float * dst,
+         const float * bias, const int K, const int N, cudaStream_t stream) {
+@@ -124,22 +214,18 @@
+     const auto * scales = (const half *) (codes + (int64_t) N*K/32);
+     const auto * gate = (const uint2 *) packed_gate;
+     const auto * gate_scales = gate ? (const half *) (gate + (int64_t) N*K/32) : nullptr;
+-    const dim3 grid(N/R);
+     if (gate) {
+-        q2_0_gemv_kernel<R, true, false><<<grid, 128, 0, stream>>>(
+-            codes, scales, gate, gate_scales, x, dst, nullptr, K/32);
++        q2_0_gemv_dispatch<TILED, true, false>(codes, scales, gate, gate_scales, x, dst, nullptr, K, N, stream);
+     } else if (bias) {
+-        q2_0_gemv_kernel<R, false, true><<<grid, 128, 0, stream>>>(
+-            codes, scales, nullptr, nullptr, x, dst, bias, K/32);
++        q2_0_gemv_dispatch<TILED, false, true>(codes, scales, nullptr, nullptr, x, dst, bias, K, N, stream);
+     } else {
+-        q2_0_gemv_kernel<R, false, false><<<grid, 128, 0, stream>>>(
+-            codes, scales, nullptr, nullptr, x, dst, nullptr, K/32);
++        q2_0_gemv_dispatch<TILED, false, false>(codes, scales, nullptr, nullptr, x, dst, nullptr, K, N, stream);
+     }
+ }
+ 
+ // Verify multiple tokens with one weight load. Each column retains the
+ // accumulation and wave reduction order of the single-token kernel.
+-template<int C>
++template<int C, bool TILED>
+ __launch_bounds__(128)
+ static __global__ void q2_0_verify_kernel(const uint2 * codes, const half * scales,
+         const block_q8_1 * x, float * dst, int chunks, int x_stride, int rows) {
+@@ -156,9 +242,9 @@
+         }
+ #pragma unroll
+         for (int r = 0; r < R; ++r) {
+-            const int64_t offset = (int64_t) (row+r)*chunks + k;
++            const int64_t offset = q2_0_offset<TILED>(row + r, k, chunks);
+             const uint2 code = codes[offset];
+-            const float scale = __half2float(scales[offset/2]);
++            const float scale = __half2float(scales[q2_0_offset<TILED>(row + r, k / 2, chunks / 2)]);
+ #pragma unroll
+             for (int c = 0; c < C; ++c) {
+                 sums[r][c] += q2_0_dot(code, scale, act[c]);
+@@ -187,13 +273,24 @@
+     }
+ }
+ 
+-template<int C>
++template<int C, bool TILED>
+ static void q2_0_verify(const void * packed, const block_q8_1 * x, float * dst,
+         int K, int N, cudaStream_t stream) {
+     const auto * codes = (const uint2 *) packed;
+     const auto * scales = (const half *) (codes + (int64_t) N*K/QK8_1);
+-    q2_0_verify_kernel<C><<<N/2, 128, 0, stream>>>(
++    q2_0_verify_kernel<C, TILED><<<N/2, 128, 0, stream>>>(
+         codes, scales, x, dst, K/QK8_1, GGML_PAD(K, MATRIX_ROW_PADDING)/QK8_1, N);
++}
++
++template<bool TILED>
++static void q2_0_dispatch(int cols, const void * packed, const void * packed_gate, const block_q8_1 * x,
++        float * out, const float * residual, int K, int N, cudaStream_t stream) {
++    switch (cols) {
++        case 2: q2_0_verify<2, TILED>(packed, x, out, K, N, stream); break;
++        case 3: q2_0_verify<3, TILED>(packed, x, out, K, N, stream); break;
++        case 4: q2_0_verify<4, TILED>(packed, x, out, K, N, stream); break;
++        default: q2_0_launch<TILED>(packed, packed_gate, x, out, residual, K, N, stream); break;
++    }
+ }
+ 
+ // The four columns of one K chunk are contiguous. Each lane reads two aligned
+@@ -231,7 +328,7 @@
+     return i == 0 ? v.x : i == 1 ? v.y : i == 2 ? v.z : v.w;
+ }
+ 
+-template<int C>
++template<int C, bool TILED>
+ __launch_bounds__(128)
+ static __global__ void q2_0_verify_mfma(const uint2 * codes, const half * scales,
+         const q2_0_words * activations, const float4 * activation_scales,
+@@ -250,20 +347,21 @@
+ #pragma unroll
+         for (int part = 0; part < parts; ++part) {
+             const int wave_start = base + part * slots + 16 * (tid / 64);
+-            if (wave_start >= chunks) {
++            // Tiled weights have a multiple of 32 chunks. Both waves can skip a full slot group together.
++            if ((TILED ? base + part * slots : wave_start) >= chunks) {
+                 continue;
+             }
+             const int item = wave_start + (tid % 64) / 4;
+             // All lanes must reach the MFMA even for a partially filled wave.
+-            const int k = min(item, chunks - 1);
++            const int k = TILED ? item : min(item, chunks - 1);
+             const q2_0_words act = activations[4 * k + quad_lane];
+             const float4 dy = activation_scales[k];
+ #pragma unroll
+             for (int group = 0; group < row_groups; ++group) {
+                 const int row = row0 + 4 * group + quad_lane;
+-                const int64_t offset = (int64_t) row * chunks + k;
++                const int64_t offset = q2_0_offset<TILED>(row, k, chunks);
+                 const uint2 code = codes[offset];
+-                const float dw = __half2float(scales[offset / 2]);
++                const float dw = __half2float(scales[q2_0_offset<TILED>(row, k / 2, chunks / 2)]);
+                 int4_acc dots = {};
+                 // Each quad forms a 4-row x 4-column tile. Eight integer matrix
+                 // instructions cover 32 K values; a lane owns one row of results.
+@@ -277,7 +375,7 @@
+                     dots = __builtin_amdgcn_mfma_i32_4x4x4i8(a, w, dots, 0, 0, 0);
+ #endif
+                 }
+-                if (item < chunks) {
++                if (TILED || item < chunks) {
+ #pragma unroll
+                     for (int col = 0; col < C; ++col) {
+                         sums[part][group][col] += dw * q2_0_component(dy, col) * dots[col];
+@@ -318,7 +416,34 @@
+ #endif
+ 
+ #if defined(GGML_USE_HIP)
+-template<int C>
++static bool q2_0_mfma_enabled() {
++    static const bool enabled = [] {
++        for (const char * key : { "GGML_MMVQ_Q2_0", "GGML_MMVQ_Q2_0_VERIFY_BATCH", "GGML_MMVQ_Q2_0_MFMA" }) {
++            const char * e = getenv(key);
++            if (e && e[0] == '0') {
++                return false;
++            }
++        }
++        return true;
++    }();
++    return enabled;
++}
++
++static bool q2_0_use_tile4(const ggml_backend_cuda_context & ctx, const ggml_tensor * w) {
++    static const bool enabled = [] {
++        const char * e = getenv("GGML_MMVQ_Q2_0_TILE");
++        return !e || e[0] != '0';
++    }();
++    return enabled && q2_0_mfma_enabled() && ggml_cuda_info().devices[ctx.device].cc == GGML_CUDA_CC_CDNA2 &&
++           w->ne[0] % (32 * QK8_1) == 0;
++}
++
++static const void * q2_0_packed(ggml_backend_cuda_context & ctx, const ggml_tensor * w, bool tiled) {
++    return ggml_cuda_get_repacked(w, ctx.device, ctx.stream(), tiled ? q2_0_tile4_kind : q2_0_repack_kind,
++            ggml_nbytes(w), tiled ? q2_0_repack<true> : q2_0_repack<false>);
++}
++
++template<int C, bool TILED>
+ static void q2_0_launch_verify_mfma(ggml_backend_cuda_context & ctx, const void * packed,
+         const ggml_tensor * src, ggml_tensor * dst) {
+     const int chunks = src->ne[0] / QK8_1;
+@@ -333,38 +458,37 @@
+     q2_0_quantize_columns<C><<<(chunks + 1) / 2, 256, 0, stream>>>(
+         static_cast<const float *>(src->data), src->nb[1] / sizeof(float), words, reinterpret_cast<float *>(dy), chunks);
+ #if defined(__gfx90a__) || !defined(__HIP_DEVICE_COMPILE__)
+-    q2_0_verify_mfma<C><<<rows / 8, 128, 0, stream>>>(codes, scales, words, dy, static_cast<float *>(dst->data), chunks, rows);
++    q2_0_verify_mfma<C, TILED><<<rows / 8, 128, 0, stream>>>(codes, scales, words, dy, static_cast<float *>(dst->data), chunks, rows);
+ #endif
+     CUDA_CHECK(cudaGetLastError());
+ }
+ 
+ bool ggml_cuda_mmvq_q2_0_mfma(ggml_backend_cuda_context & ctx, const ggml_tensor * w,
+         const ggml_tensor * src, ggml_tensor * dst) {
+-    static const bool enabled = [] {
+-        for (const char * key : { "GGML_MMVQ_Q2_0", "GGML_MMVQ_Q2_0_VERIFY_BATCH", "GGML_MMVQ_Q2_0_MFMA" }) {
+-            const char * e = getenv(key);
+-            if (e && e[0] == '0') {
+-                return false;
+-            }
+-        }
+-        return true;
+-    }();
+     const auto & device = ggml_cuda_info().devices[ctx.device];
+-    if (!enabled || device.cc != GGML_CUDA_CC_CDNA2 || device.warp_size != 64 || !q2_0_weight_ok(w) ||
++    if (!q2_0_mfma_enabled() || device.cc != GGML_CUDA_CC_CDNA2 || device.warp_size != 64 || !q2_0_weight_ok(w) ||
+             src->type != GGML_TYPE_F32 || !ggml_is_matrix(src) || src->nb[0] != sizeof(float) ||
+             src->nb[1] % sizeof(float) != 0 || src->ne[0] != w->ne[0] ||
+-            (src->ne[1] != 3 && src->ne[1] != 4) || dst->type != GGML_TYPE_F32 || !ggml_is_matrix(dst) ||
++            (src->ne[1] < 2 || src->ne[1] > 4) || dst->type != GGML_TYPE_F32 || !ggml_is_matrix(dst) ||
+             !ggml_is_contiguous(dst) || dst->ne[0] != w->ne[1] || dst->ne[1] != src->ne[1]) {
+         return false;
+     }
+-    const void * packed = ggml_cuda_get_repacked(w, ctx.device, ctx.stream(), q2_0_repack_kind, ggml_nbytes(w), q2_0_repack);
++    const bool tiled = q2_0_use_tile4(ctx, w);
++    if (!tiled && src->ne[1] == 2) {
++        return false;
++    }
++    const void * packed = q2_0_packed(ctx, w, tiled);
+     if (!packed) {
+         return false;
+     }
+-    if (src->ne[1] == 3) {
+-        q2_0_launch_verify_mfma<3>(ctx, packed, src, dst);
++    if (src->ne[1] == 2) {
++        q2_0_launch_verify_mfma<2, true>(ctx, packed, src, dst);
++    } else if (src->ne[1] == 3) {
++        if (tiled) q2_0_launch_verify_mfma<3, true>(ctx, packed, src, dst);
++        else       q2_0_launch_verify_mfma<3, false>(ctx, packed, src, dst);
+     } else {
+-        q2_0_launch_verify_mfma<4>(ctx, packed, src, dst);
++        if (tiled) q2_0_launch_verify_mfma<4, true>(ctx, packed, src, dst);
++        else       q2_0_launch_verify_mfma<4, false>(ctx, packed, src, dst);
+     }
+     return true;
+ }
+@@ -405,23 +529,22 @@
+             !ggml_are_same_shape(bias, dst))) {
+         return false;
+     }
+-    const void * packed = ggml_cuda_get_repacked(w, ctx.device, ctx.stream(), q2_0_repack_kind, ggml_nbytes(w), q2_0_repack);
++    const bool tiled = q2_0_use_tile4(ctx, w);
++    const void * packed = q2_0_packed(ctx, w, tiled);
+     if (!packed) {
+         return false;
+     }
+-    const void * packed_gate = gate ?
+-        ggml_cuda_get_repacked(gate, ctx.device, ctx.stream(), q2_0_repack_kind, ggml_nbytes(gate), q2_0_repack) : nullptr;
++    const void * packed_gate = gate ? q2_0_packed(ctx, gate, tiled) : nullptr;
+     if (gate && !packed_gate) {
+         return false;
+     }
+     const int K = (int) w->ne[0], N = (int) w->ne[1];
+     const auto * residual = bias ? (const float *) bias->data : nullptr;
+     auto * out = (float *) dst->data;
+-    switch (dst->ne[1]) {
+-        case 2: q2_0_verify<2>(packed, x, out, K, N, ctx.stream()); break;
+-        case 3: q2_0_verify<3>(packed, x, out, K, N, ctx.stream()); break;
+-        case 4: q2_0_verify<4>(packed, x, out, K, N, ctx.stream()); break;
+-        default: q2_0_launch<2>(packed, packed_gate, x, out, residual, K, N, ctx.stream()); break;
++    if (tiled) {
++        q2_0_dispatch<true>(dst->ne[1], packed, packed_gate, x, out, residual, K, N, ctx.stream());
++    } else {
++        q2_0_dispatch<false>(dst->ne[1], packed, packed_gate, x, out, residual, K, N, ctx.stream());
+     }
+     CUDA_CHECK(cudaGetLastError());
+     return true;
+--- a/ggml/src/ggml-cuda/mmvq.cu
++++ b/ggml/src/ggml-cuda/mmvq.cu
+@@ -2153,7 +2153,7 @@
+     }
+ 
+ #if defined(GGML_USE_HIP)
+-    if (!ids && !fusion && src0->type == GGML_TYPE_Q2_0 && (ne11 == 3 || ne11 == 4) &&
++    if (!ids && !fusion && src0->type == GGML_TYPE_Q2_0 && (ne11 >= 2 && ne11 <= 4) &&
+             ggml_cuda_mmvq_q2_0_mfma(ctx, src0, src1, dst)) {
+         return;
+     }

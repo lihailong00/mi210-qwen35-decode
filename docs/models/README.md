@@ -8,6 +8,7 @@
 | --- | --- | --- | --- | --- |
 | `qwen3.8-27b` | qwen35（48 层 Gated DeltaNet + 16 层全注意力，带 MTP） | llama.cpp，IQ3_S GGUF；vLLM，官方 FP8 | decode / prefill / MTP 已完成 | [qwen3.8-27b/](qwen3.8-27b/README.md) |
 | `inkling-2-mini` | inkling2（循环 MoE，128 专家选 8，24 层权重跑 48 次，带 DSpark drafter） | llama.cpp（Unsloth 合并版 b12588），UD-Q8_K_XL GGUF（NVFP4 + BF16） | decode 33.3 → 109.8 token/s，prefill pp2048 519 → 6280、128K 1515 → 4013 token/s | [inkling-2-mini/](inkling-2-mini/README.md) |
+| `ternary-bonsai-2.5-27b` | qwen35 + Hadamard 1024，带 MTP | llama.cpp，Q2_0 GGUF | Q2_0 GEMV、四行交错 MFMA、融合输入准备与分组投影，单请求 K=3 为 152.6 token/s | [ternary-bonsai-2.5-27b/](ternary-bonsai-2.5-27b/README.md) |
 
 ## 每个模型目录里放什么
 

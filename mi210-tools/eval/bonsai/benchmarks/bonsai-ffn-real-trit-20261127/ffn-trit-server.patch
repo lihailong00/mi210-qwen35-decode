@@ -1,0 +1,263 @@
+--- a/ggml/src/ggml-cuda/mmvq-q2-0.cu
++++ b/ggml/src/ggml-cuda/mmvq-q2-0.cu
+@@ -329,6 +329,194 @@
+     return i == 0 ? v.x : i == 1 ? v.y : i == 2 ? v.z : v.w;
+ }
+ 
++// Three arrays hold 4, 2 and 0.5 bytes per 32 weights. Two halves share the last byte.
++struct TritFfnMatrix {
++    const unsigned *four;
++    const unsigned short *two;
++    const unsigned char *tail;
++    const half *scales;
++    float *out;
++    int rows;
++};
++
++static TritFfnMatrix trit_matrix(const void *data, int rows, int chunks, float *out) {
++    const size_t nc = size_t(rows) * chunks;
++    auto *four = static_cast<const unsigned *>(data);
++    auto *two = reinterpret_cast<const unsigned short *>(four + nc);
++    auto *tail = reinterpret_cast<const unsigned char *>(two + nc);
++    return {four, two, tail, reinterpret_cast<const half *>(tail + nc / 2), out, rows};
++}
++
++struct RawTernaryBlock { unsigned short scale; unsigned char codes[16]; };
++static_assert(sizeof(RawTernaryBlock) == 18);
++__device__ __forceinline__ unsigned read_code(const RawTernaryBlock &z,int i) {
++    return (z.codes[i/4] >> (2*(i%4))) & 3;
++}
++template<bool FIXED>
++static __global__ void trit_repack(const RawTernaryBlock *raw, void *packed, int rows, int blocks) {
++    const size_t i = size_t(blockIdx.x)*blockDim.x+threadIdx.x;
++    const size_t nb=size_t(rows)*blocks;
++    if(i>=nb) return;
++    const int row=i/blocks, k=i%blocks;
++    const size_t bo=q2_0_offset<true>(row,k,blocks);
++    auto *four=static_cast<unsigned*>(packed);
++    auto *two=reinterpret_cast<unsigned short*>(four+2*nb);
++    auto *last=reinterpret_cast<unsigned char*>(two+2*nb);
++    auto *scale=reinterpret_cast<unsigned short*>(last+nb);
++    const RawTernaryBlock z=raw[i]; unsigned both=0;
++    for(int h=0;h<2;h++) {
++        unsigned head=0, mid=0;
++        for(int v=0;v<6;v++) {
++            unsigned b=0;
++            for (int j=0;j<5;j++) {
++                if constexpr(FIXED) {
++                    const int pos=v<4 ? 4*j+v : 20+2*j+v-4;
++                    b=3*b+read_code(z,h*32+pos);
++                } else {
++                    const int pos=j<4 ? 4*v+j : 24+v;
++                    b+=(j==0?1:j==1?3:j==2?9:j==3?27:81)*read_code(z,h*32+pos);
++                }
++            }
++            if constexpr(FIXED) b=(256*b+242)/243;
++            if(v<4) head|=b<<(8*v); else mid|=b<<(8*(v-4));
++        }
++        const size_t co=q2_0_offset<true>(row,2*k+h,2*blocks);
++        four[co]=head;two[co]=mid;
++        both|=(read_code(z,h*32+30)|(read_code(z,h*32+31)<<2))<<(4*h);
++    }
++    last[bo]=both;scale[bo]=z.scale;
++}
++// Look up the four low-order ternary digits as four signed int8 weights.
++__device__ static const unsigned trit_words[256]={0xffffffffu,0xffffff00u,0xffffff01u,0xffff00ffu,0xffff0000u,0xffff0001u,0xffff01ffu,0xffff0100u,0xffff0101u,0xff00ffffu,0xff00ff00u,0xff00ff01u,0xff0000ffu,0xff000000u,0xff000001u,0xff0001ffu,0xff000100u,0xff000101u,0xff01ffffu,0xff01ff00u,0xff01ff01u,0xff0100ffu,0xff010000u,0xff010001u,0xff0101ffu,0xff010100u,0xff010101u,0x00ffffffu,0x00ffff00u,0x00ffff01u,0x00ff00ffu,0x00ff0000u,0x00ff0001u,0x00ff01ffu,0x00ff0100u,0x00ff0101u,0x0000ffffu,0x0000ff00u,0x0000ff01u,0x000000ffu,0x00000000u,0x00000001u,0x000001ffu,0x00000100u,0x00000101u,0x0001ffffu,0x0001ff00u,0x0001ff01u,0x000100ffu,0x00010000u,0x00010001u,0x000101ffu,0x00010100u,0x00010101u,0x01ffffffu,0x01ffff00u,0x01ffff01u,0x01ff00ffu,0x01ff0000u,0x01ff0001u,0x01ff01ffu,0x01ff0100u,0x01ff0101u,0x0100ffffu,0x0100ff00u,0x0100ff01u,0x010000ffu,0x01000000u,0x01000001u,0x010001ffu,0x01000100u,0x01000101u,0x0101ffffu,0x0101ff00u,0x0101ff01u,0x010100ffu,0x01010000u,0x01010001u,0x010101ffu,0x01010100u,0x01010101u,0xffffffffu,0xffffff00u,0xffffff01u,0xffff00ffu,0xffff0000u,0xffff0001u,0xffff01ffu,0xffff0100u,0xffff0101u,0xff00ffffu,0xff00ff00u,0xff00ff01u,0xff0000ffu,0xff000000u,0xff000001u,0xff0001ffu,0xff000100u,0xff000101u,0xff01ffffu,0xff01ff00u,0xff01ff01u,0xff0100ffu,0xff010000u,0xff010001u,0xff0101ffu,0xff010100u,0xff010101u,0x00ffffffu,0x00ffff00u,0x00ffff01u,0x00ff00ffu,0x00ff0000u,0x00ff0001u,0x00ff01ffu,0x00ff0100u,0x00ff0101u,0x0000ffffu,0x0000ff00u,0x0000ff01u,0x000000ffu,0x00000000u,0x00000001u,0x000001ffu,0x00000100u,0x00000101u,0x0001ffffu,0x0001ff00u,0x0001ff01u,0x000100ffu,0x00010000u,0x00010001u,0x000101ffu,0x00010100u,0x00010101u,0x01ffffffu,0x01ffff00u,0x01ffff01u,0x01ff00ffu,0x01ff0000u,0x01ff0001u,0x01ff01ffu,0x01ff0100u,0x01ff0101u,0x0100ffffu,0x0100ff00u,0x0100ff01u,0x010000ffu,0x01000000u,0x01000001u,0x010001ffu,0x01000100u,0x01000101u,0x0101ffffu,0x0101ff00u,0x0101ff01u,0x010100ffu,0x01010000u,0x01010001u,0x010101ffu,0x01010100u,0x01010101u,0xffffffffu,0xffffff00u,0xffffff01u,0xffff00ffu,0xffff0000u,0xffff0001u,0xffff01ffu,0xffff0100u,0xffff0101u,0xff00ffffu,0xff00ff00u,0xff00ff01u,0xff0000ffu,0xff000000u,0xff000001u,0xff0001ffu,0xff000100u,0xff000101u,0xff01ffffu,0xff01ff00u,0xff01ff01u,0xff0100ffu,0xff010000u,0xff010001u,0xff0101ffu,0xff010100u,0xff010101u,0x00ffffffu,0x00ffff00u,0x00ffff01u,0x00ff00ffu,0x00ff0000u,0x00ff0001u,0x00ff01ffu,0x00ff0100u,0x00ff0101u,0x0000ffffu,0x0000ff00u,0x0000ff01u,0x000000ffu,0x00000000u,0x00000001u,0x000001ffu,0x00000100u,0x00000101u,0x0001ffffu,0x0001ff00u,0x0001ff01u,0x000100ffu,0x00010000u,0x00010001u,0x000101ffu,0x00010100u,0x00010101u,0x01ffffffu,0x01ffff00u,0x01ffff01u,0x01ff00ffu,0x01ff0000u,0x01ff0001u,0x01ff01ffu,0x01ff0100u,0x01ff0101u,0x0100ffffu,0x0100ff00u,0x0100ff01u,0x010000ffu,0x01000000u,0x01000001u,0x010001ffu,0x01000100u,0x01000101u,0x0101ffffu,0x0101ff00u,0x0101ff01u,0x010100ffu,0x01010000u,0x01010001u,0x010101ffu,0x01010100u,0x01010101u,0xffffffffu,0xffffff00u,0xffffff01u,0xffff00ffu,0xffff0000u,0xffff0001u,0xffff01ffu,0xffff0100u,0xffff0101u,0xff00ffffu,0xff00ff00u,0xff00ff01u,0xff0000ffu};
++__device__ __forceinline__ unsigned high_trits(unsigned v) {
++    const unsigned high=0x80808080u;
++    const unsigned biased=(v&0x7f7f7f7fu)|high;
++    const unsigned ge81=(biased-0x51515151u)|v;
++    const unsigned ge162=(biased-0x22222222u)&v;
++    return (((~ge81 >> 7)&0x01010101u)*255u) | ((ge162>>7)&0x01010101u);
++}
++__device__ __forceinline__ unsigned signed_tail(unsigned nib) {
++    return (((nib&3u)-1u)&255u) | (((((nib>>2)&3u)-1u)&255u)<<8);
++}
++// For x=ceil(256*n/243), five successive base-3 fractional digits recover n.
++// Each 16-bit lane holds one byte and its carry. The high byte contains the digit.
++__device__ __forceinline__ unsigned trit_step(unsigned &v) {
++    v=(v&0x00ff00ffu)*3u;
++    return ((v&0x03000300u)+0xff00ff00u)&0xff00ff00u;
++}
++__device__ __forceinline__ unsigned trit_pair(unsigned &v) {
++    const unsigned t=trit_step(v);
++    return (t>>8&255u)|(t>>16&0xff00u);
++}
++template<int MODE>
++__device__ __forceinline__ void unpack_chunk(unsigned head,unsigned mid,unsigned nib,const unsigned *table, unsigned (&out)[8]) {
++    if constexpr(MODE==3) {
++        unsigned even=head&0x00ff00ffu, odd=(head>>8)&0x00ff00ffu;
++#pragma unroll
++        for(int j=0;j<5;j++) {
++            unsigned a=trit_step(even), b=trit_step(odd);
++            out[j]=(a>>8)|b;
++        }
++        unsigned v=(mid&255u)|((mid&0xff00u)<<8);
++#pragma unroll
++        for(int j=5;j<7;j++) {
++            unsigned a=trit_pair(v), b=trit_pair(v);out[j]=a|(b<<16);
++        }
++        out[7]=trit_pair(v)|(signed_tail(nib)<<16);
++    } else {
++#pragma unroll
++        for(int j=0;j<4;j++) out[j]=table[(head>>(8*j))&255u];
++        out[4]=table[mid&255u];out[5]=table[mid>>8];
++        out[6]=high_trits(head);
++        out[7]=(high_trits(mid)&0xffffu)|(signed_tail(nib)<<16);
++    }
++}
++template<int MODE, bool GROUP>
++__launch_bounds__(128)
++static __global__ void trit_ffn(TritFfnMatrix first,TritFfnMatrix second,
++        const q2_0_words *activations,const float4 *activation_scales,int chunks) {
++    constexpr int C=4; constexpr bool TILED=true;
++    int row0=blockIdx.x*8;
++    TritFfnMatrix mat=first;
++    if constexpr(GROUP) if(row0>=mat.rows) {row0-=mat.rows;mat=second;}
++    const int rows=mat.rows;
++    __shared__ unsigned shared_table[MODE==2?256:1];
++    const unsigned *table=trit_words;
++    if constexpr(MODE==2) {
++        for(int i=threadIdx.x;i<256;i+=blockDim.x) shared_table[i]=trit_words[i];
++        __syncthreads();table=shared_table;
++    }
++    using int4_acc = int __attribute__((ext_vector_type(4)));
++    constexpr int row_groups = 2;
++    constexpr int rows_per_block = 4 * row_groups;
++    constexpr int slots = 32; // 128 threads in quads, one K chunk per quad
++    constexpr int parts = 128 / slots;
++    const int tid = threadIdx.x;
++    const int quad_lane = tid % 4;
++    const int slot = tid / 4;
++    float sums[parts][row_groups][C] = {};
++    for (int base = 0; base < chunks; base += 128) {
++#pragma unroll
++        for (int part = 0; part < parts; ++part) {
++            const int wave_start = base + part * slots + 16 * (tid / 64);
++            // Tiled weights have a multiple of 32 chunks. Both waves can skip a full slot group together.
++            if ((TILED ? base + part * slots : wave_start) >= chunks) {
++                continue;
++            }
++            const int item = wave_start + (tid % 64) / 4;
++            // All lanes must reach the MFMA even for a partially filled wave.
++            const int k = TILED ? item : min(item, chunks - 1);
++            const q2_0_words act = activations[4 * k + quad_lane];
++            const float4 dy = activation_scales[k];
++#pragma unroll
++            for (int group = 0; group < row_groups; ++group) {
++                const int row = row0 + 4 * group + quad_lane;
++                const int64_t offset = q2_0_offset<TILED>(row, k, chunks);
++                unsigned decoded[8];
++                const size_t bo=q2_0_offset<true>(row,k/2,chunks/2);
++                unpack_chunk<MODE>(mat.four[offset],mat.two[offset],(mat.tail[bo]>>(4*(k%2)))&15,table,decoded);
++                const float dw = __half2float(mat.scales[bo]);
++                int4_acc dots = {};
++                // Each quad forms a 4-row x 4-column tile. Eight integer matrix
++                // instructions cover 32 K values; a lane owns one row of results.
++#pragma unroll
++                for (int j = 0; j < 8; ++j) {
++                    const int w=static_cast<int>(decoded[j]);
++#if defined(__gfx90a__)
++                    const int a = q2_0_component(j < 4 ? act.lo : act.hi, j % 4);
++                    dots = __builtin_amdgcn_mfma_i32_4x4x4i8(a, w, dots, 0, 0, 0);
++#endif
++                }
++                if (TILED || item < chunks) {
++#pragma unroll
++                    for (int col = 0; col < C; ++col) {
++                        sums[part][group][col] += dw * q2_0_component(dy, col) * dots[col];
++                    }
++                }
++            }
++        }
++    }
++    // Match GEMV's 128-slot FP32 reduction: combine slots 64 apart, then
++    // 32 apart, then use the same shuffle tree on the remaining 32 slots.
++    __shared__ float partial[rows_per_block * C][slots + 1];
++#pragma unroll
++    for (int group = 0; group < row_groups; ++group) {
++#pragma unroll
++        for (int col = 0; col < C; ++col) {
++            const float lo = sums[0][group][col] + sums[2][group][col];
++            const float hi = sums[1][group][col] + sums[3][group][col];
++            partial[(4 * group + quad_lane) * C + col][slot] = lo + hi;
++        }
++    }
++    __syncthreads();
++    for (int output = tid / slots; output < rows_per_block * C; output += 128 / slots) {
++        const int lane = tid % slots;
++        const float sum = warp_reduce_sum<slots>(partial[output][lane]);
++        if (lane == 0) {
++            mat.out[(output % C) * rows + row0 + output / C] = sum;
++        }
++    }
++}
+ template<int C, bool TILED>
+ static __device__ __forceinline__ void q2_0_verify_rows(const uint2 * codes, const half * scales,
+         const q2_0_words * activations, const float4 * activation_scales,
+@@ -523,6 +711,16 @@
+     return true;
+ }
+ 
++static void trit_ffn_repack(const void *src,void *dst,const ggml_tensor *w,hipStream_t st) {
++    const int blocks=w->ne[0]/64,rows=w->ne[1];
++    trit_repack<false><<<(size_t(rows)*blocks+255)/256,256,0,st>>>(static_cast<const RawTernaryBlock*>(src),dst,rows,blocks);
++    CUDA_CHECK(cudaGetLastError());
++}
++static bool trit_ffn_weight(const ggml_tensor *w) {
++    const auto *name=ggml_get_name(w);
++    return (w->ne[0]==5120 && w->ne[1]==17408 && (strstr(name,".ffn_gate.weight") || strstr(name,".ffn_up.weight"))) ||
++           (w->ne[0]==17408 && w->ne[1]==5120 && strstr(name,".ffn_down.weight"));
++}
+ template<int C>
+ static void q2_0_fwht_project(ggml_backend_cuda_context & ctx, const ggml_tensor * input, const ggml_tensor * signs,
+         ggml_tensor * const * outputs, const void * const * packed, int count) {
+@@ -552,6 +750,25 @@
+     CUDA_CHECK(cudaGetLastError());
+ #endif
+ }
++template<int C>
++static void trit_ffn_project(ggml_backend_cuda_context & ctx, const ggml_tensor * input, const ggml_tensor * signs,
++        ggml_tensor * const * outputs, const void * const * packed, int count) {
++    const int width = input->ne[0];
++    const int chunks = width / QK8_1;
++    ggml_cuda_pool_alloc<char> scratch(ctx.pool());
++    auto * words = reinterpret_cast<q2_0_words *>(scratch.alloc(chunks * (4 * sizeof(q2_0_words) + sizeof(float4))));
++    auto * dy = reinterpret_cast<float4 *>(words + 4 * chunks);
++    ggml_cuda_fwht_q2_0_q8(ctx, static_cast<const float *>(input->data), static_cast<const float *>(signs->data),
++            width, C, reinterpret_cast<int8_t *>(words), reinterpret_cast<float *>(dy));
++#if defined(__gfx90a__) || !defined(__HIP_DEVICE_COMPILE__)
++    TritFfnMatrix proj[2]={};int rows=0;
++    for(int i=0;i<count;i++) {proj[i]=trit_matrix(packed[i],outputs[i]->ne[0],chunks,static_cast<float*>(outputs[i]->data));rows+=proj[i].rows;}
++    if(count==1)trit_ffn<2,false><<<rows/8,128,0,ctx.stream()>>>(proj[0],{},words,dy,chunks);
++    else trit_ffn<2,true><<<rows/8,128,0,ctx.stream()>>>(proj[0],proj[1],words,dy,chunks);
++    static const bool logged=(fprintf(stderr,"Bonsai packed FFN four-column path enabled\n"),true);(void)logged;
++    CUDA_CHECK(cudaGetLastError());
++#endif
++}
+ 
+ bool ggml_cuda_mmvq_q2_0_fwht_group(ggml_backend_cuda_context & ctx, const ggml_tensor * input,
+         const ggml_tensor * signs, ggml_tensor * const * outputs, int count) {
+@@ -559,17 +776,21 @@
+     if (!q2_0_use_tile4(ctx, outputs[0]->src[0]) || ggml_cuda_info().devices[ctx.device].warp_size != 64) {
+         return false;
+     }
++    static const bool enabled=[] {auto *e=getenv("BONSAI_FFN_TRIT");return e && e[0]=='1';}();
++    bool use_trit=enabled && input->ne[1]==4 && count<=2;
++    for(int i=0;i<count && use_trit;i++)use_trit=trit_ffn_weight(outputs[i]->src[0]);
+     const void * packed[3] = {};
+     for (int i = 0; i < count; ++i) {
+         const ggml_tensor * w = outputs[i]->src[0];
+         if (!q2_0_weight_ok(w) || w->ne[0] != input->ne[0] || w->ne[1] != outputs[i]->ne[0]) {
+             return false;
+         }
+-        packed[i] = q2_0_packed(ctx, w, true);
++        packed[i] = use_trit ? ggml_cuda_get_repacked(w,ctx.device,ctx.stream(),0x75c2,size_t(ggml_nelements(w)/64)*15,trit_ffn_repack) : q2_0_packed(ctx, w, true);
+         if (!packed[i]) {
+             return false;
+         }
+     }
++    if(use_trit) {trit_ffn_project<4>(ctx,input,signs,outputs,packed,count);return true;}
+     switch (input->ne[1]) {
+         case 2: q2_0_fwht_project<2>(ctx, input, signs, outputs, packed, count); break;
+         case 3: q2_0_fwht_project<3>(ctx, input, signs, outputs, packed, count); break;

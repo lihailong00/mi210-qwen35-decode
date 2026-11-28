@@ -1,0 +1,165 @@
+--- a/ggml/src/ggml-cuda/mmvq-q2-0.cu
++++ b/ggml/src/ggml-cuda/mmvq-q2-0.cu
+@@ -433,6 +433,102 @@
+         }
+     }
+     q2_0_verify_rows<C, true>(proj.codes, proj.scales, activations, activation_scales, proj.dst, chunks, proj.rows, row);
++}
++
++template<int C, bool TILED>
++static __device__ __forceinline__ void q2_0_verify_rows_wide(const uint2 * codes, const half * scales,
++        const q2_0_words * activations, const float4 * activation_scales,
++        const q2_0_words * activations_hi, const float4 * scales_hi, float * dst, int chunks, int rows, int row0) {
++    using int4_acc = int __attribute__((ext_vector_type(4)));
++    constexpr int row_groups = 2;
++    constexpr int rows_per_block = 4 * row_groups;
++    constexpr int slots = 32; // 128 threads in quads, one K chunk per quad
++    constexpr int parts = 128 / slots;
++    const int tid = threadIdx.x;
++    const int quad_lane = tid % 4;
++    const int slot = tid / 4;
++    float sums[parts][row_groups][C] = {};
++    for (int base = 0; base < chunks; base += 128) {
++#pragma unroll
++        for (int part = 0; part < parts; ++part) {
++            const int wave_start = base + part * slots + 16 * (tid / 64);
++            // Tiled weights have a multiple of 32 chunks. Both waves can skip a full slot group together.
++            if ((TILED ? base + part * slots : wave_start) >= chunks) {
++                continue;
++            }
++            const int item = wave_start + (tid % 64) / 4;
++            // All lanes must reach the MFMA even for a partially filled wave.
++            const int k = TILED ? item : min(item, chunks - 1);
++            const q2_0_words act = activations[4 * k + quad_lane];
++            const float4 dy = activation_scales[k];
++            const q2_0_words act_hi = activations_hi[4*k+quad_lane];
++            const float4 dy_hi = scales_hi[k];
++#pragma unroll
++            for (int group = 0; group < row_groups; ++group) {
++                const int row = row0 + 4 * group + quad_lane;
++                const int64_t offset = q2_0_offset<TILED>(row, k, chunks);
++                const uint2 code = codes[offset];
++                const float dw = __half2float(scales[q2_0_offset<TILED>(row, k / 2, chunks / 2)]);
++                int4_acc dots = {}, dots_hi = {};
++                // Each quad forms a 4-row x 4-column tile. Eight integer matrix
++                // instructions cover 32 K values; a lane owns one row of results.
++#pragma unroll
++                for (int j = 0; j < 8; ++j) {
++                    const uint32_t word = j < 4 ? code.x : code.y;
++                    const uint32_t sel = (word >> (2 * (j % 4))) & 0x03030303u;
++                    const int w = ggml_hip_perm(0x020100ff, 0x020100ff, sel);
++#if defined(__gfx90a__)
++                    const int a = q2_0_component(j < 4 ? act.lo : act.hi, j % 4);
++                    dots = __builtin_amdgcn_mfma_i32_4x4x4i8(a, w, dots, 0, 0, 0);
++                    const int a_hi = q2_0_component(j < 4 ? act_hi.lo : act_hi.hi, j % 4);
++                    dots_hi = __builtin_amdgcn_mfma_i32_4x4x4i8(a_hi,w,dots_hi,0,0,0);
++#endif
++                }
++                if (TILED || item < chunks) {
++#pragma unroll
++                    for (int col = 0; col < C; ++col) {
++                        sums[part][group][col] += dw * q2_0_component(col < 4 ? dy : dy_hi, col % 4) * (col < 4 ? dots[col % 4] : dots_hi[col % 4]);
++                    }
++                }
++            }
++        }
++    }
++    // Match GEMV's 128-slot FP32 reduction: combine slots 64 apart, then
++    // 32 apart, then use the same shuffle tree on the remaining 32 slots.
++    __shared__ float partial[rows_per_block * C][slots + 1];
++#pragma unroll
++    for (int group = 0; group < row_groups; ++group) {
++#pragma unroll
++        for (int col = 0; col < C; ++col) {
++            const float lo = sums[0][group][col] + sums[2][group][col];
++            const float hi = sums[1][group][col] + sums[3][group][col];
++            partial[(4 * group + quad_lane) * C + col][slot] = lo + hi;
++        }
++    }
++    __syncthreads();
++    for (int output = tid / slots; output < rows_per_block * C; output += 128 / slots) {
++        const int lane = tid % slots;
++        const float sum = warp_reduce_sum<slots>(partial[output][lane]);
++        if (lane == 0) {
++            dst[(output % C) * rows + row0 + output / C] = sum;
++        }
++    }
++}
++template<int C>
++__launch_bounds__(128)
++static __global__ void q2_0_verify_group_wide(q2_0_projection first, q2_0_projection second, q2_0_projection third,
++        const q2_0_words * activations, const float4 * activation_scales, const q2_0_words * hi, const float4 * dy_hi, int chunks) {
++    int row = blockIdx.x * 8;
++    q2_0_projection proj = first;
++    if (row >= first.rows) {
++        row -= first.rows;
++        proj = second;
++        if (row >= second.rows) {
++            row -= second.rows;
++            proj = third;
++        }
++    }
++    q2_0_verify_rows_wide<C, true>(proj.codes, proj.scales, activations, activation_scales, hi, dy_hi, proj.dst, chunks, proj.rows, row);
+ }
+ 
+ #endif
+@@ -553,6 +649,37 @@
+ #endif
+ }
+ 
++template<int C>
++static void q2_0_fwht_project_wide(ggml_backend_cuda_context & ctx, const ggml_tensor * input, const ggml_tensor * signs,
++        ggml_tensor * const * outputs, const void * const * packed, int count) {
++    const int width = input->ne[0];
++    const int chunks = width / QK8_1;
++    ggml_cuda_pool_alloc<char> scratch(ctx.pool());
++    auto * words = reinterpret_cast<q2_0_words *>(scratch.alloc(2*chunks * (4 * sizeof(q2_0_words) + sizeof(float4))));
++    auto * dy = reinterpret_cast<float4 *>(words + 4 * chunks);
++    ggml_cuda_fwht_q2_0_q8(ctx, static_cast<const float *>(input->data), static_cast<const float *>(signs->data),
++            width, 4, reinterpret_cast<int8_t *>(words), reinterpret_cast<float *>(dy));
++    auto * hi = reinterpret_cast<q2_0_words *>(dy+chunks);
++    auto * dy_hi = reinterpret_cast<float4 *>(hi+4*chunks);
++    ggml_cuda_fwht_q2_0_q8(ctx, static_cast<const float *>(input->data)+4*width, static_cast<const float *>(signs->data),
++            width, C-4, reinterpret_cast<int8_t *>(hi), reinterpret_cast<float *>(dy_hi));
++#if defined(__gfx90a__) || !defined(__HIP_DEVICE_COMPILE__)
++    q2_0_projection proj[3] = {};
++    int total_rows = 0;
++    for (int i = 0; i < count; ++i) {
++        const auto * codes = static_cast<const uint2 *>(packed[i]);
++        const int rows = outputs[i]->ne[0];
++        proj[i] = {codes, reinterpret_cast<const half *>(codes + (int64_t) rows * chunks),
++                   static_cast<float *>(outputs[i]->data), rows};
++        total_rows += rows;
++    }
++    q2_0_verify_group_wide<C><<<total_rows/8,128,0,ctx.stream()>>>(proj[0],proj[1],proj[2],words,dy,hi,dy_hi,chunks);
++    static const bool logged = (fprintf(stderr, "Bonsai wide verification: %d columns\n", C),true);
++    (void) logged;
++    CUDA_CHECK(cudaGetLastError());
++#endif
++}
++
+ bool ggml_cuda_mmvq_q2_0_fwht_group(ggml_backend_cuda_context & ctx, const ggml_tensor * input,
+         const ggml_tensor * signs, ggml_tensor * const * outputs, int count) {
+     GGML_ASSERT(count >= 1 && count <= 3);
+@@ -574,6 +701,10 @@
+         case 2: q2_0_fwht_project<2>(ctx, input, signs, outputs, packed, count); break;
+         case 3: q2_0_fwht_project<3>(ctx, input, signs, outputs, packed, count); break;
+         case 4: q2_0_fwht_project<4>(ctx, input, signs, outputs, packed, count); break;
++        case 5: q2_0_fwht_project_wide<5>(ctx, input, signs, outputs, packed, count); break;
++        case 6: q2_0_fwht_project_wide<6>(ctx, input, signs, outputs, packed, count); break;
++        case 7: q2_0_fwht_project_wide<7>(ctx, input, signs, outputs, packed, count); break;
++        case 8: q2_0_fwht_project_wide<8>(ctx, input, signs, outputs, packed, count); break;
+         default: return false;
+     }
+     return true;
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -6584,7 +6584,7 @@
+     const ggml_tensor * act = nodes[3];
+     const ggml_tensor * x = mul->src[0];
+     const ggml_tensor * signs = mul->src[1];
+-    if (!ggml_is_matrix(mul) || mul->ne[1] < 2 || mul->ne[1] > 4 || mul->ne[0] % 1024 != 0 ||
++    if (!ggml_is_matrix(mul) || mul->ne[1] < 2 || mul->ne[1] > 8 || mul->ne[0] % 1024 != 0 ||
+             blocks->op != GGML_OP_RESHAPE || blocks->src[0] != mul || blocks->ne[0] != 1024 ||
+             fwht->op != GGML_OP_MUL_MAT || fwht->src[1] != blocks || !ggml_cuda_op_mul_mat_use_fwht(fwht) ||
+             act->op != GGML_OP_RESHAPE || act->src[0] != fwht || !ggml_are_same_shape(act, mul) ||

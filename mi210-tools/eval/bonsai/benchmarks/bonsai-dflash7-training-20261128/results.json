@@ -1,0 +1,5969 @@
+{
+  "paired_fixed": {
+    "standard": {
+      "eligible": 1250,
+      "manual_only": 31,
+      "trained_only": 21,
+      "both": 591,
+      "neither": 607,
+      "in_candidates_all_five": 900,
+      "trained_joint": 612
+    },
+    "holdout": {
+      "eligible": 1000,
+      "manual_only": 22,
+      "trained_only": 38,
+      "both": 362,
+      "neither": 578,
+      "in_candidates_all_five": 647,
+      "trained_joint": 400
+    },
+    "all": {
+      "eligible": 2250,
+      "manual_only": 53,
+      "trained_only": 59,
+      "both": 953,
+      "neither": 1185,
+      "in_candidates_all_five": 1547,
+      "trained_joint": 1012
+    },
+    "p1": {
+      "eligible": 250,
+      "manual_only": 2,
+      "trained_only": 5,
+      "both": 5,
+      "neither": 238,
+      "in_candidates_all_five": 68,
+      "trained_joint": 10
+    },
+    "p2": {
+      "eligible": 250,
+      "manual_only": 13,
+      "trained_only": 1,
+      "both": 181,
+      "neither": 55,
+      "in_candidates_all_five": 242,
+      "trained_joint": 182
+    },
+    "p3": {
+      "eligible": 250,
+      "manual_only": 4,
+      "trained_only": 5,
+      "both": 39,
+      "neither": 202,
+      "in_candidates_all_five": 114,
+      "trained_joint": 44
+    },
+    "math": {
+      "eligible": 250,
+      "manual_only": 11,
+      "trained_only": 10,
+      "both": 154,
+      "neither": 75,
+      "in_candidates_all_five": 240,
+      "trained_joint": 164
+    },
+    "json": {
+      "eligible": 250,
+      "manual_only": 1,
+      "trained_only": 0,
+      "both": 212,
+      "neither": 37,
+      "in_candidates_all_five": 236,
+      "trained_joint": 212
+    },
+    "zh_dict": {
+      "eligible": 250,
+      "manual_only": 3,
+      "trained_only": 2,
+      "both": 46,
+      "neither": 199,
+      "in_candidates_all_five": 99,
+      "trained_joint": 48
+    },
+    "en_edit": {
+      "eligible": 250,
+      "manual_only": 6,
+      "trained_only": 7,
+      "both": 64,
+      "neither": 173,
+      "in_candidates_all_five": 176,
+      "trained_joint": 71
+    },
+    "code": {
+      "eligible": 250,
+      "manual_only": 0,
+      "trained_only": 24,
+      "both": 192,
+      "neither": 34,
+      "in_candidates_all_five": 226,
+      "trained_joint": 216
+    },
+    "zh_json": {
+      "eligible": 250,
+      "manual_only": 13,
+      "trained_only": 5,
+      "both": 60,
+      "neither": 172,
+      "in_candidates_all_five": 146,
+      "trained_joint": 65
+    }
+  },
+  "model": "Ternary-Bonsai-2.5-27B-Q2_0-mtp.gguf",
+  "draft_file": "Ternary-Bonsai-2-27B-DFlash2-ft5-Q4_K_M.gguf",
+  "draft_sha256": "f63a94fedab264f65213496b140eb6f88e78046768effafc86ee3c3b7e9d013a",
+  "hip_sha256": "f2ac3482eec8ee42b0c71102c4b1ddbf495504566695c64c86633f8bba16fedd",
+  "config": {
+    "slot_count": 1,
+    "ctx": 8192,
+    "flash_attention": true,
+    "batch": 4096,
+    "ubatch": 4096,
+    "temperature": 0,
+    "seed": 1,
+    "prompt_cache": false,
+    "ignore_eos": true,
+    "tokens_per_request": 256,
+    "repetitions": 3,
+    "server_warmup_tokens": 32
+  },
+  "frozen_sha256": "7b568caf12ca429ad538653c1e18b15aafe8033626b21f7d7dc36bbf8883be4d",
+  "training": {
+    "output_tokens_per_prompt": 144,
+    "train_anchors": 11360,
+    "validation_anchors": 2272,
+    "train_positive_rows": 53257,
+    "train_missing_rows": 6509,
+    "vocab_biases": 1927,
+    "features": 32,
+    "hidden": 24,
+    "manual_on_validation": {
+      "fixed5": 0.27219202898550726,
+      "fixed5_hits": 601,
+      "fixed5_n": 2208,
+      "rounds": 786,
+      "tokens_per_round": 2.931297709923664,
+      "active5": 0.16337285902503293
+    },
+    "selected": {
+      "epoch": 2,
+      "alpha": 1.0,
+      "fixed5": 0.2803442028985507,
+      "fixed5_hits": 619,
+      "fixed5_n": 2208,
+      "rounds": 774,
+      "tokens_per_round": 2.9767441860465116,
+      "active5": 0.15796519410977242
+    },
+    "trials": [
+      {
+        "epoch": 1,
+        "alpha": 0.5,
+        "fixed5": 0.27898550724637683,
+        "fixed5_hits": 616,
+        "fixed5_n": 2208,
+        "rounds": 780,
+        "tokens_per_round": 2.953846153846154,
+        "active5": 0.16710875331564987
+      },
+      {
+        "epoch": 1,
+        "alpha": 1.0,
+        "fixed5": 0.2749094202898551,
+        "fixed5_hits": 607,
+        "fixed5_n": 2208,
+        "rounds": 790,
+        "tokens_per_round": 2.9164556962025316,
+        "active5": 0.1640625
+      },
+      {
+        "epoch": 1,
+        "alpha": 1.5,
+        "fixed5": 0.192481884057971,
+        "fixed5_hits": 425,
+        "fixed5_n": 2208,
+        "rounds": 940,
+        "tokens_per_round": 2.451063829787234,
+        "active5": 0.10451045104510451
+      },
+      {
+        "epoch": 2,
+        "alpha": 0.5,
+        "fixed5": 0.27853260869565216,
+        "fixed5_hits": 615,
+        "fixed5_n": 2208,
+        "rounds": 778,
+        "tokens_per_round": 2.961439588688946,
+        "active5": 0.16600265604249667
+      },
+      {
+        "epoch": 2,
+        "alpha": 1.0,
+        "fixed5": 0.2803442028985507,
+        "fixed5_hits": 619,
+        "fixed5_n": 2208,
+        "rounds": 774,
+        "tokens_per_round": 2.9767441860465116,
+        "active5": 0.15796519410977242
+      },
+      {
+        "epoch": 2,
+        "alpha": 1.5,
+        "fixed5": 0.2151268115942029,
+        "fixed5_hits": 475,
+        "fixed5_n": 2208,
+        "rounds": 879,
+        "tokens_per_round": 2.621160409556314,
+        "active5": 0.12
+      },
+      {
+        "epoch": 4,
+        "alpha": 0.5,
+        "fixed5": 0.27717391304347827,
+        "fixed5_hits": 612,
+        "fixed5_n": 2208,
+        "rounds": 778,
+        "tokens_per_round": 2.961439588688946,
+        "active5": 0.16733067729083664
+      },
+      {
+        "epoch": 4,
+        "alpha": 1.0,
+        "fixed5": 0.27853260869565216,
+        "fixed5_hits": 615,
+        "fixed5_n": 2208,
+        "rounds": 770,
+        "tokens_per_round": 2.9922077922077923,
+        "active5": 0.1639784946236559
+      },
+      {
+        "epoch": 4,
+        "alpha": 1.5,
+        "fixed5": 0.21195652173913043,
+        "fixed5_hits": 468,
+        "fixed5_n": 2208,
+        "rounds": 883,
+        "tokens_per_round": 2.609286523216308,
+        "active5": 0.11475409836065574
+      },
+      {
+        "epoch": 7,
+        "alpha": 0.5,
+        "fixed5": 0.27853260869565216,
+        "fixed5_hits": 615,
+        "fixed5_n": 2208,
+        "rounds": 778,
+        "tokens_per_round": 2.961439588688946,
+        "active5": 0.16710875331564987
+      },
+      {
+        "epoch": 7,
+        "alpha": 1.0,
+        "fixed5": 0.2767210144927536,
+        "fixed5_hits": 611,
+        "fixed5_n": 2208,
+        "rounds": 774,
+        "tokens_per_round": 2.9767441860465116,
+        "active5": 0.1646586345381526
+      },
+      {
+        "epoch": 7,
+        "alpha": 1.5,
+        "fixed5": 0.20199275362318841,
+        "fixed5_hits": 446,
+        "fixed5_n": 2208,
+        "rounds": 891,
+        "tokens_per_round": 2.585858585858586,
+        "active5": 0.11395348837209303
+      },
+      {
+        "epoch": 10,
+        "alpha": 0.5,
+        "fixed5": 0.27717391304347827,
+        "fixed5_hits": 612,
+        "fixed5_n": 2208,
+        "rounds": 779,
+        "tokens_per_round": 2.957637997432606,
+        "active5": 0.16423841059602648
+      },
+      {
+        "epoch": 10,
+        "alpha": 1.0,
+        "fixed5": 0.2726449275362319,
+        "fixed5_hits": 602,
+        "fixed5_n": 2208,
+        "rounds": 780,
+        "tokens_per_round": 2.953846153846154,
+        "active5": 0.16201859229747675
+      },
+      {
+        "epoch": 10,
+        "alpha": 1.5,
+        "fixed5": 0.17798913043478262,
+        "fixed5_hits": 393,
+        "fixed5_n": 2208,
+        "rounds": 944,
+        "tokens_per_round": 2.440677966101695,
+        "active5": 0.09210526315789473
+      },
+      {
+        "epoch": 15,
+        "alpha": 0.5,
+        "fixed5": 0.27807971014492755,
+        "fixed5_hits": 614,
+        "fixed5_n": 2208,
+        "rounds": 776,
+        "tokens_per_round": 2.9690721649484537,
+        "active5": 0.16644474034620507
+      },
+      {
+        "epoch": 15,
+        "alpha": 1.0,
+        "fixed5": 0.27355072463768115,
+        "fixed5_hits": 604,
+        "fixed5_n": 2208,
+        "rounds": 787,
+        "tokens_per_round": 2.9275730622617533,
+        "active5": 0.15921052631578947
+      },
+      {
+        "epoch": 15,
+        "alpha": 1.5,
+        "fixed5": 0.19021739130434784,
+        "fixed5_hits": 420,
+        "fixed5_n": 2208,
+        "rounds": 918,
+        "tokens_per_round": 2.5098039215686274,
+        "active5": 0.10621468926553672
+      },
+      {
+        "epoch": 20,
+        "alpha": 0.5,
+        "fixed5": 0.2776268115942029,
+        "fixed5_hits": 613,
+        "fixed5_n": 2208,
+        "rounds": 777,
+        "tokens_per_round": 2.965250965250965,
+        "active5": 0.16356382978723405
+      },
+      {
+        "epoch": 20,
+        "alpha": 1.0,
+        "fixed5": 0.2617753623188406,
+        "fixed5_hits": 578,
+        "fixed5_n": 2208,
+        "rounds": 799,
+        "tokens_per_round": 2.88360450563204,
+        "active5": 0.15414507772020725
+      },
+      {
+        "epoch": 20,
+        "alpha": 1.5,
+        "fixed5": 0.14855072463768115,
+        "fixed5_hits": 328,
+        "fixed5_n": 2208,
+        "rounds": 997,
+        "tokens_per_round": 2.3109327983951857,
+        "active5": 0.08298755186721991
+      },
+      {
+        "epoch": 25,
+        "alpha": 0.5,
+        "fixed5": 0.27807971014492755,
+        "fixed5_hits": 614,
+        "fixed5_n": 2208,
+        "rounds": 776,
+        "tokens_per_round": 2.9690721649484537,
+        "active5": 0.16511318242343542
+      },
+      {
+        "epoch": 25,
+        "alpha": 1.0,
+        "fixed5": 0.2644927536231884,
+        "fixed5_hits": 584,
+        "fixed5_n": 2208,
+        "rounds": 797,
+        "tokens_per_round": 2.890840652446675,
+        "active5": 0.15454545454545454
+      },
+      {
+        "epoch": 25,
+        "alpha": 1.5,
+        "fixed5": 0.16485507246376813,
+        "fixed5_hits": 364,
+        "fixed5_n": 2208,
+        "rounds": 965,
+        "tokens_per_round": 2.387564766839378,
+        "active5": 0.09120171673819742
+      },
+      {
+        "epoch": 30,
+        "alpha": 0.5,
+        "fixed5": 0.2776268115942029,
+        "fixed5_hits": 613,
+        "fixed5_n": 2208,
+        "rounds": 779,
+        "tokens_per_round": 2.957637997432606,
+        "active5": 0.16201859229747675
+      },
+      {
+        "epoch": 30,
+        "alpha": 1.0,
+        "fixed5": 0.2608695652173913,
+        "fixed5_hits": 576,
+        "fixed5_n": 2208,
+        "rounds": 798,
+        "tokens_per_round": 2.887218045112782,
+        "active5": 0.1504539559014267
+      },
+      {
+        "epoch": 30,
+        "alpha": 1.5,
+        "fixed5": 0.15172101449275363,
+        "fixed5_hits": 335,
+        "fixed5_n": 2208,
+        "rounds": 990,
+        "tokens_per_round": 2.327272727272727,
+        "active5": 0.08350730688935282
+      }
+    ],
+    "seed": 725,
+    "sha256": "7b568caf12ca429ad538653c1e18b15aafe8033626b21f7d7dc36bbf8883be4d"
+  },
+  "correctness_requests": 108,
+  "results": {
+    "plain": {
+      "standard": {
+        "service": {
+          "requests": 15,
+          "tokens": 3840,
+          "rounds": 1050,
+          "drafted": 7278,
+          "accepted": 2772,
+          "accept_pct": 38.0873866446826,
+          "tokens_per_round": 3.657142857142857,
+          "ms_per_round": 26.824893333333332,
+          "decode_tps": 136.33391982954853,
+          "wall_tps": 123.27492178660883
+        },
+        "by_rep": [
+          {
+            "requests": 5,
+            "tokens": 1280,
+            "rounds": 350,
+            "drafted": 2426,
+            "accepted": 924,
+            "accept_pct": 38.0873866446826,
+            "tokens_per_round": 3.657142857142857,
+            "ms_per_round": 27.095977142857144,
+            "decode_tps": 134.96995653123835,
+            "wall_tps": 122.10943746322236
+          },
+          {
+            "requests": 5,
+            "tokens": 1280,
+            "rounds": 350,
+            "drafted": 2426,
+            "accepted": 924,
+            "accept_pct": 38.0873866446826,
+            "tokens_per_round": 3.657142857142857,
+            "ms_per_round": 26.716,
+            "decode_tps": 136.88961136183775,
+            "wall_tps": 123.6572834907446
+          },
+          {
+            "requests": 5,
+            "tokens": 1280,
+            "rounds": 350,
+            "drafted": 2426,
+            "accepted": 924,
+            "accept_pct": 38.0873866446826,
+            "tokens_per_round": 3.657142857142857,
+            "ms_per_round": 26.662702857142857,
+            "decode_tps": 137.1632454795602,
+            "wall_tps": 124.07551659999112
+          }
+        ],
+        "fixed": {
+          "histogram": [
+            221,
+            163,
+            120,
+            85,
+            61,
+            48,
+            48,
+            504
+          ],
+          "eligible": 1250,
+          "first5_hits": 600,
+          "first5_pct": 48.0,
+          "cumulative_percent": [
+            82.32,
+            69.28,
+            59.68,
+            52.88,
+            48.0,
+            44.16,
+            40.32
+          ]
+        },
+        "active": {
+          "histogram": [
+            106,
+            57,
+            41,
+            32,
+            15,
+            15,
+            7,
+            72
+          ],
+          "eligible": 345,
+          "first5_hits": 94,
+          "first5_pct": 27.246376811594203,
+          "cumulative_percent": [
+            69.27536231884058,
+            52.7536231884058,
+            40.869565217391305,
+            31.594202898550726,
+            27.246376811594203,
+            22.89855072463768,
+            20.869565217391305
+          ]
+        },
+        "active_all": {
+          "histogram": [
+            107,
+            59,
+            42,
+            32,
+            16,
+            15,
+            7,
+            72
+          ],
+          "eligible": 350,
+          "first5_hits": 94,
+          "first5_pct": 26.857142857142858,
+          "cumulative_percent": [
+            69.42857142857143,
+            52.57142857142857,
+            40.57142857142857,
+            31.428571428571427,
+            26.857142857142858,
+            22.571428571428573,
+            20.571428571428573
+          ]
+        }
+      },
+      "holdout": {
+        "service": {
+          "requests": 12,
+          "tokens": 3072,
+          "rounds": 927,
+          "drafted": 6459,
+          "accepted": 2124,
+          "accept_pct": 32.88434742220158,
+          "tokens_per_round": 3.313915857605178,
+          "ms_per_round": 27.24269795037756,
+          "decode_tps": 121.64418750453642,
+          "wall_tps": 111.16219537822197
+        },
+        "by_rep": [
+          {
+            "requests": 4,
+            "tokens": 1024,
+            "rounds": 309,
+            "drafted": 2153,
+            "accepted": 708,
+            "accept_pct": 32.88434742220158,
+            "tokens_per_round": 3.313915857605178,
+            "ms_per_round": 27.201407766990293,
+            "decode_tps": 121.8288364334846,
+            "wall_tps": 111.4995737147644
+          },
+          {
+            "requests": 4,
+            "tokens": 1024,
+            "rounds": 309,
+            "drafted": 2153,
+            "accepted": 708,
+            "accept_pct": 32.88434742220158,
+            "tokens_per_round": 3.313915857605178,
+            "ms_per_round": 27.300265372168283,
+            "decode_tps": 121.38767929280297,
+            "wall_tps": 110.73750685152437
+          },
+          {
+            "requests": 4,
+            "tokens": 1024,
+            "rounds": 309,
+            "drafted": 2153,
+            "accepted": 708,
+            "accept_pct": 32.88434742220158,
+            "tokens_per_round": 3.313915857605178,
+            "ms_per_round": 27.22642071197411,
+            "decode_tps": 121.71691213703042,
+            "wall_tps": 111.2522279964889
+          }
+        ],
+        "fixed": {
+          "histogram": [
+            195,
+            162,
+            167,
+            101,
+            62,
+            60,
+            86,
+            167
+          ],
+          "eligible": 1000,
+          "first5_hits": 313,
+          "first5_pct": 31.3,
+          "cumulative_percent": [
+            80.5,
+            64.3,
+            47.6,
+            37.5,
+            31.3,
+            25.3,
+            16.7
+          ]
+        },
+        "active": {
+          "histogram": [
+            95,
+            56,
+            46,
+            27,
+            23,
+            9,
+            17,
+            33
+          ],
+          "eligible": 306,
+          "first5_hits": 59,
+          "first5_pct": 19.281045751633986,
+          "cumulative_percent": [
+            68.95424836601308,
+            50.65359477124183,
+            35.62091503267974,
+            26.797385620915033,
+            19.281045751633986,
+            16.33986928104575,
+            10.784313725490197
+          ]
+        },
+        "active_all": {
+          "histogram": [
+            95,
+            56,
+            47,
+            28,
+            24,
+            9,
+            17,
+            33
+          ],
+          "eligible": 309,
+          "first5_hits": 59,
+          "first5_pct": 19.093851132686083,
+          "cumulative_percent": [
+            69.25566343042071,
+            51.13268608414239,
+            35.922330097087375,
+            26.86084142394822,
+            19.093851132686083,
+            16.181229773462782,
+            10.679611650485437
+          ]
+        }
+      },
+      "all": {
+        "service": {
+          "requests": 27,
+          "tokens": 6912,
+          "rounds": 1977,
+          "drafted": 13737,
+          "accepted": 4896,
+          "accept_pct": 35.64096964402708,
+          "tokens_per_round": 3.496206373292868,
+          "ms_per_round": 27.020798684876073,
+          "decode_tps": 129.38945343794535,
+          "wall_tps": 117.58065076120515
+        },
+        "by_rep": [
+          {
+            "requests": 9,
+            "tokens": 2304,
+            "rounds": 659,
+            "drafted": 4579,
+            "accepted": 1632,
+            "accept_pct": 35.64096964402708,
+            "tokens_per_round": 3.496206373292868,
+            "ms_per_round": 27.145412746585738,
+            "decode_tps": 128.79547664025148,
+            "wall_tps": 117.15477497325222
+          },
+          {
+            "requests": 9,
+            "tokens": 2304,
+            "rounds": 659,
+            "drafted": 4579,
+            "accepted": 1632,
+            "accept_pct": 35.64096964402708,
+            "tokens_per_round": 3.496206373292868,
+            "ms_per_round": 26.989957511380876,
+            "decode_tps": 129.53730556332368,
+            "wall_tps": 117.56132210447782
+          },
+          {
+            "requests": 9,
+            "tokens": 2304,
+            "rounds": 659,
+            "drafted": 4579,
+            "accepted": 1632,
+            "accept_pct": 35.64096964402708,
+            "tokens_per_round": 3.496206373292868,
+            "ms_per_round": 26.92702579666161,
+            "decode_tps": 129.8400499072692,
+            "wall_tps": 118.02911046174628
+          }
+        ],
+        "fixed": {
+          "histogram": [
+            416,
+            325,
+            287,
+            186,
+            123,
+            108,
+            134,
+            671
+          ],
+          "eligible": 2250,
+          "first5_hits": 913,
+          "first5_pct": 40.577777777777776,
+          "cumulative_percent": [
+            81.5111111111111,
+            67.06666666666666,
+            54.31111111111111,
+            46.044444444444444,
+            40.577777777777776,
+            35.77777777777778,
+            29.822222222222223
+          ]
+        },
+        "active": {
+          "histogram": [
+            201,
+            113,
+            87,
+            59,
+            38,
+            24,
+            24,
+            105
+          ],
+          "eligible": 651,
+          "first5_hits": 153,
+          "first5_pct": 23.502304147465438,
+          "cumulative_percent": [
+            69.12442396313364,
+            51.766513056835635,
+            38.40245775729647,
+            29.3394777265745,
+            23.502304147465438,
+            19.81566820276498,
+            16.129032258064516
+          ]
+        },
+        "active_all": {
+          "histogram": [
+            202,
+            115,
+            89,
+            60,
+            40,
+            24,
+            24,
+            105
+          ],
+          "eligible": 659,
+          "first5_hits": 153,
+          "first5_pct": 23.216995447647953,
+          "cumulative_percent": [
+            69.3474962063733,
+            51.89681335356601,
+            38.39150227617603,
+            29.28679817905918,
+            23.216995447647953,
+            19.575113808801213,
+            15.933232169954476
+          ]
+        }
+      },
+      "p1": {
+        "service": {
+          "requests": 3,
+          "tokens": 768,
+          "rounds": 339,
+          "drafted": 2346,
+          "accepted": 426,
+          "accept_pct": 18.15856777493606,
+          "tokens_per_round": 2.265486725663717,
+          "ms_per_round": 26.618362831858406,
+          "decode_tps": 85.10991979387441,
+          "wall_tps": 79.93775774825552
+        },
+        "by_rep": [
+          {
+            "requests": 1,
+            "tokens": 256,
+            "rounds": 113,
+            "drafted": 782,
+            "accepted": 142,
+            "accept_pct": 18.15856777493606,
+            "tokens_per_round": 2.265486725663717,
+            "ms_per_round": 26.87228318584071,
+            "decode_tps": 84.30570301735379,
+            "wall_tps": 79.24097838148263
+          },
+          {
+            "requests": 1,
+            "tokens": 256,
+            "rounds": 113,
+            "drafted": 782,
+            "accepted": 142,
+            "accept_pct": 18.15856777493606,
+            "tokens_per_round": 2.265486725663717,
+            "ms_per_round": 26.509389380530976,
+            "decode_tps": 85.45978532902518,
+            "wall_tps": 80.30899747401965
+          },
+          {
+            "requests": 1,
+            "tokens": 256,
+            "rounds": 113,
+            "drafted": 782,
+            "accepted": 142,
+            "accept_pct": 18.15856777493606,
+            "tokens_per_round": 2.265486725663717,
+            "ms_per_round": 26.47341592920354,
+            "decode_tps": 85.57591252002342,
+            "wall_tps": 80.27253660125602
+          }
+        ],
+        "fixed": {
+          "histogram": [
+            98,
+            64,
+            41,
+            30,
+            11,
+            5,
+            1,
+            0
+          ],
+          "eligible": 250,
+          "first5_hits": 6,
+          "first5_pct": 2.4,
+          "cumulative_percent": [
+            60.8,
+            35.2,
+            18.8,
+            6.8,
+            2.4,
+            0.4,
+            0.0
+          ]
+        },
+        "active": {
+          "histogram": [
+            45,
+            25,
+            18,
+            17,
+            4,
+            1,
+            1,
+            0
+          ],
+          "eligible": 111,
+          "first5_hits": 2,
+          "first5_pct": 1.8018018018018018,
+          "cumulative_percent": [
+            59.45945945945946,
+            36.93693693693694,
+            20.72072072072072,
+            5.405405405405405,
+            1.8018018018018018,
+            0.9009009009009009,
+            0.0
+          ]
+        },
+        "active_all": {
+          "histogram": [
+            45,
+            26,
+            19,
+            17,
+            4,
+            1,
+            1,
+            0
+          ],
+          "eligible": 113,
+          "first5_hits": 2,
+          "first5_pct": 1.7699115044247788,
+          "cumulative_percent": [
+            60.176991150442475,
+            37.16814159292036,
+            20.353982300884955,
+            5.3097345132743365,
+            1.7699115044247788,
+            0.8849557522123894,
+            0.0
+          ]
+        }
+      },
+      "p2": {
+        "service": {
+          "requests": 3,
+          "tokens": 768,
+          "rounds": 135,
+          "drafted": 915,
+          "accepted": 627,
+          "accept_pct": 68.52459016393442,
+          "tokens_per_round": 5.688888888888889,
+          "ms_per_round": 27.175881481481483,
+          "decode_tps": 209.33594712522867,
+          "wall_tps": 180.5858044008545
+        },
+        "by_rep": [
+          {
+            "requests": 1,
+            "tokens": 256,
+            "rounds": 45,
+            "drafted": 305,
+            "accepted": 209,
+            "accept_pct": 68.52459016393442,
+            "tokens_per_round": 5.688888888888889,
+            "ms_per_round": 27.464333333333332,
+            "decode_tps": 207.13733771881917,
+            "wall_tps": 178.58324926259132
+          },
+          {
+            "requests": 1,
+            "tokens": 256,
+            "rounds": 45,
+            "drafted": 305,
+            "accepted": 209,
+            "accept_pct": 68.52459016393442,
+            "tokens_per_round": 5.688888888888889,
+            "ms_per_round": 27.10528888888889,
+            "decode_tps": 209.88113840841228,
+            "wall_tps": 180.7584956534459
+          },
+          {
+            "requests": 1,
+            "tokens": 256,
+            "rounds": 45,
+            "drafted": 305,
+            "accepted": 209,
+            "accept_pct": 68.52459016393442,
+            "tokens_per_round": 5.688888888888889,
+            "ms_per_round": 26.958022222222226,
+            "decode_tps": 211.02768007214507,
+            "wall_tps": 182.4574891657366
+          }
+        ],
+        "fixed": {
+          "histogram": [
+            11,
+            12,
+            13,
+            13,
+            14,
+            15,
+            16,
+            156
+          ],
+          "eligible": 250,
+          "first5_hits": 187,
+          "first5_pct": 74.8,
+          "cumulative_percent": [
+            95.6,
+            90.8,
+            85.6,
+            80.4,
+            74.8,
+            68.8,
+            62.4
+          ]
+        },
+        "active": {
+          "histogram": [
+            4,
+            4,
+            3,
+            2,
+            4,
+            2,
+            2,
+            22
+          ],
+          "eligible": 43,
+          "first5_hits": 26,
+          "first5_pct": 60.46511627906977,
+          "cumulative_percent": [
+            90.69767441860465,
+            81.3953488372093,
+            74.4186046511628,
+            69.76744186046511,
+            60.46511627906977,
+            55.81395348837209,
+            51.16279069767442
+          ]
+        },
+        "active_all": {
+          "histogram": [
+            5,
+            5,
+            3,
+            2,
+            4,
+            2,
+            2,
+            22
+          ],
+          "eligible": 45,
+          "first5_hits": 26,
+          "first5_pct": 57.77777777777778,
+          "cumulative_percent": [
+            88.88888888888889,
+            77.77777777777777,
+            71.11111111111111,
+            66.66666666666667,
+            57.77777777777778,
+            53.333333333333336,
+            48.888888888888886
+          ]
+        }
+      },
+      "p3": {
+        "service": {
+          "requests": 3,
+          "tokens": 768,
+          "rounds": 315,
+          "drafted": 2205,
+          "accepted": 450,
+          "accept_pct": 20.408163265306122,
+          "tokens_per_round": 2.4380952380952383,
+          "ms_per_round": 26.64406031746032,
+          "decode_tps": 91.5061446733594,
+          "wall_tps": 85.48462779580507
+        },
+        "by_rep": [
+          {
+            "requests": 1,
+            "tokens": 256,
+            "rounds": 105,
+            "drafted": 735,
+            "accepted": 150,
+            "accept_pct": 20.408163265306122,
+            "tokens_per_round": 2.4380952380952383,
+            "ms_per_round": 26.925514285714286,
+            "decode_tps": 90.54962561620611,
+            "wall_tps": 84.52003763403249
+          },
+          {
+            "requests": 1,
+            "tokens": 256,
+            "rounds": 105,
+            "drafted": 735,
+            "accepted": 150,
+            "accept_pct": 20.408163265306122,
+            "tokens_per_round": 2.4380952380952383,
+            "ms_per_round": 26.52918095238095,
+            "decode_tps": 91.90239391376397,
+            "wall_tps": 85.95303269456716
+          },
+          {
+            "requests": 1,
+            "tokens": 256,
+            "rounds": 105,
+            "drafted": 735,
+            "accepted": 150,
+            "accept_pct": 20.408163265306122,
+            "tokens_per_round": 2.4380952380952383,
+            "ms_per_round": 26.477485714285713,
+            "decode_tps": 92.08182621281837,
+            "wall_tps": 85.99743195721905
+          }
+        ],
+        "fixed": {
+          "histogram": [
+            79,
+            58,
+            41,
+            19,
+            14,
+            10,
+            8,
+            21
+          ],
+          "eligible": 250,
+          "first5_hits": 39,
+          "first5_pct": 15.6,
+          "cumulative_percent": [
+            68.4,
+            45.2,
+            28.8,
+            21.2,
+            15.6,
+            11.6,
+            8.4
+          ]
+        },
+        "active": {
+          "histogram": [
+            46,
+            21,
+            17,
+            8,
+            2,
+            6,
+            2,
+            3
+          ],
+          "eligible": 105,
+          "first5_hits": 11,
+          "first5_pct": 10.476190476190476,
+          "cumulative_percent": [
+            56.19047619047619,
+            36.19047619047619,
+            20.0,
+            12.380952380952381,
+            10.476190476190476,
+            4.761904761904762,
+            2.857142857142857
+          ]
+        },
+        "active_all": {
+          "histogram": [
+            46,
+            21,
+            17,
+            8,
+            2,
+            6,
+            2,
+            3
+          ],
+          "eligible": 105,
+          "first5_hits": 11,
+          "first5_pct": 10.476190476190476,
+          "cumulative_percent": [
+            56.19047619047619,
+            36.19047619047619,
+            20.0,
+            12.380952380952381,
+            10.476190476190476,
+            4.761904761904762,
+            2.857142857142857
+          ]
+        }
+      },
+      "math": {
+        "service": {
+          "requests": 3,
+          "tokens": 768,
+          "rounds": 129,
+          "drafted": 897,
+          "accepted": 636,
+          "accept_pct": 70.90301003344482,
+          "tokens_per_round": 5.953488372093023,
+          "ms_per_round": 27.203581395348834,
+          "decode_tps": 218.84943329965105,
+          "wall_tps": 185.51622830521487
+        },
+        "by_rep": [
+          {
+            "requests": 1,
+            "tokens": 256,
+            "rounds": 43,
+            "drafted": 299,
+            "accepted": 212,
+            "accept_pct": 70.90301003344482,
+            "tokens_per_round": 5.953488372093023,
+            "ms_per_round": 27.455627906976748,
+            "decode_tps": 216.8403648339138,
+            "wall_tps": 183.81289967102137
+          },
+          {
+            "requests": 1,
+            "tokens": 256,
+            "rounds": 43,
+            "drafted": 299,
+            "accepted": 212,
+            "accept_pct": 70.90301003344482,
+            "tokens_per_round": 5.953488372093023,
+            "ms_per_round": 27.08367441860465,
+            "decode_tps": 219.81834074934014,
+            "wall_tps": 185.62706565872207
+          },
+          {
+            "requests": 1,
+            "tokens": 256,
+            "rounds": 43,
+            "drafted": 299,
+            "accepted": 212,
+            "accept_pct": 70.90301003344482,
+            "tokens_per_round": 5.953488372093023,
+            "ms_per_round": 27.071441860465114,
+            "decode_tps": 219.91766832292163,
+            "wall_tps": 187.13863544035692
+          }
+        ],
+        "fixed": {
+          "histogram": [
+            15,
+            19,
+            18,
+            16,
+            15,
+            14,
+            16,
+            137
+          ],
+          "eligible": 250,
+          "first5_hits": 167,
+          "first5_pct": 66.8,
+          "cumulative_percent": [
+            94.0,
+            86.4,
+            79.2,
+            72.8,
+            66.8,
+            61.2,
+            54.8
+          ]
+        },
+        "active": {
+          "histogram": [
+            5,
+            3,
+            1,
+            2,
+            4,
+            5,
+            1,
+            22
+          ],
+          "eligible": 43,
+          "first5_hits": 28,
+          "first5_pct": 65.11627906976744,
+          "cumulative_percent": [
+            88.37209302325581,
+            81.3953488372093,
+            79.06976744186046,
+            74.4186046511628,
+            65.11627906976744,
+            53.48837209302326,
+            51.16279069767442
+          ]
+        },
+        "active_all": {
+          "histogram": [
+            5,
+            3,
+            1,
+            2,
+            4,
+            5,
+            1,
+            22
+          ],
+          "eligible": 43,
+          "first5_hits": 28,
+          "first5_pct": 65.11627906976744,
+          "cumulative_percent": [
+            88.37209302325581,
+            81.3953488372093,
+            79.06976744186046,
+            74.4186046511628,
+            65.11627906976744,
+            53.48837209302326,
+            51.16279069767442
+          ]
+        }
+      },
+      "json": {
+        "service": {
+          "requests": 3,
+          "tokens": 768,
+          "rounds": 132,
+          "drafted": 915,
+          "accepted": 633,
+          "accept_pct": 69.18032786885246,
+          "tokens_per_round": 5.818181818181818,
+          "ms_per_round": 27.057787878787877,
+          "decode_tps": 215.02799283688,
+          "wall_tps": 184.36205873583964
+        },
+        "by_rep": [
+          {
+            "requests": 1,
+            "tokens": 256,
+            "rounds": 44,
+            "drafted": 305,
+            "accepted": 211,
+            "accept_pct": 69.18032786885246,
+            "tokens_per_round": 5.818181818181818,
+            "ms_per_round": 27.349045454545454,
+            "decode_tps": 212.7380214366797,
+            "wall_tps": 183.29503652174327
+          },
+          {
+            "requests": 1,
+            "tokens": 256,
+            "rounds": 44,
+            "drafted": 305,
+            "accepted": 211,
+            "accept_pct": 69.18032786885246,
+            "tokens_per_round": 5.818181818181818,
+            "ms_per_round": 26.93497727272727,
+            "decode_tps": 216.00841757802252,
+            "wall_tps": 184.20344225586572
+          },
+          {
+            "requests": 1,
+            "tokens": 256,
+            "rounds": 44,
+            "drafted": 305,
+            "accepted": 211,
+            "accept_pct": 69.18032786885246,
+            "tokens_per_round": 5.818181818181818,
+            "ms_per_round": 26.88934090909091,
+            "decode_tps": 216.3750252507964,
+            "wall_tps": 185.6023335609056
+          }
+        ],
+        "fixed": {
+          "histogram": [
+            18,
+            10,
+            7,
+            7,
+            7,
+            4,
+            7,
+            190
+          ],
+          "eligible": 250,
+          "first5_hits": 201,
+          "first5_pct": 80.4,
+          "cumulative_percent": [
+            92.8,
+            88.8,
+            86.0,
+            83.2,
+            80.4,
+            78.8,
+            76.0
+          ]
+        },
+        "active": {
+          "histogram": [
+            6,
+            4,
+            2,
+            3,
+            1,
+            1,
+            1,
+            25
+          ],
+          "eligible": 43,
+          "first5_hits": 27,
+          "first5_pct": 62.7906976744186,
+          "cumulative_percent": [
+            86.04651162790698,
+            76.74418604651163,
+            72.09302325581395,
+            65.11627906976744,
+            62.7906976744186,
+            60.46511627906977,
+            58.13953488372093
+          ]
+        },
+        "active_all": {
+          "histogram": [
+            6,
+            4,
+            2,
+            3,
+            2,
+            1,
+            1,
+            25
+          ],
+          "eligible": 44,
+          "first5_hits": 27,
+          "first5_pct": 61.36363636363637,
+          "cumulative_percent": [
+            86.36363636363636,
+            77.27272727272727,
+            72.72727272727273,
+            65.9090909090909,
+            61.36363636363637,
+            59.09090909090909,
+            56.81818181818182
+          ]
+        }
+      },
+      "zh_dict": {
+        "service": {
+          "requests": 3,
+          "tokens": 768,
+          "rounds": 312,
+          "drafted": 2184,
+          "accepted": 450,
+          "accept_pct": 20.604395604395606,
+          "tokens_per_round": 2.4615384615384617,
+          "ms_per_round": 27.29408974358974,
+          "decode_tps": 90.18576859177271,
+          "wall_tps": 84.41162262016357
+        },
+        "by_rep": [
+          {
+            "requests": 1,
+            "tokens": 256,
+            "rounds": 104,
+            "drafted": 728,
+            "accepted": 150,
+            "accept_pct": 20.604395604395606,
+            "tokens_per_round": 2.4615384615384617,
+            "ms_per_round": 27.064836538461538,
+            "decode_tps": 90.94968883482436,
+            "wall_tps": 85.08032240315687
+          },
+          {
+            "requests": 1,
+            "tokens": 256,
+            "rounds": 104,
+            "drafted": 728,
+            "accepted": 150,
+            "accept_pct": 20.604395604395606,
+            "tokens_per_round": 2.4615384615384617,
+            "ms_per_round": 26.66553846153846,
+            "decode_tps": 92.3115977983684,
+            "wall_tps": 86.14741244857589
+          },
+          {
+            "requests": 1,
+            "tokens": 256,
+            "rounds": 104,
+            "drafted": 728,
+            "accepted": 150,
+            "accept_pct": 20.604395604395606,
+            "tokens_per_round": 2.4615384615384617,
+            "ms_per_round": 28.15189423076923,
+            "decode_tps": 87.43775610125975,
+            "wall_tps": 82.1117789031608
+          }
+        ],
+        "fixed": {
+          "histogram": [
+            85,
+            49,
+            35,
+            19,
+            13,
+            15,
+            12,
+            22
+          ],
+          "eligible": 250,
+          "first5_hits": 49,
+          "first5_pct": 19.6,
+          "cumulative_percent": [
+            66.0,
+            46.4,
+            32.4,
+            24.8,
+            19.6,
+            13.6,
+            8.8
+          ]
+        },
+        "active": {
+          "histogram": [
+            48,
+            25,
+            13,
+            2,
+            5,
+            1,
+            2,
+            8
+          ],
+          "eligible": 104,
+          "first5_hits": 11,
+          "first5_pct": 10.576923076923077,
+          "cumulative_percent": [
+            53.84615384615385,
+            29.807692307692307,
+            17.307692307692307,
+            15.384615384615385,
+            10.576923076923077,
+            9.615384615384615,
+            7.6923076923076925
+          ]
+        },
+        "active_all": {
+          "histogram": [
+            48,
+            25,
+            13,
+            2,
+            5,
+            1,
+            2,
+            8
+          ],
+          "eligible": 104,
+          "first5_hits": 11,
+          "first5_pct": 10.576923076923077,
+          "cumulative_percent": [
+            53.84615384615385,
+            29.807692307692307,
+            17.307692307692307,
+            15.384615384615385,
+            10.576923076923077,
+            9.615384615384615,
+            7.6923076923076925
+          ]
+        }
+      },
+      "en_edit": {
+        "service": {
+          "requests": 3,
+          "tokens": 768,
+          "rounds": 210,
+          "drafted": 1461,
+          "accepted": 552,
+          "accept_pct": 37.782340862423,
+          "tokens_per_round": 3.657142857142857,
+          "ms_per_round": 27.79202857142857,
+          "decode_tps": 131.58963361539435,
+          "wall_tps": 118.84024111671096
+        },
+        "by_rep": [
+          {
+            "requests": 1,
+            "tokens": 256,
+            "rounds": 70,
+            "drafted": 487,
+            "accepted": 184,
+            "accept_pct": 37.782340862423,
+            "tokens_per_round": 3.657142857142857,
+            "ms_per_round": 27.316557142857146,
+            "decode_tps": 133.8800800561041,
+            "wall_tps": 120.95210671291815
+          },
+          {
+            "requests": 1,
+            "tokens": 256,
+            "rounds": 70,
+            "drafted": 487,
+            "accepted": 184,
+            "accept_pct": 37.782340862423,
+            "tokens_per_round": 3.657142857142857,
+            "ms_per_round": 29.251571428571427,
+            "decode_tps": 125.02380824473411,
+            "wall_tps": 113.17419024230196
+          },
+          {
+            "requests": 1,
+            "tokens": 256,
+            "rounds": 70,
+            "drafted": 487,
+            "accepted": 184,
+            "accept_pct": 37.782340862423,
+            "tokens_per_round": 3.657142857142857,
+            "ms_per_round": 26.807957142857145,
+            "decode_tps": 136.4200501237106,
+            "wall_tps": 122.84556195830231
+          }
+        ],
+        "fixed": {
+          "histogram": [
+            46,
+            48,
+            39,
+            30,
+            22,
+            16,
+            12,
+            37
+          ],
+          "eligible": 250,
+          "first5_hits": 65,
+          "first5_pct": 26.0,
+          "cumulative_percent": [
+            81.6,
+            62.4,
+            46.8,
+            34.8,
+            26.0,
+            19.6,
+            14.8
+          ]
+        },
+        "active": {
+          "histogram": [
+            15,
+            14,
+            8,
+            11,
+            7,
+            3,
+            2,
+            9
+          ],
+          "eligible": 69,
+          "first5_hits": 14,
+          "first5_pct": 20.28985507246377,
+          "cumulative_percent": [
+            78.26086956521739,
+            57.971014492753625,
+            46.3768115942029,
+            30.434782608695652,
+            20.28985507246377,
+            15.942028985507246,
+            13.043478260869565
+          ]
+        },
+        "active_all": {
+          "histogram": [
+            15,
+            14,
+            8,
+            12,
+            7,
+            3,
+            2,
+            9
+          ],
+          "eligible": 70,
+          "first5_hits": 14,
+          "first5_pct": 20.0,
+          "cumulative_percent": [
+            78.57142857142857,
+            58.57142857142857,
+            47.142857142857146,
+            30.0,
+            20.0,
+            15.714285714285714,
+            12.857142857142858
+          ]
+        }
+      },
+      "code": {
+        "service": {
+          "requests": 3,
+          "tokens": 768,
+          "rounds": 153,
+          "drafted": 1062,
+          "accepted": 612,
+          "accept_pct": 57.6271186440678,
+          "tokens_per_round": 5.019607843137255,
+          "ms_per_round": 26.956084967320262,
+          "decode_tps": 186.21427589439227,
+          "wall_tps": 163.25026351016132
+        },
+        "by_rep": [
+          {
+            "requests": 1,
+            "tokens": 256,
+            "rounds": 51,
+            "drafted": 354,
+            "accepted": 204,
+            "accept_pct": 57.6271186440678,
+            "tokens_per_round": 5.019607843137255,
+            "ms_per_round": 27.261960784313725,
+            "decode_tps": 184.12497482666362,
+            "wall_tps": 161.87644730631123
+          },
+          {
+            "requests": 1,
+            "tokens": 256,
+            "rounds": 51,
+            "drafted": 354,
+            "accepted": 204,
+            "accept_pct": 57.6271186440678,
+            "tokens_per_round": 5.019607843137255,
+            "ms_per_round": 26.819313725490197,
+            "decode_tps": 187.1639183058741,
+            "wall_tps": 163.66395352599
+          },
+          {
+            "requests": 1,
+            "tokens": 256,
+            "rounds": 51,
+            "drafted": 354,
+            "accepted": 204,
+            "accept_pct": 57.6271186440678,
+            "tokens_per_round": 5.019607843137255,
+            "ms_per_round": 26.786980392156863,
+            "decode_tps": 187.38983527262295,
+            "wall_tps": 164.2289266952586
+          }
+        ],
+        "fixed": {
+          "histogram": [
+            9,
+            18,
+            56,
+            27,
+            8,
+            9,
+            47,
+            76
+          ],
+          "eligible": 250,
+          "first5_hits": 132,
+          "first5_pct": 52.8,
+          "cumulative_percent": [
+            96.4,
+            89.2,
+            66.8,
+            56.0,
+            52.8,
+            49.2,
+            30.4
+          ]
+        },
+        "active": {
+          "histogram": [
+            2,
+            5,
+            12,
+            4,
+            7,
+            0,
+            9,
+            11
+          ],
+          "eligible": 50,
+          "first5_hits": 20,
+          "first5_pct": 40.0,
+          "cumulative_percent": [
+            96.0,
+            86.0,
+            62.0,
+            54.0,
+            40.0,
+            40.0,
+            22.0
+          ]
+        },
+        "active_all": {
+          "histogram": [
+            2,
+            5,
+            12,
+            4,
+            8,
+            0,
+            9,
+            11
+          ],
+          "eligible": 51,
+          "first5_hits": 20,
+          "first5_pct": 39.21568627450981,
+          "cumulative_percent": [
+            96.07843137254902,
+            86.27450980392157,
+            62.745098039215684,
+            54.90196078431372,
+            39.21568627450981,
+            39.21568627450981,
+            21.568627450980394
+          ]
+        }
+      },
+      "zh_json": {
+        "service": {
+          "requests": 3,
+          "tokens": 768,
+          "rounds": 252,
+          "drafted": 1752,
+          "accepted": 510,
+          "accept_pct": 29.10958904109589,
+          "tokens_per_round": 3.0476190476190474,
+          "ms_per_round": 26.895309523809527,
+          "decode_tps": 113.31414665152269,
+          "wall_tps": 104.2043977625656
+        },
+        "by_rep": [
+          {
+            "requests": 1,
+            "tokens": 256,
+            "rounds": 84,
+            "drafted": 584,
+            "accepted": 170,
+            "accept_pct": 29.10958904109589,
+            "tokens_per_round": 3.0476190476190474,
+            "ms_per_round": 27.23777380952381,
+            "decode_tps": 111.88943226165694,
+            "wall_tps": 103.35178840579417
+          },
+          {
+            "requests": 1,
+            "tokens": 256,
+            "rounds": 84,
+            "drafted": 584,
+            "accepted": 170,
+            "accept_pct": 29.10958904109589,
+            "tokens_per_round": 3.0476190476190474,
+            "ms_per_round": 26.75203571428571,
+            "decode_tps": 113.92101446663384,
+            "wall_tps": 104.52129137955579
+          },
+          {
+            "requests": 1,
+            "tokens": 256,
+            "rounds": 84,
+            "drafted": 584,
+            "accepted": 170,
+            "accept_pct": 29.10958904109589,
+            "tokens_per_round": 3.0476190476190474,
+            "ms_per_round": 26.69611904761905,
+            "decode_tps": 114.15962905255535,
+            "wall_tps": 104.75095976358784
+          }
+        ],
+        "fixed": {
+          "histogram": [
+            55,
+            47,
+            37,
+            25,
+            19,
+            20,
+            15,
+            32
+          ],
+          "eligible": 250,
+          "first5_hits": 67,
+          "first5_pct": 26.8,
+          "cumulative_percent": [
+            78.0,
+            59.2,
+            44.4,
+            34.4,
+            26.8,
+            18.8,
+            12.8
+          ]
+        },
+        "active": {
+          "histogram": [
+            30,
+            12,
+            13,
+            10,
+            4,
+            5,
+            4,
+            5
+          ],
+          "eligible": 83,
+          "first5_hits": 14,
+          "first5_pct": 16.867469879518072,
+          "cumulative_percent": [
+            63.855421686746986,
+            49.397590361445786,
+            33.734939759036145,
+            21.686746987951807,
+            16.867469879518072,
+            10.843373493975903,
+            6.024096385542169
+          ]
+        },
+        "active_all": {
+          "histogram": [
+            30,
+            12,
+            14,
+            10,
+            4,
+            5,
+            4,
+            5
+          ],
+          "eligible": 84,
+          "first5_hits": 14,
+          "first5_pct": 16.666666666666668,
+          "cumulative_percent": [
+            64.28571428571429,
+            50.0,
+            33.333333333333336,
+            21.428571428571427,
+            16.666666666666668,
+            10.714285714285714,
+            5.9523809523809526
+          ]
+        }
+      }
+    },
+    "manual": {
+      "standard": {
+        "service": {
+          "requests": 15,
+          "tokens": 3840,
+          "rounds": 987,
+          "drafted": 6843,
+          "accepted": 2832,
+          "accept_pct": 41.385357299430076,
+          "tokens_per_round": 3.8905775075987843,
+          "ms_per_round": 27.353920972644378,
+          "decode_tps": 142.2310721556008,
+          "wall_tps": 128.04789807078436
+        },
+        "by_rep": [
+          {
+            "requests": 5,
+            "tokens": 1280,
+            "rounds": 329,
+            "drafted": 2281,
+            "accepted": 944,
+            "accept_pct": 41.385357299430076,
+            "tokens_per_round": 3.8905775075987843,
+            "ms_per_round": 27.300364741641335,
+            "decode_tps": 142.510092609293,
+            "wall_tps": 128.02783942300664
+          },
+          {
+            "requests": 5,
+            "tokens": 1280,
+            "rounds": 329,
+            "drafted": 2281,
+            "accepted": 944,
+            "accept_pct": 41.385357299430076,
+            "tokens_per_round": 3.8905775075987843,
+            "ms_per_round": 27.800960486322186,
+            "decode_tps": 139.94399616203592,
+            "wall_tps": 126.31067394569432
+          },
+          {
+            "requests": 5,
+            "tokens": 1280,
+            "rounds": 329,
+            "drafted": 2281,
+            "accepted": 944,
+            "accept_pct": 41.385357299430076,
+            "tokens_per_round": 3.8905775075987843,
+            "ms_per_round": 26.960437689969606,
+            "decode_tps": 144.30691194031465,
+            "wall_tps": 129.854203205388
+          }
+        ],
+        "fixed": {
+          "histogram": [
+            209,
+            152,
+            118,
+            80,
+            69,
+            43,
+            46,
+            533
+          ],
+          "eligible": 1250,
+          "first5_hits": 622,
+          "first5_pct": 49.76,
+          "cumulative_percent": [
+            83.28,
+            71.12,
+            61.68,
+            55.28,
+            49.76,
+            46.32,
+            42.64
+          ]
+        },
+        "active": {
+          "histogram": [
+            88,
+            56,
+            34,
+            29,
+            19,
+            14,
+            7,
+            77
+          ],
+          "eligible": 324,
+          "first5_hits": 98,
+          "first5_pct": 30.246913580246915,
+          "cumulative_percent": [
+            72.8395061728395,
+            55.55555555555556,
+            45.06172839506173,
+            36.111111111111114,
+            30.246913580246915,
+            25.925925925925927,
+            23.765432098765434
+          ]
+        },
+        "active_all": {
+          "histogram": [
+            89,
+            58,
+            36,
+            29,
+            19,
+            14,
+            7,
+            77
+          ],
+          "eligible": 329,
+          "first5_hits": 98,
+          "first5_pct": 29.78723404255319,
+          "cumulative_percent": [
+            72.94832826747721,
+            55.319148936170215,
+            44.37689969604863,
+            35.56231003039514,
+            29.78723404255319,
+            25.53191489361702,
+            23.404255319148938
+          ]
+        }
+      },
+      "holdout": {
+        "service": {
+          "requests": 12,
+          "tokens": 3072,
+          "rounds": 873,
+          "drafted": 6081,
+          "accepted": 2178,
+          "accept_pct": 35.81647755303404,
+          "tokens_per_round": 3.5189003436426116,
+          "ms_per_round": 27.084978235967927,
+          "decode_tps": 129.9207373543181,
+          "wall_tps": 117.89969522242066
+        },
+        "by_rep": [
+          {
+            "requests": 4,
+            "tokens": 1024,
+            "rounds": 291,
+            "drafted": 2027,
+            "accepted": 726,
+            "accept_pct": 35.81647755303404,
+            "tokens_per_round": 3.5189003436426116,
+            "ms_per_round": 27.202800687285222,
+            "decode_tps": 129.35801662831616,
+            "wall_tps": 117.52724537383878
+          },
+          {
+            "requests": 4,
+            "tokens": 1024,
+            "rounds": 291,
+            "drafted": 2027,
+            "accepted": 726,
+            "accept_pct": 35.81647755303404,
+            "tokens_per_round": 3.5189003436426116,
+            "ms_per_round": 27.064305841924398,
+            "decode_tps": 130.01997406457042,
+            "wall_tps": 117.99966226863019
+          },
+          {
+            "requests": 4,
+            "tokens": 1024,
+            "rounds": 291,
+            "drafted": 2027,
+            "accepted": 726,
+            "accept_pct": 35.81647755303404,
+            "tokens_per_round": 3.5189003436426116,
+            "ms_per_round": 26.98782817869416,
+            "decode_tps": 130.38842252673916,
+            "wall_tps": 118.17408011370337
+          }
+        ],
+        "fixed": {
+          "histogram": [
+            184,
+            154,
+            138,
+            78,
+            62,
+            66,
+            79,
+            239
+          ],
+          "eligible": 1000,
+          "first5_hits": 384,
+          "first5_pct": 38.4,
+          "cumulative_percent": [
+            81.6,
+            66.2,
+            52.4,
+            44.6,
+            38.4,
+            31.8,
+            23.9
+          ]
+        },
+        "active": {
+          "histogram": [
+            88,
+            49,
+            36,
+            26,
+            19,
+            9,
+            26,
+            35
+          ],
+          "eligible": 288,
+          "first5_hits": 70,
+          "first5_pct": 24.305555555555557,
+          "cumulative_percent": [
+            69.44444444444444,
+            52.43055555555556,
+            39.93055555555556,
+            30.90277777777778,
+            24.305555555555557,
+            21.180555555555557,
+            12.152777777777779
+          ]
+        },
+        "active_all": {
+          "histogram": [
+            89,
+            49,
+            37,
+            27,
+            19,
+            9,
+            26,
+            35
+          ],
+          "eligible": 291,
+          "first5_hits": 70,
+          "first5_pct": 24.054982817869416,
+          "cumulative_percent": [
+            69.41580756013745,
+            52.577319587628864,
+            39.86254295532646,
+            30.584192439862544,
+            24.054982817869416,
+            20.962199312714777,
+            12.027491408934708
+          ]
+        }
+      },
+      "all": {
+        "service": {
+          "requests": 27,
+          "tokens": 6912,
+          "rounds": 1860,
+          "drafted": 12924,
+          "accepted": 5010,
+          "accept_pct": 38.765088207985144,
+          "tokens_per_round": 3.7161290322580647,
+          "ms_per_round": 27.227691397849462,
+          "decode_tps": 136.483441726961,
+          "wall_tps": 123.32985229291236
+        },
+        "by_rep": [
+          {
+            "requests": 9,
+            "tokens": 2304,
+            "rounds": 620,
+            "drafted": 4308,
+            "accepted": 1670,
+            "accept_pct": 38.765088207985144,
+            "tokens_per_round": 3.7161290322580647,
+            "ms_per_round": 27.25457258064516,
+            "decode_tps": 136.3488281191052,
+            "wall_tps": 123.13810513253517
+          },
+          {
+            "requests": 9,
+            "tokens": 2304,
+            "rounds": 620,
+            "drafted": 4308,
+            "accepted": 1670,
+            "accept_pct": 38.765088207985144,
+            "tokens_per_round": 3.7161290322580647,
+            "ms_per_round": 27.45520806451613,
+            "decode_tps": 135.35242652416437,
+            "wall_tps": 122.47674340704418
+          },
+          {
+            "requests": 9,
+            "tokens": 2304,
+            "rounds": 620,
+            "drafted": 4308,
+            "accepted": 1670,
+            "accept_pct": 38.765088207985144,
+            "tokens_per_round": 3.7161290322580647,
+            "ms_per_round": 26.973293548387094,
+            "decode_tps": 137.77068141833482,
+            "wall_tps": 124.3899843650015
+          }
+        ],
+        "fixed": {
+          "histogram": [
+            393,
+            306,
+            256,
+            158,
+            131,
+            109,
+            125,
+            772
+          ],
+          "eligible": 2250,
+          "first5_hits": 1006,
+          "first5_pct": 44.71111111111111,
+          "cumulative_percent": [
+            82.53333333333333,
+            68.93333333333334,
+            57.55555555555556,
+            50.53333333333333,
+            44.71111111111111,
+            39.86666666666667,
+            34.31111111111111
+          ]
+        },
+        "active": {
+          "histogram": [
+            176,
+            105,
+            70,
+            55,
+            38,
+            23,
+            33,
+            112
+          ],
+          "eligible": 612,
+          "first5_hits": 168,
+          "first5_pct": 27.45098039215686,
+          "cumulative_percent": [
+            71.24183006535948,
+            54.08496732026144,
+            42.64705882352941,
+            33.66013071895425,
+            27.45098039215686,
+            23.69281045751634,
+            18.30065359477124
+          ]
+        },
+        "active_all": {
+          "histogram": [
+            178,
+            107,
+            73,
+            56,
+            38,
+            23,
+            33,
+            112
+          ],
+          "eligible": 620,
+          "first5_hits": 168,
+          "first5_pct": 27.096774193548388,
+          "cumulative_percent": [
+            71.29032258064517,
+            54.03225806451613,
+            42.25806451612903,
+            33.225806451612904,
+            27.096774193548388,
+            23.387096774193548,
+            18.06451612903226
+          ]
+        }
+      },
+      "p1": {
+        "service": {
+          "requests": 3,
+          "tokens": 768,
+          "rounds": 327,
+          "drafted": 2250,
+          "accepted": 438,
+          "accept_pct": 19.466666666666665,
+          "tokens_per_round": 2.3486238532110093,
+          "ms_per_round": 26.722538226299694,
+          "decode_tps": 87.88925038937913,
+          "wall_tps": 82.44188661046175
+        },
+        "by_rep": [
+          {
+            "requests": 1,
+            "tokens": 256,
+            "rounds": 109,
+            "drafted": 750,
+            "accepted": 146,
+            "accept_pct": 19.466666666666665,
+            "tokens_per_round": 2.3486238532110093,
+            "ms_per_round": 26.789064220183484,
+            "decode_tps": 87.67099268221183,
+            "wall_tps": 82.18652492888955
+          },
+          {
+            "requests": 1,
+            "tokens": 256,
+            "rounds": 109,
+            "drafted": 750,
+            "accepted": 146,
+            "accept_pct": 19.466666666666665,
+            "tokens_per_round": 2.3486238532110093,
+            "ms_per_round": 26.693394495412843,
+            "decode_tps": 87.98520748699126,
+            "wall_tps": 82.60820062150884
+          },
+          {
+            "requests": 1,
+            "tokens": 256,
+            "rounds": 109,
+            "drafted": 750,
+            "accepted": 146,
+            "accept_pct": 19.466666666666665,
+            "tokens_per_round": 2.3486238532110093,
+            "ms_per_round": 26.68515596330275,
+            "decode_tps": 88.01237123893227,
+            "wall_tps": 82.53216129642965
+          }
+        ],
+        "fixed": {
+          "histogram": [
+            94,
+            67,
+            46,
+            24,
+            12,
+            4,
+            3,
+            0
+          ],
+          "eligible": 250,
+          "first5_hits": 7,
+          "first5_pct": 2.8,
+          "cumulative_percent": [
+            62.4,
+            35.6,
+            17.2,
+            7.6,
+            2.8,
+            1.2,
+            0.0
+          ]
+        },
+        "active": {
+          "histogram": [
+            37,
+            29,
+            19,
+            12,
+            6,
+            1,
+            2,
+            0
+          ],
+          "eligible": 106,
+          "first5_hits": 3,
+          "first5_pct": 2.830188679245283,
+          "cumulative_percent": [
+            65.09433962264151,
+            37.735849056603776,
+            19.81132075471698,
+            8.49056603773585,
+            2.830188679245283,
+            1.8867924528301887,
+            0.0
+          ]
+        },
+        "active_all": {
+          "histogram": [
+            38,
+            31,
+            19,
+            12,
+            6,
+            1,
+            2,
+            0
+          ],
+          "eligible": 109,
+          "first5_hits": 3,
+          "first5_pct": 2.7522935779816513,
+          "cumulative_percent": [
+            65.13761467889908,
+            36.69724770642202,
+            19.26605504587156,
+            8.256880733944953,
+            2.7522935779816513,
+            1.834862385321101,
+            0.0
+          ]
+        }
+      },
+      "p2": {
+        "service": {
+          "requests": 3,
+          "tokens": 768,
+          "rounds": 129,
+          "drafted": 891,
+          "accepted": 633,
+          "accept_pct": 71.04377104377105,
+          "tokens_per_round": 5.953488372093023,
+          "ms_per_round": 27.468945736434108,
+          "decode_tps": 216.7352336422751,
+          "wall_tps": 185.8650592419729
+        },
+        "by_rep": [
+          {
+            "requests": 1,
+            "tokens": 256,
+            "rounds": 43,
+            "drafted": 297,
+            "accepted": 211,
+            "accept_pct": 71.04377104377105,
+            "tokens_per_round": 5.953488372093023,
+            "ms_per_round": 27.583767441860466,
+            "decode_tps": 215.83303965426242,
+            "wall_tps": 184.85236574529057
+          },
+          {
+            "requests": 1,
+            "tokens": 256,
+            "rounds": 43,
+            "drafted": 297,
+            "accepted": 211,
+            "accept_pct": 71.04377104377105,
+            "tokens_per_round": 5.953488372093023,
+            "ms_per_round": 27.443837209302327,
+            "decode_tps": 216.93352597482385,
+            "wall_tps": 186.6944365689393
+          },
+          {
+            "requests": 1,
+            "tokens": 256,
+            "rounds": 43,
+            "drafted": 297,
+            "accepted": 211,
+            "accept_pct": 71.04377104377105,
+            "tokens_per_round": 5.953488372093023,
+            "ms_per_round": 27.379232558139535,
+            "decode_tps": 217.44540718775986,
+            "wall_tps": 186.05780747396622
+          }
+        ],
+        "fixed": {
+          "histogram": [
+            9,
+            12,
+            11,
+            9,
+            15,
+            15,
+            15,
+            164
+          ],
+          "eligible": 250,
+          "first5_hits": 194,
+          "first5_pct": 77.6,
+          "cumulative_percent": [
+            96.4,
+            91.6,
+            87.2,
+            83.6,
+            77.6,
+            71.6,
+            65.6
+          ]
+        },
+        "active": {
+          "histogram": [
+            4,
+            4,
+            2,
+            2,
+            3,
+            2,
+            2,
+            23
+          ],
+          "eligible": 42,
+          "first5_hits": 27,
+          "first5_pct": 64.28571428571429,
+          "cumulative_percent": [
+            90.47619047619048,
+            80.95238095238095,
+            76.19047619047619,
+            71.42857142857143,
+            64.28571428571429,
+            59.523809523809526,
+            54.76190476190476
+          ]
+        },
+        "active_all": {
+          "histogram": [
+            4,
+            4,
+            3,
+            2,
+            3,
+            2,
+            2,
+            23
+          ],
+          "eligible": 43,
+          "first5_hits": 27,
+          "first5_pct": 62.7906976744186,
+          "cumulative_percent": [
+            90.69767441860465,
+            81.3953488372093,
+            74.4186046511628,
+            69.76744186046511,
+            62.7906976744186,
+            58.13953488372093,
+            53.48837209302326
+          ]
+        }
+      },
+      "p3": {
+        "service": {
+          "requests": 3,
+          "tokens": 768,
+          "rounds": 285,
+          "drafted": 1995,
+          "accepted": 480,
+          "accept_pct": 24.06015037593985,
+          "tokens_per_round": 2.694736842105263,
+          "ms_per_round": 27.77298596491228,
+          "decode_tps": 97.02726402950438,
+          "wall_tps": 90.34186560628346
+        },
+        "by_rep": [
+          {
+            "requests": 1,
+            "tokens": 256,
+            "rounds": 95,
+            "drafted": 665,
+            "accepted": 160,
+            "accept_pct": 24.06015037593985,
+            "tokens_per_round": 2.694736842105263,
+            "ms_per_round": 26.94533684210526,
+            "decode_tps": 100.00753963091749,
+            "wall_tps": 92.6833196706738
+          },
+          {
+            "requests": 1,
+            "tokens": 256,
+            "rounds": 95,
+            "drafted": 665,
+            "accepted": 160,
+            "accept_pct": 24.06015037593985,
+            "tokens_per_round": 2.694736842105263,
+            "ms_per_round": 29.609947368421054,
+            "decode_tps": 91.00782276226516,
+            "wall_tps": 85.25945431220019
+          },
+          {
+            "requests": 1,
+            "tokens": 256,
+            "rounds": 95,
+            "drafted": 665,
+            "accepted": 160,
+            "accept_pct": 24.06015037593985,
+            "tokens_per_round": 2.694736842105263,
+            "ms_per_round": 26.763673684210527,
+            "decode_tps": 100.68635845366205,
+            "wall_tps": 93.5553193312837
+          }
+        ],
+        "fixed": {
+          "histogram": [
+            79,
+            49,
+            41,
+            23,
+            15,
+            10,
+            9,
+            24
+          ],
+          "eligible": 250,
+          "first5_hits": 43,
+          "first5_pct": 17.2,
+          "cumulative_percent": [
+            68.4,
+            48.8,
+            32.4,
+            23.2,
+            17.2,
+            13.2,
+            9.6
+          ]
+        },
+        "active": {
+          "histogram": [
+            39,
+            19,
+            11,
+            9,
+            4,
+            6,
+            3,
+            4
+          ],
+          "eligible": 95,
+          "first5_hits": 13,
+          "first5_pct": 13.68421052631579,
+          "cumulative_percent": [
+            58.94736842105263,
+            38.94736842105263,
+            27.36842105263158,
+            17.894736842105264,
+            13.68421052631579,
+            7.368421052631579,
+            4.2105263157894735
+          ]
+        },
+        "active_all": {
+          "histogram": [
+            39,
+            19,
+            11,
+            9,
+            4,
+            6,
+            3,
+            4
+          ],
+          "eligible": 95,
+          "first5_hits": 13,
+          "first5_pct": 13.68421052631579,
+          "cumulative_percent": [
+            58.94736842105263,
+            38.94736842105263,
+            27.36842105263158,
+            17.894736842105264,
+            13.68421052631579,
+            7.368421052631579,
+            4.2105263157894735
+          ]
+        }
+      },
+      "math": {
+        "service": {
+          "requests": 3,
+          "tokens": 768,
+          "rounds": 129,
+          "drafted": 888,
+          "accepted": 636,
+          "accept_pct": 71.62162162162163,
+          "tokens_per_round": 5.953488372093023,
+          "ms_per_round": 27.618596899224805,
+          "decode_tps": 215.5608553836464,
+          "wall_tps": 182.70945966056394
+        },
+        "by_rep": [
+          {
+            "requests": 1,
+            "tokens": 256,
+            "rounds": 43,
+            "drafted": 296,
+            "accepted": 212,
+            "accept_pct": 71.62162162162163,
+            "tokens_per_round": 5.953488372093023,
+            "ms_per_round": 28.629023255813955,
+            "decode_tps": 207.95289866845158,
+            "wall_tps": 176.4017029940326
+          },
+          {
+            "requests": 1,
+            "tokens": 256,
+            "rounds": 43,
+            "drafted": 296,
+            "accepted": 212,
+            "accept_pct": 71.62162162162163,
+            "tokens_per_round": 5.953488372093023,
+            "ms_per_round": 27.130023255813953,
+            "decode_tps": 219.44280386185048,
+            "wall_tps": 185.62055370973027
+          },
+          {
+            "requests": 1,
+            "tokens": 256,
+            "rounds": 43,
+            "drafted": 296,
+            "accepted": 212,
+            "accept_pct": 71.62162162162163,
+            "tokens_per_round": 5.953488372093023,
+            "ms_per_round": 27.096744186046514,
+            "decode_tps": 219.71231418860927,
+            "wall_tps": 186.4524697462056
+          }
+        ],
+        "fixed": {
+          "histogram": [
+            16,
+            17,
+            14,
+            16,
+            22,
+            11,
+            15,
+            139
+          ],
+          "eligible": 250,
+          "first5_hits": 165,
+          "first5_pct": 66.0,
+          "cumulative_percent": [
+            93.6,
+            86.8,
+            81.2,
+            74.8,
+            66.0,
+            61.6,
+            55.6
+          ]
+        },
+        "active": {
+          "histogram": [
+            5,
+            2,
+            0,
+            3,
+            5,
+            5,
+            0,
+            22
+          ],
+          "eligible": 42,
+          "first5_hits": 27,
+          "first5_pct": 64.28571428571429,
+          "cumulative_percent": [
+            88.0952380952381,
+            83.33333333333333,
+            83.33333333333333,
+            76.19047619047619,
+            64.28571428571429,
+            52.38095238095238,
+            52.38095238095238
+          ]
+        },
+        "active_all": {
+          "histogram": [
+            5,
+            2,
+            1,
+            3,
+            5,
+            5,
+            0,
+            22
+          ],
+          "eligible": 43,
+          "first5_hits": 27,
+          "first5_pct": 62.7906976744186,
+          "cumulative_percent": [
+            88.37209302325581,
+            83.72093023255815,
+            81.3953488372093,
+            74.4186046511628,
+            62.7906976744186,
+            51.16279069767442,
+            51.16279069767442
+          ]
+        }
+      },
+      "json": {
+        "service": {
+          "requests": 3,
+          "tokens": 768,
+          "rounds": 117,
+          "drafted": 819,
+          "accepted": 645,
+          "accept_pct": 78.75457875457876,
+          "tokens_per_round": 6.564102564102564,
+          "ms_per_round": 27.679111111111112,
+          "decode_tps": 237.15004928274462,
+          "wall_tps": 200.17419920254568
+        },
+        "by_rep": [
+          {
+            "requests": 1,
+            "tokens": 256,
+            "rounds": 39,
+            "drafted": 273,
+            "accepted": 215,
+            "accept_pct": 78.75457875457876,
+            "tokens_per_round": 6.564102564102564,
+            "ms_per_round": 27.816794871794873,
+            "decode_tps": 235.97623645556317,
+            "wall_tps": 199.26148742872073
+          },
+          {
+            "requests": 1,
+            "tokens": 256,
+            "rounds": 39,
+            "drafted": 273,
+            "accepted": 215,
+            "accept_pct": 78.75457875457876,
+            "tokens_per_round": 6.564102564102564,
+            "ms_per_round": 27.62346153846154,
+            "decode_tps": 237.6278061662559,
+            "wall_tps": 199.71976229215468
+          },
+          {
+            "requests": 1,
+            "tokens": 256,
+            "rounds": 39,
+            "drafted": 273,
+            "accepted": 215,
+            "accept_pct": 78.75457875457876,
+            "tokens_per_round": 6.564102564102564,
+            "ms_per_round": 27.597076923076923,
+            "decode_tps": 237.8549939328394,
+            "wall_tps": 201.55603621217432
+          }
+        ],
+        "fixed": {
+          "histogram": [
+            11,
+            7,
+            6,
+            8,
+            5,
+            3,
+            4,
+            206
+          ],
+          "eligible": 250,
+          "first5_hits": 213,
+          "first5_pct": 85.2,
+          "cumulative_percent": [
+            95.6,
+            92.8,
+            90.4,
+            87.2,
+            85.2,
+            84.0,
+            82.4
+          ]
+        },
+        "active": {
+          "histogram": [
+            3,
+            2,
+            2,
+            3,
+            1,
+            0,
+            0,
+            28
+          ],
+          "eligible": 39,
+          "first5_hits": 28,
+          "first5_pct": 71.7948717948718,
+          "cumulative_percent": [
+            92.3076923076923,
+            87.17948717948718,
+            82.05128205128206,
+            74.35897435897436,
+            71.7948717948718,
+            71.7948717948718,
+            71.7948717948718
+          ]
+        },
+        "active_all": {
+          "histogram": [
+            3,
+            2,
+            2,
+            3,
+            1,
+            0,
+            0,
+            28
+          ],
+          "eligible": 39,
+          "first5_hits": 28,
+          "first5_pct": 71.7948717948718,
+          "cumulative_percent": [
+            92.3076923076923,
+            87.17948717948718,
+            82.05128205128206,
+            74.35897435897436,
+            71.7948717948718,
+            71.7948717948718,
+            71.7948717948718
+          ]
+        }
+      },
+      "zh_dict": {
+        "service": {
+          "requests": 3,
+          "tokens": 768,
+          "rounds": 297,
+          "drafted": 2079,
+          "accepted": 465,
+          "accept_pct": 22.366522366522368,
+          "tokens_per_round": 2.585858585858586,
+          "ms_per_round": 26.993329966329966,
+          "decode_tps": 95.79620554722398,
+          "wall_tps": 89.23706225125811
+        },
+        "by_rep": [
+          {
+            "requests": 1,
+            "tokens": 256,
+            "rounds": 99,
+            "drafted": 693,
+            "accepted": 155,
+            "accept_pct": 22.366522366522368,
+            "tokens_per_round": 2.585858585858586,
+            "ms_per_round": 27.091191919191917,
+            "decode_tps": 95.45015935702388,
+            "wall_tps": 88.97626933109595
+          },
+          {
+            "requests": 1,
+            "tokens": 256,
+            "rounds": 99,
+            "drafted": 693,
+            "accepted": 155,
+            "accept_pct": 22.366522366522368,
+            "tokens_per_round": 2.585858585858586,
+            "ms_per_round": 26.95420202020202,
+            "decode_tps": 95.93526767813418,
+            "wall_tps": 89.14929962190747
+          },
+          {
+            "requests": 1,
+            "tokens": 256,
+            "rounds": 99,
+            "drafted": 693,
+            "accepted": 155,
+            "accept_pct": 22.366522366522368,
+            "tokens_per_round": 2.585858585858586,
+            "ms_per_round": 26.93459595959596,
+            "decode_tps": 96.00510027095189,
+            "wall_tps": 89.58784206548637
+          }
+        ],
+        "fixed": {
+          "histogram": [
+            80,
+            49,
+            37,
+            21,
+            14,
+            13,
+            11,
+            25
+          ],
+          "eligible": 250,
+          "first5_hits": 49,
+          "first5_pct": 19.6,
+          "cumulative_percent": [
+            68.0,
+            48.4,
+            33.6,
+            25.2,
+            19.6,
+            14.4,
+            10.0
+          ]
+        },
+        "active": {
+          "histogram": [
+            44,
+            22,
+            13,
+            4,
+            4,
+            1,
+            3,
+            8
+          ],
+          "eligible": 99,
+          "first5_hits": 12,
+          "first5_pct": 12.121212121212121,
+          "cumulative_percent": [
+            55.55555555555556,
+            33.333333333333336,
+            20.2020202020202,
+            16.161616161616163,
+            12.121212121212121,
+            11.11111111111111,
+            8.080808080808081
+          ]
+        },
+        "active_all": {
+          "histogram": [
+            44,
+            22,
+            13,
+            4,
+            4,
+            1,
+            3,
+            8
+          ],
+          "eligible": 99,
+          "first5_hits": 12,
+          "first5_pct": 12.121212121212121,
+          "cumulative_percent": [
+            55.55555555555556,
+            33.333333333333336,
+            20.2020202020202,
+            16.161616161616163,
+            12.121212121212121,
+            11.11111111111111,
+            8.080808080808081
+          ]
+        }
+      },
+      "en_edit": {
+        "service": {
+          "requests": 3,
+          "tokens": 768,
+          "rounds": 201,
+          "drafted": 1398,
+          "accepted": 561,
+          "accept_pct": 40.128755364806864,
+          "tokens_per_round": 3.8208955223880596,
+          "ms_per_round": 27.18660696517413,
+          "decode_tps": 140.54330234304717,
+          "wall_tps": 126.05328337394296
+        },
+        "by_rep": [
+          {
+            "requests": 1,
+            "tokens": 256,
+            "rounds": 67,
+            "drafted": 466,
+            "accepted": 187,
+            "accept_pct": 40.128755364806864,
+            "tokens_per_round": 3.8208955223880596,
+            "ms_per_round": 27.31694029850746,
+            "decode_tps": 139.8727485814663,
+            "wall_tps": 125.34657490047216
+          },
+          {
+            "requests": 1,
+            "tokens": 256,
+            "rounds": 67,
+            "drafted": 466,
+            "accepted": 187,
+            "accept_pct": 40.128755364806864,
+            "tokens_per_round": 3.8208955223880596,
+            "ms_per_round": 27.17879104477612,
+            "decode_tps": 140.583718977539,
+            "wall_tps": 126.3067787612375
+          },
+          {
+            "requests": 1,
+            "tokens": 256,
+            "rounds": 67,
+            "drafted": 466,
+            "accepted": 187,
+            "accept_pct": 40.128755364806864,
+            "tokens_per_round": 3.8208955223880596,
+            "ms_per_round": 27.06408955223881,
+            "decode_tps": 141.1795329383983,
+            "wall_tps": 126.51265768133865
+          }
+        ],
+        "fixed": {
+          "histogram": [
+            38,
+            50,
+            40,
+            31,
+            21,
+            15,
+            14,
+            41
+          ],
+          "eligible": 250,
+          "first5_hits": 70,
+          "first5_pct": 28.0,
+          "cumulative_percent": [
+            84.8,
+            64.8,
+            48.8,
+            36.4,
+            28.0,
+            22.0,
+            16.4
+          ]
+        },
+        "active": {
+          "histogram": [
+            11,
+            13,
+            8,
+            14,
+            6,
+            2,
+            5,
+            7
+          ],
+          "eligible": 66,
+          "first5_hits": 14,
+          "first5_pct": 21.21212121212121,
+          "cumulative_percent": [
+            83.33333333333333,
+            63.63636363636363,
+            51.515151515151516,
+            30.303030303030305,
+            21.21212121212121,
+            18.181818181818183,
+            10.606060606060606
+          ]
+        },
+        "active_all": {
+          "histogram": [
+            11,
+            13,
+            8,
+            15,
+            6,
+            2,
+            5,
+            7
+          ],
+          "eligible": 67,
+          "first5_hits": 14,
+          "first5_pct": 20.895522388059703,
+          "cumulative_percent": [
+            83.58208955223881,
+            64.17910447761194,
+            52.23880597014925,
+            29.850746268656717,
+            20.895522388059703,
+            17.91044776119403,
+            10.447761194029852
+          ]
+        }
+      },
+      "code": {
+        "service": {
+          "requests": 3,
+          "tokens": 768,
+          "rounds": 126,
+          "drafted": 882,
+          "accepted": 639,
+          "accept_pct": 72.44897959183673,
+          "tokens_per_round": 6.095238095238095,
+          "ms_per_round": 27.254468253968255,
+          "decode_tps": 223.6417910795463,
+          "wall_tps": 190.53763346722008
+        },
+        "by_rep": [
+          {
+            "requests": 1,
+            "tokens": 256,
+            "rounds": 42,
+            "drafted": 294,
+            "accepted": 213,
+            "accept_pct": 72.44897959183673,
+            "tokens_per_round": 6.095238095238095,
+            "ms_per_round": 27.388285714285715,
+            "decode_tps": 222.54909119992212,
+            "wall_tps": 190.49620518541306
+          },
+          {
+            "requests": 1,
+            "tokens": 256,
+            "rounds": 42,
+            "drafted": 294,
+            "accepted": 213,
+            "accept_pct": 72.44897959183673,
+            "tokens_per_round": 6.095238095238095,
+            "ms_per_round": 27.222261904761904,
+            "decode_tps": 223.9063791452199,
+            "wall_tps": 191.0534647525903
+          },
+          {
+            "requests": 1,
+            "tokens": 256,
+            "rounds": 42,
+            "drafted": 294,
+            "accepted": 213,
+            "accept_pct": 72.44897959183673,
+            "tokens_per_round": 6.095238095238095,
+            "ms_per_round": 27.152857142857144,
+            "decode_tps": 224.47870082951894,
+            "wall_tps": 190.06580347964942
+          }
+        ],
+        "fixed": {
+          "histogram": [
+            6,
+            11,
+            26,
+            4,
+            11,
+            19,
+            39,
+            134
+          ],
+          "eligible": 250,
+          "first5_hits": 192,
+          "first5_pct": 76.8,
+          "cumulative_percent": [
+            97.6,
+            93.2,
+            82.8,
+            81.2,
+            76.8,
+            69.2,
+            53.6
+          ]
+        },
+        "active": {
+          "histogram": [
+            2,
+            3,
+            3,
+            0,
+            7,
+            0,
+            13,
+            14
+          ],
+          "eligible": 42,
+          "first5_hits": 27,
+          "first5_pct": 64.28571428571429,
+          "cumulative_percent": [
+            95.23809523809524,
+            88.0952380952381,
+            80.95238095238095,
+            80.95238095238095,
+            64.28571428571429,
+            64.28571428571429,
+            33.333333333333336
+          ]
+        },
+        "active_all": {
+          "histogram": [
+            2,
+            3,
+            3,
+            0,
+            7,
+            0,
+            13,
+            14
+          ],
+          "eligible": 42,
+          "first5_hits": 27,
+          "first5_pct": 64.28571428571429,
+          "cumulative_percent": [
+            95.23809523809524,
+            88.0952380952381,
+            80.95238095238095,
+            80.95238095238095,
+            64.28571428571429,
+            64.28571428571429,
+            33.333333333333336
+          ]
+        }
+      },
+      "zh_json": {
+        "service": {
+          "requests": 3,
+          "tokens": 768,
+          "rounds": 249,
+          "drafted": 1722,
+          "accepted": 513,
+          "accept_pct": 29.790940766550523,
+          "tokens_per_round": 3.0843373493975905,
+          "ms_per_round": 27.026489959839356,
+          "decode_tps": 114.1227497163277,
+          "wall_tps": 104.82643842334878
+        },
+        "by_rep": [
+          {
+            "requests": 1,
+            "tokens": 256,
+            "rounds": 83,
+            "drafted": 574,
+            "accepted": 171,
+            "accept_pct": 29.790940766550523,
+            "tokens_per_round": 3.0843373493975905,
+            "ms_per_round": 27.14992771084337,
+            "decode_tps": 113.60388809306998,
+            "wall_tps": 104.51089206054968
+          },
+          {
+            "requests": 1,
+            "tokens": 256,
+            "rounds": 83,
+            "drafted": 574,
+            "accepted": 171,
+            "accept_pct": 29.790940766550523,
+            "tokens_per_round": 3.0843373493975905,
+            "ms_per_round": 27.023289156626507,
+            "decode_tps": 114.13626711096586,
+            "wall_tps": 104.93294306719396
+          },
+          {
+            "requests": 1,
+            "tokens": 256,
+            "rounds": 83,
+            "drafted": 574,
+            "accepted": 171,
+            "accept_pct": 29.790940766550523,
+            "tokens_per_round": 3.0843373493975905,
+            "ms_per_round": 26.906253012048193,
+            "decode_tps": 114.63273418325744,
+            "wall_tps": 105.03696291317624
+          }
+        ],
+        "fixed": {
+          "histogram": [
+            60,
+            44,
+            35,
+            22,
+            16,
+            19,
+            15,
+            39
+          ],
+          "eligible": 250,
+          "first5_hits": 73,
+          "first5_pct": 29.2,
+          "cumulative_percent": [
+            76.0,
+            58.4,
+            44.4,
+            35.6,
+            29.2,
+            21.6,
+            15.6
+          ]
+        },
+        "active": {
+          "histogram": [
+            31,
+            11,
+            12,
+            8,
+            2,
+            6,
+            5,
+            6
+          ],
+          "eligible": 81,
+          "first5_hits": 17,
+          "first5_pct": 20.987654320987655,
+          "cumulative_percent": [
+            61.72839506172839,
+            48.148148148148145,
+            33.333333333333336,
+            23.45679012345679,
+            20.987654320987655,
+            13.580246913580247,
+            7.407407407407407
+          ]
+        },
+        "active_all": {
+          "histogram": [
+            32,
+            11,
+            13,
+            8,
+            2,
+            6,
+            5,
+            6
+          ],
+          "eligible": 83,
+          "first5_hits": 17,
+          "first5_pct": 20.481927710843372,
+          "cumulative_percent": [
+            61.44578313253012,
+            48.19277108433735,
+            32.53012048192771,
+            22.89156626506024,
+            20.481927710843372,
+            13.25301204819277,
+            7.228915662650603
+          ]
+        }
+      }
+    },
+    "trained": {
+      "standard": {
+        "service": {
+          "requests": 15,
+          "tokens": 3840,
+          "rounds": 1011,
+          "drafted": 7011,
+          "accepted": 2808,
+          "accept_pct": 40.05134788189987,
+          "tokens_per_round": 3.798219584569733,
+          "ms_per_round": 26.971669634025716,
+          "decode_tps": 140.8225607130433,
+          "wall_tps": 127.01704299118879
+        },
+        "by_rep": [
+          {
+            "requests": 5,
+            "tokens": 1280,
+            "rounds": 337,
+            "drafted": 2337,
+            "accepted": 936,
+            "accept_pct": 40.05134788189987,
+            "tokens_per_round": 3.798219584569733,
+            "ms_per_round": 27.068545994065282,
+            "decode_tps": 140.31856699663453,
+            "wall_tps": 126.40490561981561
+          },
+          {
+            "requests": 5,
+            "tokens": 1280,
+            "rounds": 337,
+            "drafted": 2337,
+            "accepted": 936,
+            "accept_pct": 40.05134788189987,
+            "tokens_per_round": 3.798219584569733,
+            "ms_per_round": 26.93680712166172,
+            "decode_tps": 141.00481795837362,
+            "wall_tps": 127.24344459128073
+          },
+          {
+            "requests": 5,
+            "tokens": 1280,
+            "rounds": 337,
+            "drafted": 2337,
+            "accepted": 936,
+            "accept_pct": 40.05134788189987,
+            "tokens_per_round": 3.798219584569733,
+            "ms_per_round": 26.90965578635015,
+            "decode_tps": 141.14708916107242,
+            "wall_tps": 127.40734161164136
+          }
+        ],
+        "fixed": {
+          "histogram": [
+            209,
+            170,
+            107,
+            83,
+            69,
+            49,
+            46,
+            517
+          ],
+          "eligible": 1250,
+          "first5_hits": 612,
+          "first5_pct": 48.96,
+          "cumulative_percent": [
+            83.28,
+            69.68,
+            61.12,
+            54.48,
+            48.96,
+            45.04,
+            41.36
+          ]
+        },
+        "active": {
+          "histogram": [
+            95,
+            61,
+            34,
+            26,
+            18,
+            16,
+            8,
+            75
+          ],
+          "eligible": 333,
+          "first5_hits": 99,
+          "first5_pct": 29.72972972972973,
+          "cumulative_percent": [
+            71.47147147147147,
+            53.153153153153156,
+            42.94294294294294,
+            35.13513513513514,
+            29.72972972972973,
+            24.924924924924923,
+            22.52252252252252
+          ]
+        },
+        "active_all": {
+          "histogram": [
+            96,
+            63,
+            35,
+            26,
+            18,
+            16,
+            8,
+            75
+          ],
+          "eligible": 337,
+          "first5_hits": 99,
+          "first5_pct": 29.376854599406528,
+          "cumulative_percent": [
+            71.513353115727,
+            52.81899109792285,
+            42.433234421364986,
+            34.718100890207715,
+            29.376854599406528,
+            24.62908011869436,
+            22.255192878338278
+          ]
+        }
+      },
+      "holdout": {
+        "service": {
+          "requests": 12,
+          "tokens": 3072,
+          "rounds": 870,
+          "drafted": 6060,
+          "accepted": 2181,
+          "accept_pct": 35.99009900990099,
+          "tokens_per_round": 3.5310344827586206,
+          "ms_per_round": 27.406372413793104,
+          "decode_tps": 128.8399073560541,
+          "wall_tps": 117.1323425108656
+        },
+        "by_rep": [
+          {
+            "requests": 4,
+            "tokens": 1024,
+            "rounds": 290,
+            "drafted": 2020,
+            "accepted": 727,
+            "accept_pct": 35.99009900990099,
+            "tokens_per_round": 3.5310344827586206,
+            "ms_per_round": 28.431882758620688,
+            "decode_tps": 124.1927772682586,
+            "wall_tps": 113.33210901653538
+          },
+          {
+            "requests": 4,
+            "tokens": 1024,
+            "rounds": 290,
+            "drafted": 2020,
+            "accepted": 727,
+            "accept_pct": 35.99009900990099,
+            "tokens_per_round": 3.5310344827586206,
+            "ms_per_round": 26.939103448275862,
+            "decode_tps": 131.0746844095367,
+            "wall_tps": 119.00300216597758
+          },
+          {
+            "requests": 4,
+            "tokens": 1024,
+            "rounds": 290,
+            "drafted": 2020,
+            "accepted": 727,
+            "accept_pct": 35.99009900990099,
+            "tokens_per_round": 3.5310344827586206,
+            "ms_per_round": 26.848131034482762,
+            "decode_tps": 131.5188188788072,
+            "wall_tps": 119.25658878596238
+          }
+        ],
+        "fixed": {
+          "histogram": [
+            180,
+            156,
+            119,
+            82,
+            63,
+            66,
+            67,
+            267
+          ],
+          "eligible": 1000,
+          "first5_hits": 400,
+          "first5_pct": 40.0,
+          "cumulative_percent": [
+            82.0,
+            66.4,
+            54.5,
+            46.3,
+            40.0,
+            33.4,
+            26.7
+          ]
+        },
+        "active": {
+          "histogram": [
+            90,
+            49,
+            38,
+            19,
+            20,
+            10,
+            21,
+            40
+          ],
+          "eligible": 287,
+          "first5_hits": 71,
+          "first5_pct": 24.738675958188153,
+          "cumulative_percent": [
+            68.6411149825784,
+            51.56794425087108,
+            38.32752613240418,
+            31.70731707317073,
+            24.738675958188153,
+            21.254355400696863,
+            13.937282229965156
+          ]
+        },
+        "active_all": {
+          "histogram": [
+            90,
+            49,
+            39,
+            20,
+            21,
+            10,
+            21,
+            40
+          ],
+          "eligible": 290,
+          "first5_hits": 71,
+          "first5_pct": 24.482758620689655,
+          "cumulative_percent": [
+            68.96551724137932,
+            52.06896551724138,
+            38.62068965517241,
+            31.724137931034484,
+            24.482758620689655,
+            21.03448275862069,
+            13.793103448275861
+          ]
+        }
+      },
+      "all": {
+        "service": {
+          "requests": 27,
+          "tokens": 6912,
+          "rounds": 1881,
+          "drafted": 13071,
+          "accepted": 4989,
+          "accept_pct": 38.16846453982098,
+          "tokens_per_round": 3.674641148325359,
+          "ms_per_round": 27.172728335991494,
+          "decode_tps": 135.2326900298095,
+          "wall_tps": 122.42532270033729
+        },
+        "by_rep": [
+          {
+            "requests": 9,
+            "tokens": 2304,
+            "rounds": 627,
+            "drafted": 4357,
+            "accepted": 1663,
+            "accept_pct": 38.16846453982098,
+            "tokens_per_round": 3.674641148325359,
+            "ms_per_round": 27.69911642743222,
+            "decode_tps": 132.66275687718777,
+            "wall_tps": 120.24060016751233
+          },
+          {
+            "requests": 9,
+            "tokens": 2304,
+            "rounds": 627,
+            "drafted": 4357,
+            "accepted": 1663,
+            "accept_pct": 38.16846453982098,
+            "tokens_per_round": 3.674641148325359,
+            "ms_per_round": 26.9378692185008,
+            "decode_tps": 136.4117227876967,
+            "wall_tps": 123.44433978364492
+          },
+          {
+            "requests": 9,
+            "tokens": 2304,
+            "rounds": 627,
+            "drafted": 4357,
+            "accepted": 1663,
+            "accept_pct": 38.16846453982098,
+            "tokens_per_round": 3.674641148325359,
+            "ms_per_round": 26.881199362041464,
+            "decode_tps": 136.69930046031592,
+            "wall_tps": 123.65129064843286
+          }
+        ],
+        "fixed": {
+          "histogram": [
+            389,
+            326,
+            226,
+            165,
+            132,
+            115,
+            113,
+            784
+          ],
+          "eligible": 2250,
+          "first5_hits": 1012,
+          "first5_pct": 44.977777777777774,
+          "cumulative_percent": [
+            82.71111111111111,
+            68.22222222222223,
+            58.17777777777778,
+            50.84444444444444,
+            44.977777777777774,
+            39.86666666666667,
+            34.84444444444444
+          ]
+        },
+        "active": {
+          "histogram": [
+            185,
+            110,
+            72,
+            45,
+            38,
+            26,
+            29,
+            115
+          ],
+          "eligible": 620,
+          "first5_hits": 170,
+          "first5_pct": 27.419354838709676,
+          "cumulative_percent": [
+            70.16129032258064,
+            52.41935483870968,
+            40.806451612903224,
+            33.54838709677419,
+            27.419354838709676,
+            23.225806451612904,
+            18.548387096774192
+          ]
+        },
+        "active_all": {
+          "histogram": [
+            186,
+            112,
+            74,
+            46,
+            39,
+            26,
+            29,
+            115
+          ],
+          "eligible": 627,
+          "first5_hits": 170,
+          "first5_pct": 27.11323763955343,
+          "cumulative_percent": [
+            70.33492822966507,
+            52.47208931419458,
+            40.66985645933014,
+            33.333333333333336,
+            27.11323763955343,
+            22.966507177033492,
+            18.341307814992025
+          ]
+        }
+      },
+      "p1": {
+        "service": {
+          "requests": 3,
+          "tokens": 768,
+          "rounds": 327,
+          "drafted": 2265,
+          "accepted": 438,
+          "accept_pct": 19.337748344370862,
+          "tokens_per_round": 2.3486238532110093,
+          "ms_per_round": 26.74125993883792,
+          "decode_tps": 87.82771861096803,
+          "wall_tps": 82.34369851947194
+        },
+        "by_rep": [
+          {
+            "requests": 1,
+            "tokens": 256,
+            "rounds": 109,
+            "drafted": 755,
+            "accepted": 146,
+            "accept_pct": 19.337748344370862,
+            "tokens_per_round": 2.3486238532110093,
+            "ms_per_round": 26.71224770642202,
+            "decode_tps": 87.92310849402483,
+            "wall_tps": 82.33613671317491
+          },
+          {
+            "requests": 1,
+            "tokens": 256,
+            "rounds": 109,
+            "drafted": 755,
+            "accepted": 146,
+            "accept_pct": 19.337748344370862,
+            "tokens_per_round": 2.3486238532110093,
+            "ms_per_round": 26.696532110091745,
+            "decode_tps": 87.97486668027528,
+            "wall_tps": 82.54755477295693
+          },
+          {
+            "requests": 1,
+            "tokens": 256,
+            "rounds": 109,
+            "drafted": 755,
+            "accepted": 146,
+            "accept_pct": 19.337748344370862,
+            "tokens_per_round": 2.3486238532110093,
+            "ms_per_round": 26.815,
+            "decode_tps": 87.58619627861306,
+            "wall_tps": 82.14837263270243
+          }
+        ],
+        "fixed": {
+          "histogram": [
+            90,
+            76,
+            39,
+            25,
+            10,
+            7,
+            3,
+            0
+          ],
+          "eligible": 250,
+          "first5_hits": 10,
+          "first5_pct": 4.0,
+          "cumulative_percent": [
+            64.0,
+            33.6,
+            18.0,
+            8.0,
+            4.0,
+            1.2,
+            0.0
+          ]
+        },
+        "active": {
+          "histogram": [
+            38,
+            31,
+            18,
+            11,
+            4,
+            3,
+            2,
+            0
+          ],
+          "eligible": 107,
+          "first5_hits": 5,
+          "first5_pct": 4.672897196261682,
+          "cumulative_percent": [
+            64.48598130841121,
+            35.51401869158879,
+            18.69158878504673,
+            8.411214953271028,
+            4.672897196261682,
+            1.8691588785046729,
+            0.0
+          ]
+        },
+        "active_all": {
+          "histogram": [
+            38,
+            32,
+            19,
+            11,
+            4,
+            3,
+            2,
+            0
+          ],
+          "eligible": 109,
+          "first5_hits": 5,
+          "first5_pct": 4.587155963302752,
+          "cumulative_percent": [
+            65.13761467889908,
+            35.77981651376147,
+            18.34862385321101,
+            8.256880733944953,
+            4.587155963302752,
+            1.834862385321101,
+            0.0
+          ]
+        }
+      },
+      "p2": {
+        "service": {
+          "requests": 3,
+          "tokens": 768,
+          "rounds": 135,
+          "drafted": 915,
+          "accepted": 627,
+          "accept_pct": 68.52459016393442,
+          "tokens_per_round": 5.688888888888889,
+          "ms_per_round": 27.2,
+          "decode_tps": 209.15032679738562,
+          "wall_tps": 180.79411766564922
+        },
+        "by_rep": [
+          {
+            "requests": 1,
+            "tokens": 256,
+            "rounds": 45,
+            "drafted": 305,
+            "accepted": 209,
+            "accept_pct": 68.52459016393442,
+            "tokens_per_round": 5.688888888888889,
+            "ms_per_round": 27.389177777777775,
+            "decode_tps": 207.705719939668,
+            "wall_tps": 179.40667791631944
+          },
+          {
+            "requests": 1,
+            "tokens": 256,
+            "rounds": 45,
+            "drafted": 305,
+            "accepted": 209,
+            "accept_pct": 68.52459016393442,
+            "tokens_per_round": 5.688888888888889,
+            "ms_per_round": 27.14806666666667,
+            "decode_tps": 209.55042429868138,
+            "wall_tps": 181.22364149702204
+          },
+          {
+            "requests": 1,
+            "tokens": 256,
+            "rounds": 45,
+            "drafted": 305,
+            "accepted": 209,
+            "accept_pct": 68.52459016393442,
+            "tokens_per_round": 5.688888888888889,
+            "ms_per_round": 27.062755555555558,
+            "decode_tps": 210.21099929053787,
+            "wall_tps": 181.76901006049488
+          }
+        ],
+        "fixed": {
+          "histogram": [
+            11,
+            14,
+            12,
+            15,
+            16,
+            14,
+            13,
+            155
+          ],
+          "eligible": 250,
+          "first5_hits": 182,
+          "first5_pct": 72.8,
+          "cumulative_percent": [
+            95.6,
+            90.0,
+            85.2,
+            79.2,
+            72.8,
+            67.2,
+            62.0
+          ]
+        },
+        "active": {
+          "histogram": [
+            4,
+            4,
+            3,
+            3,
+            3,
+            2,
+            1,
+            23
+          ],
+          "eligible": 43,
+          "first5_hits": 26,
+          "first5_pct": 60.46511627906977,
+          "cumulative_percent": [
+            90.69767441860465,
+            81.3953488372093,
+            74.4186046511628,
+            67.44186046511628,
+            60.46511627906977,
+            55.81395348837209,
+            53.48837209302326
+          ]
+        },
+        "active_all": {
+          "histogram": [
+            5,
+            5,
+            3,
+            3,
+            3,
+            2,
+            1,
+            23
+          ],
+          "eligible": 45,
+          "first5_hits": 26,
+          "first5_pct": 57.77777777777778,
+          "cumulative_percent": [
+            88.88888888888889,
+            77.77777777777777,
+            71.11111111111111,
+            64.44444444444444,
+            57.77777777777778,
+            53.333333333333336,
+            51.111111111111114
+          ]
+        }
+      },
+      "p3": {
+        "service": {
+          "requests": 3,
+          "tokens": 768,
+          "rounds": 291,
+          "drafted": 2031,
+          "accepted": 474,
+          "accept_pct": 23.338257016248154,
+          "tokens_per_round": 2.6391752577319587,
+          "ms_per_round": 26.780298969072163,
+          "decode_tps": 98.54913347979686,
+          "wall_tps": 91.66127186697884
+        },
+        "by_rep": [
+          {
+            "requests": 1,
+            "tokens": 256,
+            "rounds": 97,
+            "drafted": 677,
+            "accepted": 158,
+            "accept_pct": 23.338257016248154,
+            "tokens_per_round": 2.6391752577319587,
+            "ms_per_round": 26.955443298969072,
+            "decode_tps": 97.9088055967121,
+            "wall_tps": 90.91320682606231
+          },
+          {
+            "requests": 1,
+            "tokens": 256,
+            "rounds": 97,
+            "drafted": 677,
+            "accepted": 158,
+            "accept_pct": 23.338257016248154,
+            "tokens_per_round": 2.6391752577319587,
+            "ms_per_round": 26.769525773195873,
+            "decode_tps": 98.58879384312984,
+            "wall_tps": 91.84162642190086
+          },
+          {
+            "requests": 1,
+            "tokens": 256,
+            "rounds": 97,
+            "drafted": 677,
+            "accepted": 158,
+            "accept_pct": 23.338257016248154,
+            "tokens_per_round": 2.6391752577319587,
+            "ms_per_round": 26.615927835051544,
+            "decode_tps": 99.157740210594,
+            "wall_tps": 92.23911178936046
+          }
+        ],
+        "fixed": {
+          "histogram": [
+            79,
+            53,
+            37,
+            20,
+            17,
+            11,
+            9,
+            24
+          ],
+          "eligible": 250,
+          "first5_hits": 44,
+          "first5_pct": 17.6,
+          "cumulative_percent": [
+            68.4,
+            47.2,
+            32.4,
+            24.4,
+            17.6,
+            13.2,
+            9.6
+          ]
+        },
+        "active": {
+          "histogram": [
+            42,
+            20,
+            10,
+            5,
+            6,
+            8,
+            3,
+            3
+          ],
+          "eligible": 97,
+          "first5_hits": 14,
+          "first5_pct": 14.43298969072165,
+          "cumulative_percent": [
+            56.70103092783505,
+            36.08247422680412,
+            25.77319587628866,
+            20.61855670103093,
+            14.43298969072165,
+            6.185567010309279,
+            3.0927835051546393
+          ]
+        },
+        "active_all": {
+          "histogram": [
+            42,
+            20,
+            10,
+            5,
+            6,
+            8,
+            3,
+            3
+          ],
+          "eligible": 97,
+          "first5_hits": 14,
+          "first5_pct": 14.43298969072165,
+          "cumulative_percent": [
+            56.70103092783505,
+            36.08247422680412,
+            25.77319587628866,
+            20.61855670103093,
+            14.43298969072165,
+            6.185567010309279,
+            3.0927835051546393
+          ]
+        }
+      },
+      "math": {
+        "service": {
+          "requests": 3,
+          "tokens": 768,
+          "rounds": 135,
+          "drafted": 939,
+          "accepted": 630,
+          "accept_pct": 67.09265175718849,
+          "tokens_per_round": 5.688888888888889,
+          "ms_per_round": 27.19691851851852,
+          "decode_tps": 209.17402407244396,
+          "wall_tps": 178.7834067906113
+        },
+        "by_rep": [
+          {
+            "requests": 1,
+            "tokens": 256,
+            "rounds": 45,
+            "drafted": 313,
+            "accepted": 210,
+            "accept_pct": 67.09265175718849,
+            "tokens_per_round": 5.688888888888889,
+            "ms_per_round": 27.327333333333335,
+            "decode_tps": 208.17577842290584,
+            "wall_tps": 177.7349461182997
+          },
+          {
+            "requests": 1,
+            "tokens": 256,
+            "rounds": 45,
+            "drafted": 313,
+            "accepted": 210,
+            "accept_pct": 67.09265175718849,
+            "tokens_per_round": 5.688888888888889,
+            "ms_per_round": 27.1754,
+            "decode_tps": 209.33965604513233,
+            "wall_tps": 179.1073190173173
+          },
+          {
+            "requests": 1,
+            "tokens": 256,
+            "rounds": 45,
+            "drafted": 313,
+            "accepted": 210,
+            "accept_pct": 67.09265175718849,
+            "tokens_per_round": 5.688888888888889,
+            "ms_per_round": 27.08802222222222,
+            "decode_tps": 210.01492254469176,
+            "wall_tps": 179.5177296787771
+          }
+        ],
+        "fixed": {
+          "histogram": [
+            16,
+            18,
+            14,
+            16,
+            22,
+            14,
+            15,
+            135
+          ],
+          "eligible": 250,
+          "first5_hits": 164,
+          "first5_pct": 65.6,
+          "cumulative_percent": [
+            93.6,
+            86.4,
+            80.8,
+            74.4,
+            65.6,
+            60.0,
+            54.0
+          ]
+        },
+        "active": {
+          "histogram": [
+            6,
+            3,
+            2,
+            4,
+            4,
+            3,
+            1,
+            22
+          ],
+          "eligible": 45,
+          "first5_hits": 26,
+          "first5_pct": 57.77777777777778,
+          "cumulative_percent": [
+            86.66666666666667,
+            80.0,
+            75.55555555555556,
+            66.66666666666667,
+            57.77777777777778,
+            51.111111111111114,
+            48.888888888888886
+          ]
+        },
+        "active_all": {
+          "histogram": [
+            6,
+            3,
+            2,
+            4,
+            4,
+            3,
+            1,
+            22
+          ],
+          "eligible": 45,
+          "first5_hits": 26,
+          "first5_pct": 57.77777777777778,
+          "cumulative_percent": [
+            86.66666666666667,
+            80.0,
+            75.55555555555556,
+            66.66666666666667,
+            57.77777777777778,
+            51.111111111111114,
+            48.888888888888886
+          ]
+        }
+      },
+      "json": {
+        "service": {
+          "requests": 3,
+          "tokens": 768,
+          "rounds": 123,
+          "drafted": 861,
+          "accepted": 639,
+          "accept_pct": 74.21602787456446,
+          "tokens_per_round": 6.2439024390243905,
+          "ms_per_round": 27.539146341463418,
+          "decode_tps": 226.72824936564797,
+          "wall_tps": 192.8145955801173
+        },
+        "by_rep": [
+          {
+            "requests": 1,
+            "tokens": 256,
+            "rounds": 41,
+            "drafted": 287,
+            "accepted": 213,
+            "accept_pct": 74.21602787456446,
+            "tokens_per_round": 6.2439024390243905,
+            "ms_per_round": 27.647414634146344,
+            "decode_tps": 225.8403732012167,
+            "wall_tps": 191.92733117874573
+          },
+          {
+            "requests": 1,
+            "tokens": 256,
+            "rounds": 41,
+            "drafted": 287,
+            "accepted": 213,
+            "accept_pct": 74.21602787456446,
+            "tokens_per_round": 6.2439024390243905,
+            "ms_per_round": 27.477609756097564,
+            "decode_tps": 227.23601122687916,
+            "wall_tps": 192.64376638856584
+          },
+          {
+            "requests": 1,
+            "tokens": 256,
+            "rounds": 41,
+            "drafted": 287,
+            "accepted": 213,
+            "accept_pct": 74.21602787456446,
+            "tokens_per_round": 6.2439024390243905,
+            "ms_per_round": 27.492414634146343,
+            "decode_tps": 227.11364287621683,
+            "wall_tps": 193.88282802842224
+          }
+        ],
+        "fixed": {
+          "histogram": [
+            13,
+            9,
+            5,
+            7,
+            4,
+            3,
+            6,
+            203
+          ],
+          "eligible": 250,
+          "first5_hits": 212,
+          "first5_pct": 84.8,
+          "cumulative_percent": [
+            94.8,
+            91.2,
+            89.2,
+            86.4,
+            84.8,
+            83.6,
+            81.2
+          ]
+        },
+        "active": {
+          "histogram": [
+            5,
+            3,
+            1,
+            3,
+            1,
+            0,
+            1,
+            27
+          ],
+          "eligible": 41,
+          "first5_hits": 28,
+          "first5_pct": 68.29268292682927,
+          "cumulative_percent": [
+            87.8048780487805,
+            80.48780487804878,
+            78.04878048780488,
+            70.73170731707317,
+            68.29268292682927,
+            68.29268292682927,
+            65.85365853658537
+          ]
+        },
+        "active_all": {
+          "histogram": [
+            5,
+            3,
+            1,
+            3,
+            1,
+            0,
+            1,
+            27
+          ],
+          "eligible": 41,
+          "first5_hits": 28,
+          "first5_pct": 68.29268292682927,
+          "cumulative_percent": [
+            87.8048780487805,
+            80.48780487804878,
+            78.04878048780488,
+            70.73170731707317,
+            68.29268292682927,
+            68.29268292682927,
+            65.85365853658537
+          ]
+        }
+      },
+      "zh_dict": {
+        "service": {
+          "requests": 3,
+          "tokens": 768,
+          "rounds": 303,
+          "drafted": 2121,
+          "accepted": 459,
+          "accept_pct": 21.64073550212164,
+          "tokens_per_round": 2.5346534653465347,
+          "ms_per_round": 26.866524752475247,
+          "decode_tps": 94.34243872992967,
+          "wall_tps": 87.94449454284616
+        },
+        "by_rep": [
+          {
+            "requests": 1,
+            "tokens": 256,
+            "rounds": 101,
+            "drafted": 707,
+            "accepted": 153,
+            "accept_pct": 21.64073550212164,
+            "tokens_per_round": 2.5346534653465347,
+            "ms_per_round": 26.995445544554457,
+            "decode_tps": 93.89189228839481,
+            "wall_tps": 87.32130220733906
+          },
+          {
+            "requests": 1,
+            "tokens": 256,
+            "rounds": 101,
+            "drafted": 707,
+            "accepted": 153,
+            "accept_pct": 21.64073550212164,
+            "tokens_per_round": 2.5346534653465347,
+            "ms_per_round": 26.81868316831683,
+            "decode_tps": 94.51073527506132,
+            "wall_tps": 88.15306357593815
+          },
+          {
+            "requests": 1,
+            "tokens": 256,
+            "rounds": 101,
+            "drafted": 707,
+            "accepted": 153,
+            "accept_pct": 21.64073550212164,
+            "tokens_per_round": 2.5346534653465347,
+            "ms_per_round": 26.785445544554456,
+            "decode_tps": 94.62801210942843,
+            "wall_tps": 88.3660701463111
+          }
+        ],
+        "fixed": {
+          "histogram": [
+            82,
+            45,
+            36,
+            23,
+            16,
+            14,
+            12,
+            22
+          ],
+          "eligible": 250,
+          "first5_hits": 48,
+          "first5_pct": 19.2,
+          "cumulative_percent": [
+            67.2,
+            49.2,
+            34.8,
+            25.6,
+            19.2,
+            13.6,
+            8.8
+          ]
+        },
+        "active": {
+          "histogram": [
+            49,
+            19,
+            13,
+            3,
+            4,
+            1,
+            6,
+            6
+          ],
+          "eligible": 101,
+          "first5_hits": 13,
+          "first5_pct": 12.871287128712872,
+          "cumulative_percent": [
+            51.48514851485149,
+            32.67326732673267,
+            19.801980198019802,
+            16.831683168316832,
+            12.871287128712872,
+            11.881188118811881,
+            5.9405940594059405
+          ]
+        },
+        "active_all": {
+          "histogram": [
+            49,
+            19,
+            13,
+            3,
+            4,
+            1,
+            6,
+            6
+          ],
+          "eligible": 101,
+          "first5_hits": 13,
+          "first5_pct": 12.871287128712872,
+          "cumulative_percent": [
+            51.48514851485149,
+            32.67326732673267,
+            19.801980198019802,
+            16.831683168316832,
+            12.871287128712872,
+            11.881188118811881,
+            5.9405940594059405
+          ]
+        }
+      },
+      "en_edit": {
+        "service": {
+          "requests": 3,
+          "tokens": 768,
+          "rounds": 192,
+          "drafted": 1335,
+          "accepted": 570,
+          "accept_pct": 42.69662921348315,
+          "tokens_per_round": 4.0,
+          "ms_per_round": 27.106427083333333,
+          "decode_tps": 147.56647889088418,
+          "wall_tps": 131.6607332107103
+        },
+        "by_rep": [
+          {
+            "requests": 1,
+            "tokens": 256,
+            "rounds": 64,
+            "drafted": 445,
+            "accepted": 190,
+            "accept_pct": 42.69662921348315,
+            "tokens_per_round": 4.0,
+            "ms_per_round": 27.251125,
+            "decode_tps": 146.7829309799137,
+            "wall_tps": 131.24261031806574
+          },
+          {
+            "requests": 1,
+            "tokens": 256,
+            "rounds": 64,
+            "drafted": 445,
+            "accepted": 190,
+            "accept_pct": 42.69662921348315,
+            "tokens_per_round": 4.0,
+            "ms_per_round": 27.087234375,
+            "decode_tps": 147.6710373832692,
+            "wall_tps": 131.68338571046388
+          },
+          {
+            "requests": 1,
+            "tokens": 256,
+            "rounds": 64,
+            "drafted": 445,
+            "accepted": 190,
+            "accept_pct": 42.69662921348315,
+            "tokens_per_round": 4.0,
+            "ms_per_round": 26.980921875,
+            "decode_tps": 148.25290323776233,
+            "wall_tps": 132.05873912085804
+          }
+        ],
+        "fixed": {
+          "histogram": [
+            33,
+            50,
+            40,
+            32,
+            24,
+            13,
+            16,
+            42
+          ],
+          "eligible": 250,
+          "first5_hits": 71,
+          "first5_pct": 28.4,
+          "cumulative_percent": [
+            86.8,
+            66.8,
+            50.8,
+            38.0,
+            28.4,
+            23.2,
+            16.8
+          ]
+        },
+        "active": {
+          "histogram": [
+            11,
+            11,
+            8,
+            7,
+            10,
+            5,
+            3,
+            8
+          ],
+          "eligible": 63,
+          "first5_hits": 16,
+          "first5_pct": 25.396825396825395,
+          "cumulative_percent": [
+            82.53968253968254,
+            65.07936507936508,
+            52.38095238095238,
+            41.26984126984127,
+            25.396825396825395,
+            17.46031746031746,
+            12.698412698412698
+          ]
+        },
+        "active_all": {
+          "histogram": [
+            11,
+            11,
+            8,
+            8,
+            10,
+            5,
+            3,
+            8
+          ],
+          "eligible": 64,
+          "first5_hits": 16,
+          "first5_pct": 25.0,
+          "cumulative_percent": [
+            82.8125,
+            65.625,
+            53.125,
+            40.625,
+            25.0,
+            17.1875,
+            12.5
+          ]
+        }
+      },
+      "code": {
+        "service": {
+          "requests": 3,
+          "tokens": 768,
+          "rounds": 123,
+          "drafted": 852,
+          "accepted": 642,
+          "accept_pct": 75.35211267605634,
+          "tokens_per_round": 6.2439024390243905,
+          "ms_per_round": 27.140617886178863,
+          "decode_tps": 230.05749040828013,
+          "wall_tps": 196.18125683920977
+        },
+        "by_rep": [
+          {
+            "requests": 1,
+            "tokens": 256,
+            "rounds": 41,
+            "drafted": 284,
+            "accepted": 214,
+            "accept_pct": 75.35211267605634,
+            "tokens_per_round": 6.2439024390243905,
+            "ms_per_round": 27.282878048780486,
+            "decode_tps": 228.85790963330885,
+            "wall_tps": 195.95166494377727
+          },
+          {
+            "requests": 1,
+            "tokens": 256,
+            "rounds": 41,
+            "drafted": 284,
+            "accepted": 214,
+            "accept_pct": 75.35211267605634,
+            "tokens_per_round": 6.2439024390243905,
+            "ms_per_round": 27.144951219512194,
+            "decode_tps": 230.02076476513173,
+            "wall_tps": 196.2776489760163
+          },
+          {
+            "requests": 1,
+            "tokens": 256,
+            "rounds": 41,
+            "drafted": 284,
+            "accepted": 214,
+            "accept_pct": 75.35211267605634,
+            "tokens_per_round": 6.2439024390243905,
+            "ms_per_round": 26.994024390243904,
+            "decode_tps": 231.30683846018312,
+            "wall_tps": 196.3148638730938
+          }
+        ],
+        "fixed": {
+          "histogram": [
+            7,
+            9,
+            9,
+            2,
+            7,
+            20,
+            24,
+            172
+          ],
+          "eligible": 250,
+          "first5_hits": 216,
+          "first5_pct": 86.4,
+          "cumulative_percent": [
+            97.2,
+            93.6,
+            90.0,
+            89.2,
+            86.4,
+            78.4,
+            68.8
+          ]
+        },
+        "active": {
+          "histogram": [
+            2,
+            3,
+            4,
+            0,
+            3,
+            2,
+            5,
+            21
+          ],
+          "eligible": 40,
+          "first5_hits": 28,
+          "first5_pct": 70.0,
+          "cumulative_percent": [
+            95.0,
+            87.5,
+            77.5,
+            77.5,
+            70.0,
+            65.0,
+            52.5
+          ]
+        },
+        "active_all": {
+          "histogram": [
+            2,
+            3,
+            4,
+            0,
+            4,
+            2,
+            5,
+            21
+          ],
+          "eligible": 41,
+          "first5_hits": 28,
+          "first5_pct": 68.29268292682927,
+          "cumulative_percent": [
+            95.1219512195122,
+            87.8048780487805,
+            78.04878048780488,
+            78.04878048780488,
+            68.29268292682927,
+            63.41463414634146,
+            51.21951219512195
+          ]
+        }
+      },
+      "zh_json": {
+        "service": {
+          "requests": 3,
+          "tokens": 768,
+          "rounds": 252,
+          "drafted": 1752,
+          "accepted": 510,
+          "accept_pct": 29.10958904109589,
+          "tokens_per_round": 3.0476190476190474,
+          "ms_per_round": 28.413718253968252,
+          "decode_tps": 107.2587199034895,
+          "wall_tps": 99.14740808549321
+        },
+        "by_rep": [
+          {
+            "requests": 1,
+            "tokens": 256,
+            "rounds": 84,
+            "drafted": 584,
+            "accepted": 170,
+            "accept_pct": 29.10958904109589,
+            "tokens_per_round": 3.0476190476190474,
+            "ms_per_round": 31.619476190476192,
+            "decode_tps": 96.38423575584066,
+            "wall_tps": 89.92996878844909
+          },
+          {
+            "requests": 1,
+            "tokens": 256,
+            "rounds": 84,
+            "drafted": 584,
+            "accepted": 170,
+            "accept_pct": 29.10958904109589,
+            "tokens_per_round": 3.0476190476190474,
+            "ms_per_round": 26.870559523809522,
+            "decode_tps": 113.41851831997047,
+            "wall_tps": 104.38526558292172
+          },
+          {
+            "requests": 1,
+            "tokens": 256,
+            "rounds": 84,
+            "drafted": 584,
+            "accepted": 170,
+            "accept_pct": 29.10958904109589,
+            "tokens_per_round": 3.0476190476190474,
+            "ms_per_round": 26.75111904761905,
+            "decode_tps": 113.92491813871605,
+            "wall_tps": 104.62092548746864
+          }
+        ],
+        "fixed": {
+          "histogram": [
+            58,
+            52,
+            34,
+            25,
+            16,
+            19,
+            15,
+            31
+          ],
+          "eligible": 250,
+          "first5_hits": 65,
+          "first5_pct": 26.0,
+          "cumulative_percent": [
+            76.8,
+            56.0,
+            42.4,
+            32.4,
+            26.0,
+            18.4,
+            12.4
+          ]
+        },
+        "active": {
+          "histogram": [
+            28,
+            16,
+            13,
+            9,
+            3,
+            2,
+            7,
+            5
+          ],
+          "eligible": 83,
+          "first5_hits": 14,
+          "first5_pct": 16.867469879518072,
+          "cumulative_percent": [
+            66.26506024096386,
+            46.98795180722892,
+            31.325301204819276,
+            20.481927710843372,
+            16.867469879518072,
+            14.457831325301205,
+            6.024096385542169
+          ]
+        },
+        "active_all": {
+          "histogram": [
+            28,
+            16,
+            14,
+            9,
+            3,
+            2,
+            7,
+            5
+          ],
+          "eligible": 84,
+          "first5_hits": 14,
+          "first5_pct": 16.666666666666668,
+          "cumulative_percent": [
+            66.66666666666667,
+            47.61904761904762,
+            30.952380952380953,
+            20.238095238095237,
+            16.666666666666668,
+            14.285714285714286,
+            5.9523809523809526
+          ]
+        }
+      }
+    }
+  },
+  "raw_service_requests": [
+    {
+      "mode": "plain",
+      "rep": 1,
+      "id": "p1",
+      "group": "standard",
+      "tokens": 256,
+      "ms": 3036.568,
+      "prompt_ms": 152.106,
+      "wall_ms": 3230.6516808457673,
+      "rounds": 113,
+      "drafted": 782,
+      "accepted": 142
+    },
+    {
+      "mode": "plain",
+      "rep": 1,
+      "id": "p2",
+      "group": "standard",
+      "tokens": 256,
+      "ms": 1235.895,
+      "prompt_ms": 126.642,
+      "wall_ms": 1433.5051078815013,
+      "rounds": 45,
+      "drafted": 305,
+      "accepted": 209
+    },
+    {
+      "mode": "plain",
+      "rep": 1,
+      "id": "p3",
+      "group": "standard",
+      "tokens": 256,
+      "ms": 2827.179,
+      "prompt_ms": 133.082,
+      "wall_ms": 3028.8675581105053,
+      "rounds": 105,
+      "drafted": 735,
+      "accepted": 150
+    },
+    {
+      "mode": "plain",
+      "rep": 1,
+      "id": "math",
+      "group": "standard",
+      "tokens": 256,
+      "ms": 1180.592,
+      "prompt_ms": 146.376,
+      "wall_ms": 1392.720535164699,
+      "rounds": 43,
+      "drafted": 299,
+      "accepted": 212
+    },
+    {
+      "mode": "plain",
+      "rep": 1,
+      "id": "json",
+      "group": "standard",
+      "tokens": 256,
+      "ms": 1203.358,
+      "prompt_ms": 126.074,
+      "wall_ms": 1396.6553860809654,
+      "rounds": 44,
+      "drafted": 305,
+      "accepted": 211
+    },
+    {
+      "mode": "plain",
+      "rep": 1,
+      "id": "zh_dict",
+      "group": "holdout",
+      "tokens": 256,
+      "ms": 2814.743,
+      "prompt_ms": 128.503,
+      "wall_ms": 3008.9213671162724,
+      "rounds": 104,
+      "drafted": 728,
+      "accepted": 150
+    },
+    {
+      "mode": "plain",
+      "rep": 1,
+      "id": "en_edit",
+      "group": "holdout",
+      "tokens": 256,
+      "ms": 1912.159,
+      "prompt_ms": 138.572,
+      "wall_ms": 2116.5402319747955,
+      "rounds": 70,
+      "drafted": 487,
+      "accepted": 184
+    },
+    {
+      "mode": "plain",
+      "rep": 1,
+      "id": "code",
+      "group": "holdout",
+      "tokens": 256,
+      "ms": 1390.36,
+      "prompt_ms": 126.654,
+      "wall_ms": 1581.4530418720096,
+      "rounds": 51,
+      "drafted": 354,
+      "accepted": 204
+    },
+    {
+      "mode": "plain",
+      "rep": 1,
+      "id": "zh_json",
+      "group": "holdout",
+      "tokens": 256,
+      "ms": 2287.973,
+      "prompt_ms": 125.326,
+      "wall_ms": 2476.976973004639,
+      "rounds": 84,
+      "drafted": 584,
+      "accepted": 170
+    },
+    {
+      "mode": "plain",
+      "rep": 2,
+      "id": "math",
+      "group": "standard",
+      "tokens": 256,
+      "ms": 1164.598,
+      "prompt_ms": 171.92,
+      "wall_ms": 1379.1092322207987,
+      "rounds": 43,
+      "drafted": 299,
+      "accepted": 212
+    },
+    {
+      "mode": "plain",
+      "rep": 2,
+      "id": "json",
+      "group": "standard",
+      "tokens": 256,
+      "ms": 1185.139,
+      "prompt_ms": 137.166,
+      "wall_ms": 1389.7677310742438,
+      "rounds": 44,
+      "drafted": 305,
+      "accepted": 211
+    },
+    {
+      "mode": "plain",
+      "rep": 2,
+      "id": "zh_dict",
+      "group": "holdout",
+      "tokens": 256,
+      "ms": 2773.216,
+      "prompt_ms": 128.553,
+      "wall_ms": 2971.650485182181,
+      "rounds": 104,
+      "drafted": 728,
+      "accepted": 150
+    },
+    {
+      "mode": "plain",
+      "rep": 2,
+      "id": "en_edit",
+      "group": "holdout",
+      "tokens": 256,
+      "ms": 2047.61,
+      "prompt_ms": 146.762,
+      "wall_ms": 2261.99983805418,
+      "rounds": 70,
+      "drafted": 487,
+      "accepted": 184
+    },
+    {
+      "mode": "plain",
+      "rep": 2,
+      "id": "code",
+      "group": "holdout",
+      "tokens": 256,
+      "ms": 1367.785,
+      "prompt_ms": 126.689,
+      "wall_ms": 1564.1807159408927,
+      "rounds": 51,
+      "drafted": 354,
+      "accepted": 204
+    },
+    {
+      "mode": "plain",
+      "rep": 2,
+      "id": "zh_json",
+      "group": "holdout",
+      "tokens": 256,
+      "ms": 2247.171,
+      "prompt_ms": 133.771,
+      "wall_ms": 2449.261740082875,
+      "rounds": 84,
+      "drafted": 584,
+      "accepted": 170
+    },
+    {
+      "mode": "plain",
+      "rep": 2,
+      "id": "p1",
+      "group": "standard",
+      "tokens": 256,
+      "ms": 2995.561,
+      "prompt_ms": 125.482,
+      "wall_ms": 3187.687657075003,
+      "rounds": 113,
+      "drafted": 782,
+      "accepted": 142
+    },
+    {
+      "mode": "plain",
+      "rep": 2,
+      "id": "p2",
+      "group": "standard",
+      "tokens": 256,
+      "ms": 1219.738,
+      "prompt_ms": 130.406,
+      "wall_ms": 1416.2543180864304,
+      "rounds": 45,
+      "drafted": 305,
+      "accepted": 209
+    },
+    {
+      "mode": "plain",
+      "rep": 2,
+      "id": "p3",
+      "group": "standard",
+      "tokens": 256,
+      "ms": 2785.564,
+      "prompt_ms": 128.41,
+      "wall_ms": 2978.370768018067,
+      "rounds": 105,
+      "drafted": 735,
+      "accepted": 150
+    },
+    {
+      "mode": "plain",
+      "rep": 3,
+      "id": "en_edit",
+      "group": "holdout",
+      "tokens": 256,
+      "ms": 1876.557,
+      "prompt_ms": 167.887,
+      "wall_ms": 2083.9173668064177,
+      "rounds": 70,
+      "drafted": 487,
+      "accepted": 184
+    },
+    {
+      "mode": "plain",
+      "rep": 3,
+      "id": "code",
+      "group": "holdout",
+      "tokens": 256,
+      "ms": 1366.136,
+      "prompt_ms": 127.793,
+      "wall_ms": 1558.799689868465,
+      "rounds": 51,
+      "drafted": 354,
+      "accepted": 204
+    },
+    {
+      "mode": "plain",
+      "rep": 3,
+      "id": "zh_json",
+      "group": "holdout",
+      "tokens": 256,
+      "ms": 2242.474,
+      "prompt_ms": 131.655,
+      "wall_ms": 2443.891689181328,
+      "rounds": 84,
+      "drafted": 584,
+      "accepted": 170
+    },
+    {
+      "mode": "plain",
+      "rep": 3,
+      "id": "p1",
+      "group": "standard",
+      "tokens": 256,
+      "ms": 2991.496,
+      "prompt_ms": 127.346,
+      "wall_ms": 3189.135547960177,
+      "rounds": 113,
+      "drafted": 782,
+      "accepted": 142
+    },
+    {
+      "mode": "plain",
+      "rep": 3,
+      "id": "p2",
+      "group": "standard",
+      "tokens": 256,
+      "ms": 1213.111,
+      "prompt_ms": 123.48,
+      "wall_ms": 1403.066550847143,
+      "rounds": 45,
+      "drafted": 305,
+      "accepted": 209
+    },
+    {
+      "mode": "plain",
+      "rep": 3,
+      "id": "p3",
+      "group": "standard",
+      "tokens": 256,
+      "ms": 2780.136,
+      "prompt_ms": 128.456,
+      "wall_ms": 2976.833077147603,
+      "rounds": 105,
+      "drafted": 735,
+      "accepted": 150
+    },
+    {
+      "mode": "plain",
+      "rep": 3,
+      "id": "math",
+      "group": "standard",
+      "tokens": 256,
+      "ms": 1164.072,
+      "prompt_ms": 139.707,
+      "wall_ms": 1367.9697909392416,
+      "rounds": 43,
+      "drafted": 299,
+      "accepted": 212
+    },
+    {
+      "mode": "plain",
+      "rep": 3,
+      "id": "json",
+      "group": "standard",
+      "tokens": 256,
+      "ms": 1183.131,
+      "prompt_ms": 128.319,
+      "wall_ms": 1379.2930028866976,
+      "rounds": 44,
+      "drafted": 305,
+      "accepted": 211
+    },
+    {
+      "mode": "plain",
+      "rep": 3,
+      "id": "zh_dict",
+      "group": "holdout",
+      "tokens": 256,
+      "ms": 2927.797,
+      "prompt_ms": 126.214,
+      "wall_ms": 3117.7013020496815,
+      "rounds": 104,
+      "drafted": 728,
+      "accepted": 150
+    },
+    {
+      "mode": "manual",
+      "rep": 1,
+      "id": "p1",
+      "group": "standard",
+      "tokens": 256,
+      "ms": 2920.008,
+      "prompt_ms": 153.164,
+      "wall_ms": 3114.8658520542085,
+      "rounds": 109,
+      "drafted": 750,
+      "accepted": 146
+    },
+    {
+      "mode": "manual",
+      "rep": 1,
+      "id": "p2",
+      "group": "standard",
+      "tokens": 256,
+      "ms": 1186.102,
+      "prompt_ms": 126.596,
+      "wall_ms": 1384.888957021758,
+      "rounds": 43,
+      "drafted": 297,
+      "accepted": 211
+    },
+    {
+      "mode": "manual",
+      "rep": 1,
+      "id": "p3",
+      "group": "standard",
+      "tokens": 256,
+      "ms": 2559.807,
+      "prompt_ms": 132.345,
+      "wall_ms": 2762.0935558807105,
+      "rounds": 95,
+      "drafted": 665,
+      "accepted": 160
+    },
+    {
+      "mode": "manual",
+      "rep": 1,
+      "id": "math",
+      "group": "standard",
+      "tokens": 256,
+      "ms": 1231.048,
+      "prompt_ms": 150.902,
+      "wall_ms": 1451.2331550940871,
+      "rounds": 43,
+      "drafted": 296,
+      "accepted": 212
+    },
+    {
+      "mode": "manual",
+      "rep": 1,
+      "id": "json",
+      "group": "standard",
+      "tokens": 256,
+      "ms": 1084.855,
+      "prompt_ms": 130.556,
+      "wall_ms": 1284.7439979668707,
+      "rounds": 39,
+      "drafted": 273,
+      "accepted": 215
+    },
+    {
+      "mode": "manual",
+      "rep": 1,
+      "id": "zh_dict",
+      "group": "holdout",
+      "tokens": 256,
+      "ms": 2682.028,
+      "prompt_ms": 129.746,
+      "wall_ms": 2877.1716540213674,
+      "rounds": 99,
+      "drafted": 693,
+      "accepted": 155
+    },
+    {
+      "mode": "manual",
+      "rep": 1,
+      "id": "en_edit",
+      "group": "holdout",
+      "tokens": 256,
+      "ms": 1830.235,
+      "prompt_ms": 145.746,
+      "wall_ms": 2042.3374169040471,
+      "rounds": 67,
+      "drafted": 466,
+      "accepted": 187
+    },
+    {
+      "mode": "manual",
+      "rep": 1,
+      "id": "code",
+      "group": "holdout",
+      "tokens": 256,
+      "ms": 1150.308,
+      "prompt_ms": 129.494,
+      "wall_ms": 1343.8587910495698,
+      "rounds": 42,
+      "drafted": 294,
+      "accepted": 213
+    },
+    {
+      "mode": "manual",
+      "rep": 1,
+      "id": "zh_json",
+      "group": "holdout",
+      "tokens": 256,
+      "ms": 2253.444,
+      "prompt_ms": 132.036,
+      "wall_ms": 2449.5054529979825,
+      "rounds": 83,
+      "drafted": 574,
+      "accepted": 171
+    },
+    {
+      "mode": "manual",
+      "rep": 2,
+      "id": "math",
+      "group": "standard",
+      "tokens": 256,
+      "ms": 1166.591,
+      "prompt_ms": 171.396,
+      "wall_ms": 1379.1576141957194,
+      "rounds": 43,
+      "drafted": 296,
+      "accepted": 212
+    },
+    {
+      "mode": "manual",
+      "rep": 2,
+      "id": "json",
+      "group": "standard",
+      "tokens": 256,
+      "ms": 1077.315,
+      "prompt_ms": 133.938,
+      "wall_ms": 1281.7960379179567,
+      "rounds": 39,
+      "drafted": 273,
+      "accepted": 215
+    },
+    {
+      "mode": "manual",
+      "rep": 2,
+      "id": "zh_dict",
+      "group": "holdout",
+      "tokens": 256,
+      "ms": 2668.466,
+      "prompt_ms": 132.915,
+      "wall_ms": 2871.587338158861,
+      "rounds": 99,
+      "drafted": 693,
+      "accepted": 155
+    },
+    {
+      "mode": "manual",
+      "rep": 2,
+      "id": "en_edit",
+      "group": "holdout",
+      "tokens": 256,
+      "ms": 1820.979,
+      "prompt_ms": 140.018,
+      "wall_ms": 2026.8112488556653,
+      "rounds": 67,
+      "drafted": 466,
+      "accepted": 187
+    },
+    {
+      "mode": "manual",
+      "rep": 2,
+      "id": "code",
+      "group": "holdout",
+      "tokens": 256,
+      "ms": 1143.335,
+      "prompt_ms": 131.349,
+      "wall_ms": 1339.9390601553023,
+      "rounds": 42,
+      "drafted": 294,
+      "accepted": 213
+    },
+    {
+      "mode": "manual",
+      "rep": 2,
+      "id": "zh_json",
+      "group": "holdout",
+      "tokens": 256,
+      "ms": 2242.933,
+      "prompt_ms": 129.33,
+      "wall_ms": 2439.6532920654863,
+      "rounds": 83,
+      "drafted": 574,
+      "accepted": 171
+    },
+    {
+      "mode": "manual",
+      "rep": 2,
+      "id": "p1",
+      "group": "standard",
+      "tokens": 256,
+      "ms": 2909.58,
+      "prompt_ms": 123.594,
+      "wall_ms": 3098.9659389015287,
+      "rounds": 109,
+      "drafted": 750,
+      "accepted": 146
+    },
+    {
+      "mode": "manual",
+      "rep": 2,
+      "id": "p2",
+      "group": "standard",
+      "tokens": 256,
+      "ms": 1180.085,
+      "prompt_ms": 125.334,
+      "wall_ms": 1371.2245780043304,
+      "rounds": 43,
+      "drafted": 297,
+      "accepted": 211
+    },
+    {
+      "mode": "manual",
+      "rep": 2,
+      "id": "p3",
+      "group": "standard",
+      "tokens": 256,
+      "ms": 2812.945,
+      "prompt_ms": 125.411,
+      "wall_ms": 3002.5995599571615,
+      "rounds": 95,
+      "drafted": 665,
+      "accepted": 160
+    },
+    {
+      "mode": "manual",
+      "rep": 3,
+      "id": "en_edit",
+      "group": "holdout",
+      "tokens": 256,
+      "ms": 1813.294,
+      "prompt_ms": 171.585,
+      "wall_ms": 2023.5129408538342,
+      "rounds": 67,
+      "drafted": 466,
+      "accepted": 187
+    },
+    {
+      "mode": "manual",
+      "rep": 3,
+      "id": "code",
+      "group": "holdout",
+      "tokens": 256,
+      "ms": 1140.42,
+      "prompt_ms": 135.143,
+      "wall_ms": 1346.901942975819,
+      "rounds": 42,
+      "drafted": 294,
+      "accepted": 213
+    },
+    {
+      "mode": "manual",
+      "rep": 3,
+      "id": "zh_json",
+      "group": "holdout",
+      "tokens": 256,
+      "ms": 2233.219,
+      "prompt_ms": 135.772,
+      "wall_ms": 2437.2372629586607,
+      "rounds": 83,
+      "drafted": 574,
+      "accepted": 171
+    },
+    {
+      "mode": "manual",
+      "rep": 3,
+      "id": "p1",
+      "group": "standard",
+      "tokens": 256,
+      "ms": 2908.682,
+      "prompt_ms": 126.094,
+      "wall_ms": 3101.8211080227047,
+      "rounds": 109,
+      "drafted": 750,
+      "accepted": 146
+    },
+    {
+      "mode": "manual",
+      "rep": 3,
+      "id": "p2",
+      "group": "standard",
+      "tokens": 256,
+      "ms": 1177.307,
+      "prompt_ms": 130.9,
+      "wall_ms": 1375.916460994631,
+      "rounds": 43,
+      "drafted": 297,
+      "accepted": 211
+    },
+    {
+      "mode": "manual",
+      "rep": 3,
+      "id": "p3",
+      "group": "standard",
+      "tokens": 256,
+      "ms": 2542.549,
+      "prompt_ms": 127.797,
+      "wall_ms": 2736.3489519339055,
+      "rounds": 95,
+      "drafted": 665,
+      "accepted": 160
+    },
+    {
+      "mode": "manual",
+      "rep": 3,
+      "id": "math",
+      "group": "standard",
+      "tokens": 256,
+      "ms": 1165.16,
+      "prompt_ms": 141.076,
+      "wall_ms": 1373.0040709488094,
+      "rounds": 43,
+      "drafted": 296,
+      "accepted": 212
+    },
+    {
+      "mode": "manual",
+      "rep": 3,
+      "id": "json",
+      "group": "standard",
+      "tokens": 256,
+      "ms": 1076.286,
+      "prompt_ms": 128.08,
+      "wall_ms": 1270.1182500459254,
+      "rounds": 39,
+      "drafted": 273,
+      "accepted": 215
+    },
+    {
+      "mode": "manual",
+      "rep": 3,
+      "id": "zh_dict",
+      "group": "holdout",
+      "tokens": 256,
+      "ms": 2666.525,
+      "prompt_ms": 127.83,
+      "wall_ms": 2857.5305989943445,
+      "rounds": 99,
+      "drafted": 693,
+      "accepted": 155
+    },
+    {
+      "mode": "trained",
+      "rep": 1,
+      "id": "p1",
+      "group": "standard",
+      "tokens": 256,
+      "ms": 2911.635,
+      "prompt_ms": 155.382,
+      "wall_ms": 3109.205875080079,
+      "rounds": 109,
+      "drafted": 755,
+      "accepted": 146
+    },
+    {
+      "mode": "trained",
+      "rep": 1,
+      "id": "p2",
+      "group": "standard",
+      "tokens": 256,
+      "ms": 1232.513,
+      "prompt_ms": 127.454,
+      "wall_ms": 1426.9257029518485,
+      "rounds": 45,
+      "drafted": 305,
+      "accepted": 209
+    },
+    {
+      "mode": "trained",
+      "rep": 1,
+      "id": "p3",
+      "group": "standard",
+      "tokens": 256,
+      "ms": 2614.678,
+      "prompt_ms": 133.149,
+      "wall_ms": 2815.8725111279637,
+      "rounds": 97,
+      "drafted": 677,
+      "accepted": 158
+    },
+    {
+      "mode": "trained",
+      "rep": 1,
+      "id": "math",
+      "group": "standard",
+      "tokens": 256,
+      "ms": 1229.73,
+      "prompt_ms": 145.15,
+      "wall_ms": 1440.3470200486481,
+      "rounds": 45,
+      "drafted": 313,
+      "accepted": 210
+    },
+    {
+      "mode": "trained",
+      "rep": 1,
+      "id": "json",
+      "group": "standard",
+      "tokens": 256,
+      "ms": 1133.544,
+      "prompt_ms": 134.081,
+      "wall_ms": 1333.8381689973176,
+      "rounds": 41,
+      "drafted": 287,
+      "accepted": 213
+    },
+    {
+      "mode": "trained",
+      "rep": 1,
+      "id": "zh_dict",
+      "group": "holdout",
+      "tokens": 256,
+      "ms": 2726.54,
+      "prompt_ms": 138.369,
+      "wall_ms": 2931.7015840206295,
+      "rounds": 101,
+      "drafted": 707,
+      "accepted": 153
+    },
+    {
+      "mode": "trained",
+      "rep": 1,
+      "id": "en_edit",
+      "group": "holdout",
+      "tokens": 256,
+      "ms": 1744.072,
+      "prompt_ms": 140.239,
+      "wall_ms": 1950.5860130302608,
+      "rounds": 64,
+      "drafted": 445,
+      "accepted": 190
+    },
+    {
+      "mode": "trained",
+      "rep": 1,
+      "id": "code",
+      "group": "holdout",
+      "tokens": 256,
+      "ms": 1118.598,
+      "prompt_ms": 124.245,
+      "wall_ms": 1306.4446279313415,
+      "rounds": 41,
+      "drafted": 284,
+      "accepted": 214
+    },
+    {
+      "mode": "trained",
+      "rep": 1,
+      "id": "zh_json",
+      "group": "holdout",
+      "tokens": 256,
+      "ms": 2656.036,
+      "prompt_ms": 125.044,
+      "wall_ms": 2846.6595001518726,
+      "rounds": 84,
+      "drafted": 584,
+      "accepted": 170
+    },
+    {
+      "mode": "trained",
+      "rep": 2,
+      "id": "math",
+      "group": "standard",
+      "tokens": 256,
+      "ms": 1222.893,
+      "prompt_ms": 168.975,
+      "wall_ms": 1429.3106580153108,
+      "rounds": 45,
+      "drafted": 313,
+      "accepted": 210
+    },
+    {
+      "mode": "trained",
+      "rep": 2,
+      "id": "json",
+      "group": "standard",
+      "tokens": 256,
+      "ms": 1126.582,
+      "prompt_ms": 131.3,
+      "wall_ms": 1328.8776730187237,
+      "rounds": 41,
+      "drafted": 287,
+      "accepted": 213
+    },
+    {
+      "mode": "trained",
+      "rep": 2,
+      "id": "zh_dict",
+      "group": "holdout",
+      "tokens": 256,
+      "ms": 2708.687,
+      "prompt_ms": 127.513,
+      "wall_ms": 2904.039741959423,
+      "rounds": 101,
+      "drafted": 707,
+      "accepted": 153
+    },
+    {
+      "mode": "trained",
+      "rep": 2,
+      "id": "en_edit",
+      "group": "holdout",
+      "tokens": 256,
+      "ms": 1733.583,
+      "prompt_ms": 142.76,
+      "wall_ms": 1944.0569409634918,
+      "rounds": 64,
+      "drafted": 445,
+      "accepted": 190
+    },
+    {
+      "mode": "trained",
+      "rep": 2,
+      "id": "code",
+      "group": "holdout",
+      "tokens": 256,
+      "ms": 1112.943,
+      "prompt_ms": 126.147,
+      "wall_ms": 1304.274844005704,
+      "rounds": 41,
+      "drafted": 284,
+      "accepted": 214
+    },
+    {
+      "mode": "trained",
+      "rep": 2,
+      "id": "zh_json",
+      "group": "holdout",
+      "tokens": 256,
+      "ms": 2257.127,
+      "prompt_ms": 129.1,
+      "wall_ms": 2452.453404897824,
+      "rounds": 84,
+      "drafted": 584,
+      "accepted": 170
+    },
+    {
+      "mode": "trained",
+      "rep": 2,
+      "id": "p1",
+      "group": "standard",
+      "tokens": 256,
+      "ms": 2909.922,
+      "prompt_ms": 125.08,
+      "wall_ms": 3101.2426801025867,
+      "rounds": 109,
+      "drafted": 755,
+      "accepted": 146
+    },
+    {
+      "mode": "trained",
+      "rep": 2,
+      "id": "p2",
+      "group": "standard",
+      "tokens": 256,
+      "ms": 1221.663,
+      "prompt_ms": 127.67,
+      "wall_ms": 1412.6192249823362,
+      "rounds": 45,
+      "drafted": 305,
+      "accepted": 209
+    },
+    {
+      "mode": "trained",
+      "rep": 2,
+      "id": "p3",
+      "group": "standard",
+      "tokens": 256,
+      "ms": 2596.644,
+      "prompt_ms": 126.596,
+      "wall_ms": 2787.4070829711854,
+      "rounds": 97,
+      "drafted": 677,
+      "accepted": 158
+    },
+    {
+      "mode": "trained",
+      "rep": 3,
+      "id": "en_edit",
+      "group": "holdout",
+      "tokens": 256,
+      "ms": 1726.779,
+      "prompt_ms": 168.757,
+      "wall_ms": 1938.5313058737665,
+      "rounds": 64,
+      "drafted": 445,
+      "accepted": 190
+    },
+    {
+      "mode": "trained",
+      "rep": 3,
+      "id": "code",
+      "group": "holdout",
+      "tokens": 256,
+      "ms": 1106.755,
+      "prompt_ms": 127.068,
+      "wall_ms": 1304.0275960229337,
+      "rounds": 41,
+      "drafted": 284,
+      "accepted": 214
+    },
+    {
+      "mode": "trained",
+      "rep": 3,
+      "id": "zh_json",
+      "group": "holdout",
+      "tokens": 256,
+      "ms": 2247.094,
+      "prompt_ms": 132.615,
+      "wall_ms": 2446.9292238354683,
+      "rounds": 84,
+      "drafted": 584,
+      "accepted": 170
+    },
+    {
+      "mode": "trained",
+      "rep": 3,
+      "id": "p1",
+      "group": "standard",
+      "tokens": 256,
+      "ms": 2922.835,
+      "prompt_ms": 127.292,
+      "wall_ms": 3116.3124940358102,
+      "rounds": 109,
+      "drafted": 755,
+      "accepted": 146
+    },
+    {
+      "mode": "trained",
+      "rep": 3,
+      "id": "p2",
+      "group": "standard",
+      "tokens": 256,
+      "ms": 1217.824,
+      "prompt_ms": 124.558,
+      "wall_ms": 1408.380889100954,
+      "rounds": 45,
+      "drafted": 305,
+      "accepted": 209
+    },
+    {
+      "mode": "trained",
+      "rep": 3,
+      "id": "p3",
+      "group": "standard",
+      "tokens": 256,
+      "ms": 2581.745,
+      "prompt_ms": 128.793,
+      "wall_ms": 2775.3953288774937,
+      "rounds": 97,
+      "drafted": 677,
+      "accepted": 158
+    },
+    {
+      "mode": "trained",
+      "rep": 3,
+      "id": "math",
+      "group": "standard",
+      "tokens": 256,
+      "ms": 1218.961,
+      "prompt_ms": 141.614,
+      "wall_ms": 1426.0429900605232,
+      "rounds": 45,
+      "drafted": 313,
+      "accepted": 210
+    },
+    {
+      "mode": "trained",
+      "rep": 3,
+      "id": "json",
+      "group": "standard",
+      "tokens": 256,
+      "ms": 1127.189,
+      "prompt_ms": 129.071,
+      "wall_ms": 1320.3851140569896,
+      "rounds": 41,
+      "drafted": 287,
+      "accepted": 213
+    },
+    {
+      "mode": "trained",
+      "rep": 3,
+      "id": "zh_dict",
+      "group": "holdout",
+      "tokens": 256,
+      "ms": 2705.33,
+      "prompt_ms": 127.445,
+      "wall_ms": 2897.039548959583,
+      "rounds": 101,
+      "drafted": 707,
+      "accepted": 153
+    }
+  ],
+  "artifact_checks": {
+    "feature_bytes_identical": true,
+    "trained_weights_identical": true,
+    "model_sha256": "7b568caf12ca429ad538653c1e18b15aafe8033626b21f7d7dc36bbf8883be4d",
+    "deployed_test_hook_sha256": "4a4c6ef90f3861b871b15c1553a5f4b19f82e9e5ee8540d1fcf1280b72cf207c",
+    "rebuilt_hook_sha256": "4a4c6ef90f3861b871b15c1553a5f4b19f82e9e5ee8540d1fcf1280b72cf207c",
+    "official_verified": true
+  }
+}

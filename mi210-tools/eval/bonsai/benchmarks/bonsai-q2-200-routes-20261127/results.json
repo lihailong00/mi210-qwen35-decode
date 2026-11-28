@@ -1,0 +1,3035 @@
+{
+  "runs": {
+    "adapt-ideal7-1": {
+      "groups": {
+        "standard": {
+          "n": 1280,
+          "rounds": 222,
+          "ms": 6658.441,
+          "tps": 192.23719185917545,
+          "yield_per_round": 5.7657657657657655,
+          "ms_per_round": 29.992977477477478,
+          "drafted": 1171,
+          "accepted": 1052
+        },
+        "holdout": {
+          "n": 1024,
+          "rounds": 201,
+          "ms": 5806.299,
+          "tps": 176.36019088923942,
+          "yield_per_round": 5.0945273631840795,
+          "ms_per_round": 28.887059701492536,
+          "drafted": 966,
+          "accepted": 817
+        }
+      },
+      "requests": [
+        {
+          "id": "p1",
+          "n": 256,
+          "rounds": 64,
+          "ms": 1644.178,
+          "drafted": 245,
+          "accepted": 191,
+          "exact": true
+        },
+        {
+          "id": "p2",
+          "n": 256,
+          "rounds": 32,
+          "ms": 1127.321,
+          "drafted": 224,
+          "accepted": 222,
+          "exact": true
+        },
+        {
+          "id": "p3",
+          "n": 256,
+          "rounds": 57,
+          "ms": 1566.812,
+          "drafted": 251,
+          "accepted": 198,
+          "exact": true
+        },
+        {
+          "id": "math",
+          "n": 256,
+          "rounds": 35,
+          "ms": 1170.587,
+          "drafted": 227,
+          "accepted": 220,
+          "exact": true
+        },
+        {
+          "id": "json",
+          "n": 256,
+          "rounds": 34,
+          "ms": 1149.543,
+          "drafted": 224,
+          "accepted": 221,
+          "exact": true
+        },
+        {
+          "id": "zh_dict",
+          "n": 256,
+          "rounds": 70,
+          "ms": 1805.146,
+          "drafted": 274,
+          "accepted": 185,
+          "exact": true
+        },
+        {
+          "id": "en_edit",
+          "n": 256,
+          "rounds": 43,
+          "ms": 1312.719,
+          "drafted": 227,
+          "accepted": 212,
+          "exact": true
+        },
+        {
+          "id": "code",
+          "n": 256,
+          "rounds": 37,
+          "ms": 1208.516,
+          "drafted": 226,
+          "accepted": 217,
+          "exact": true
+        },
+        {
+          "id": "zh_json",
+          "n": 256,
+          "rounds": 51,
+          "ms": 1479.918,
+          "drafted": 239,
+          "accepted": 203,
+          "exact": true
+        }
+      ]
+    },
+    "adapt-ideal7-2": {
+      "groups": {
+        "standard": {
+          "n": 1280,
+          "rounds": 222,
+          "ms": 6859.630999999999,
+          "tps": 186.59895845709485,
+          "yield_per_round": 5.7657657657657655,
+          "ms_per_round": 30.899238738738735,
+          "drafted": 1171,
+          "accepted": 1052
+        },
+        "holdout": {
+          "n": 1024,
+          "rounds": 201,
+          "ms": 5781.148,
+          "tps": 177.12744942699962,
+          "yield_per_round": 5.0945273631840795,
+          "ms_per_round": 28.76193034825871,
+          "drafted": 966,
+          "accepted": 817
+        }
+      },
+      "requests": [
+        {
+          "id": "p1",
+          "n": 256,
+          "rounds": 64,
+          "ms": 1631.989,
+          "drafted": 245,
+          "accepted": 191,
+          "exact": true
+        },
+        {
+          "id": "p2",
+          "n": 256,
+          "rounds": 32,
+          "ms": 1125.444,
+          "drafted": 224,
+          "accepted": 222,
+          "exact": true
+        },
+        {
+          "id": "p3",
+          "n": 256,
+          "rounds": 57,
+          "ms": 1562.911,
+          "drafted": 251,
+          "accepted": 198,
+          "exact": true
+        },
+        {
+          "id": "math",
+          "n": 256,
+          "rounds": 35,
+          "ms": 1166.312,
+          "drafted": 227,
+          "accepted": 220,
+          "exact": true
+        },
+        {
+          "id": "json",
+          "n": 256,
+          "rounds": 34,
+          "ms": 1372.975,
+          "drafted": 224,
+          "accepted": 221,
+          "exact": true
+        },
+        {
+          "id": "zh_dict",
+          "n": 256,
+          "rounds": 70,
+          "ms": 1797.694,
+          "drafted": 274,
+          "accepted": 185,
+          "exact": true
+        },
+        {
+          "id": "en_edit",
+          "n": 256,
+          "rounds": 43,
+          "ms": 1308.693,
+          "drafted": 227,
+          "accepted": 212,
+          "exact": true
+        },
+        {
+          "id": "code",
+          "n": 256,
+          "rounds": 37,
+          "ms": 1209.812,
+          "drafted": 226,
+          "accepted": 217,
+          "exact": true
+        },
+        {
+          "id": "zh_json",
+          "n": 256,
+          "rounds": 51,
+          "ms": 1464.949,
+          "drafted": 239,
+          "accepted": 203,
+          "exact": true
+        }
+      ]
+    },
+    "adapt-real7-1": {
+      "groups": {
+        "standard": {
+          "n": 1280,
+          "rounds": 365,
+          "ms": 9547.789,
+          "tps": 134.06245152673566,
+          "yield_per_round": 3.506849315068493,
+          "ms_per_round": 26.158326027397262,
+          "drafted": 1533,
+          "accepted": 909
+        },
+        "holdout": {
+          "n": 1024,
+          "rounds": 334,
+          "ms": 8406.293,
+          "tps": 121.81350328854823,
+          "yield_per_round": 3.065868263473054,
+          "ms_per_round": 25.168541916167662,
+          "drafted": 1255,
+          "accepted": 683
+        }
+      },
+      "requests": [
+        {
+          "id": "p1",
+          "n": 256,
+          "rounds": 116,
+          "ms": 2580.447,
+          "drafted": 362,
+          "accepted": 139,
+          "exact": true
+        },
+        {
+          "id": "p2",
+          "n": 256,
+          "rounds": 47,
+          "ms": 1486.768,
+          "drafted": 265,
+          "accepted": 207,
+          "exact": true
+        },
+        {
+          "id": "p3",
+          "n": 256,
+          "rounds": 108,
+          "ms": 2555.632,
+          "drafted": 368,
+          "accepted": 147,
+          "exact": true
+        },
+        {
+          "id": "math",
+          "n": 256,
+          "rounds": 48,
+          "ms": 1513.069,
+          "drafted": 277,
+          "accepted": 207,
+          "exact": true
+        },
+        {
+          "id": "json",
+          "n": 256,
+          "rounds": 46,
+          "ms": 1411.873,
+          "drafted": 261,
+          "accepted": 209,
+          "exact": true
+        },
+        {
+          "id": "zh_dict",
+          "n": 256,
+          "rounds": 113,
+          "ms": 2663.414,
+          "drafted": 383,
+          "accepted": 141,
+          "exact": true
+        },
+        {
+          "id": "en_edit",
+          "n": 256,
+          "rounds": 80,
+          "ms": 2062.512,
+          "drafted": 309,
+          "accepted": 174,
+          "exact": true
+        },
+        {
+          "id": "code",
+          "n": 256,
+          "rounds": 54,
+          "ms": 1466.331,
+          "drafted": 230,
+          "accepted": 201,
+          "exact": true
+        },
+        {
+          "id": "zh_json",
+          "n": 256,
+          "rounds": 87,
+          "ms": 2214.036,
+          "drafted": 333,
+          "accepted": 167,
+          "exact": true
+        }
+      ]
+    },
+    "adapt-real7-2": {
+      "groups": {
+        "standard": {
+          "n": 1280,
+          "rounds": 365,
+          "ms": 9490.34,
+          "tps": 134.87398765481532,
+          "yield_per_round": 3.506849315068493,
+          "ms_per_round": 26.000931506849316,
+          "drafted": 1533,
+          "accepted": 909
+        },
+        "holdout": {
+          "n": 1024,
+          "rounds": 334,
+          "ms": 8360.14,
+          "tps": 122.48598707677145,
+          "yield_per_round": 3.065868263473054,
+          "ms_per_round": 25.030359281437125,
+          "drafted": 1255,
+          "accepted": 683
+        }
+      },
+      "requests": [
+        {
+          "id": "p1",
+          "n": 256,
+          "rounds": 116,
+          "ms": 2567.755,
+          "drafted": 362,
+          "accepted": 139,
+          "exact": true
+        },
+        {
+          "id": "p2",
+          "n": 256,
+          "rounds": 47,
+          "ms": 1478.847,
+          "drafted": 265,
+          "accepted": 207,
+          "exact": true
+        },
+        {
+          "id": "p3",
+          "n": 256,
+          "rounds": 108,
+          "ms": 2529.598,
+          "drafted": 368,
+          "accepted": 147,
+          "exact": true
+        },
+        {
+          "id": "math",
+          "n": 256,
+          "rounds": 48,
+          "ms": 1506.55,
+          "drafted": 277,
+          "accepted": 207,
+          "exact": true
+        },
+        {
+          "id": "json",
+          "n": 256,
+          "rounds": 46,
+          "ms": 1407.59,
+          "drafted": 261,
+          "accepted": 209,
+          "exact": true
+        },
+        {
+          "id": "zh_dict",
+          "n": 256,
+          "rounds": 113,
+          "ms": 2664.524,
+          "drafted": 383,
+          "accepted": 141,
+          "exact": true
+        },
+        {
+          "id": "en_edit",
+          "n": 256,
+          "rounds": 80,
+          "ms": 2038.295,
+          "drafted": 309,
+          "accepted": 174,
+          "exact": true
+        },
+        {
+          "id": "code",
+          "n": 256,
+          "rounds": 54,
+          "ms": 1456.083,
+          "drafted": 230,
+          "accepted": 201,
+          "exact": true
+        },
+        {
+          "id": "zh_json",
+          "n": 256,
+          "rounds": 87,
+          "ms": 2201.238,
+          "drafted": 333,
+          "accepted": 167,
+          "exact": true
+        }
+      ]
+    },
+    "fixft3-1": {
+      "groups": {
+        "standard": {
+          "n": 1280,
+          "rounds": 442,
+          "ms": 8974.255000000001,
+          "tps": 142.63022390159404,
+          "yield_per_round": 2.8959276018099547,
+          "ms_per_round": 20.303744343891406,
+          "drafted": 1321,
+          "accepted": 831
+        },
+        "holdout": {
+          "n": 1024,
+          "rounds": 379,
+          "ms": 7722.947,
+          "tps": 132.59187198876285,
+          "yield_per_round": 2.7018469656992083,
+          "ms_per_round": 20.377168865435358,
+          "drafted": 1137,
+          "accepted": 637
+        }
+      },
+      "requests": [
+        {
+          "id": "p1",
+          "n": 256,
+          "rounds": 115,
+          "ms": 2320.592,
+          "drafted": 344,
+          "accepted": 140,
+          "exact": true
+        },
+        {
+          "id": "p2",
+          "n": 256,
+          "rounds": 72,
+          "ms": 1475.927,
+          "drafted": 214,
+          "accepted": 182,
+          "exact": true
+        },
+        {
+          "id": "p3",
+          "n": 256,
+          "rounds": 111,
+          "ms": 2241.293,
+          "drafted": 333,
+          "accepted": 144,
+          "exact": true
+        },
+        {
+          "id": "math",
+          "n": 256,
+          "rounds": 73,
+          "ms": 1481.947,
+          "drafted": 217,
+          "accepted": 182,
+          "exact": true
+        },
+        {
+          "id": "json",
+          "n": 256,
+          "rounds": 71,
+          "ms": 1454.496,
+          "drafted": 213,
+          "accepted": 183,
+          "exact": true
+        },
+        {
+          "id": "zh_dict",
+          "n": 256,
+          "rounds": 117,
+          "ms": 2374.975,
+          "drafted": 351,
+          "accepted": 137,
+          "exact": true
+        },
+        {
+          "id": "en_edit",
+          "n": 256,
+          "rounds": 87,
+          "ms": 1775.968,
+          "drafted": 261,
+          "accepted": 167,
+          "exact": true
+        },
+        {
+          "id": "code",
+          "n": 256,
+          "rounds": 74,
+          "ms": 1515.956,
+          "drafted": 222,
+          "accepted": 180,
+          "exact": true
+        },
+        {
+          "id": "zh_json",
+          "n": 256,
+          "rounds": 101,
+          "ms": 2056.048,
+          "drafted": 303,
+          "accepted": 153,
+          "exact": true
+        }
+      ]
+    },
+    "fixft4-1": {
+      "groups": {
+        "standard": {
+          "n": 1280,
+          "rounds": 403,
+          "ms": 9876.287,
+          "tps": 129.60336207321637,
+          "yield_per_round": 3.176178660049628,
+          "ms_per_round": 24.506915632754342,
+          "drafted": 1603,
+          "accepted": 870
+        },
+        "holdout": {
+          "n": 1024,
+          "rounds": 339,
+          "ms": 8294.624,
+          "tps": 123.45345611808324,
+          "yield_per_round": 3.0206489675516224,
+          "ms_per_round": 24.467917404129793,
+          "drafted": 1354,
+          "accepted": 678
+        }
+      },
+      "requests": [
+        {
+          "id": "p1",
+          "n": 256,
+          "rounds": 112,
+          "ms": 2711.845,
+          "drafted": 446,
+          "accepted": 143,
+          "exact": true
+        },
+        {
+          "id": "p2",
+          "n": 256,
+          "rounds": 61,
+          "ms": 1539.129,
+          "drafted": 240,
+          "accepted": 193,
+          "exact": true
+        },
+        {
+          "id": "p3",
+          "n": 256,
+          "rounds": 110,
+          "ms": 2673.111,
+          "drafted": 438,
+          "accepted": 145,
+          "exact": true
+        },
+        {
+          "id": "math",
+          "n": 256,
+          "rounds": 60,
+          "ms": 1484.932,
+          "drafted": 240,
+          "accepted": 194,
+          "exact": true
+        },
+        {
+          "id": "json",
+          "n": 256,
+          "rounds": 60,
+          "ms": 1467.27,
+          "drafted": 239,
+          "accepted": 195,
+          "exact": true
+        },
+        {
+          "id": "zh_dict",
+          "n": 256,
+          "rounds": 111,
+          "ms": 2695.167,
+          "drafted": 443,
+          "accepted": 144,
+          "exact": true
+        },
+        {
+          "id": "en_edit",
+          "n": 256,
+          "rounds": 81,
+          "ms": 1987.287,
+          "drafted": 324,
+          "accepted": 173,
+          "exact": true
+        },
+        {
+          "id": "code",
+          "n": 256,
+          "rounds": 58,
+          "ms": 1433.332,
+          "drafted": 232,
+          "accepted": 196,
+          "exact": true
+        },
+        {
+          "id": "zh_json",
+          "n": 256,
+          "rounds": 89,
+          "ms": 2178.838,
+          "drafted": 355,
+          "accepted": 165,
+          "exact": true
+        }
+      ]
+    },
+    "fixft7-1": {
+      "groups": {
+        "standard": {
+          "n": 1280,
+          "rounds": 350,
+          "ms": 12098.773,
+          "tps": 105.79585219096185,
+          "yield_per_round": 3.657142857142857,
+          "ms_per_round": 34.567922857142854,
+          "drafted": 2426,
+          "accepted": 924
+        },
+        "holdout": {
+          "n": 1024,
+          "rounds": 309,
+          "ms": 10725.042,
+          "tps": 95.47748158002553,
+          "yield_per_round": 3.313915857605178,
+          "ms_per_round": 34.708873786407764,
+          "drafted": 2153,
+          "accepted": 708
+        }
+      },
+      "requests": [
+        {
+          "id": "p1",
+          "n": 256,
+          "rounds": 113,
+          "ms": 3875.428,
+          "drafted": 782,
+          "accepted": 142,
+          "exact": true
+        },
+        {
+          "id": "p2",
+          "n": 256,
+          "rounds": 45,
+          "ms": 1559.902,
+          "drafted": 305,
+          "accepted": 209,
+          "exact": true
+        },
+        {
+          "id": "p3",
+          "n": 256,
+          "rounds": 105,
+          "ms": 3632.067,
+          "drafted": 735,
+          "accepted": 150,
+          "exact": true
+        },
+        {
+          "id": "math",
+          "n": 256,
+          "rounds": 43,
+          "ms": 1501.285,
+          "drafted": 299,
+          "accepted": 212,
+          "exact": true
+        },
+        {
+          "id": "json",
+          "n": 256,
+          "rounds": 44,
+          "ms": 1530.091,
+          "drafted": 305,
+          "accepted": 211,
+          "exact": true
+        },
+        {
+          "id": "zh_dict",
+          "n": 256,
+          "rounds": 104,
+          "ms": 3606.287,
+          "drafted": 728,
+          "accepted": 150,
+          "exact": true
+        },
+        {
+          "id": "en_edit",
+          "n": 256,
+          "rounds": 70,
+          "ms": 2436.944,
+          "drafted": 487,
+          "accepted": 184,
+          "exact": true
+        },
+        {
+          "id": "code",
+          "n": 256,
+          "rounds": 51,
+          "ms": 1772.481,
+          "drafted": 354,
+          "accepted": 204,
+          "exact": true
+        },
+        {
+          "id": "zh_json",
+          "n": 256,
+          "rounds": 84,
+          "ms": 2909.33,
+          "drafted": 584,
+          "accepted": 170,
+          "exact": true
+        }
+      ]
+    },
+    "fixstock7-1": {
+      "groups": {
+        "standard": {
+          "n": 1280,
+          "rounds": 350,
+          "ms": 11908.828,
+          "tps": 107.48328886772066,
+          "yield_per_round": 3.657142857142857,
+          "ms_per_round": 34.02522285714286,
+          "drafted": 2431,
+          "accepted": 924
+        },
+        "holdout": {
+          "n": 1024,
+          "rounds": 318,
+          "ms": 10840.024,
+          "tps": 94.46473550243063,
+          "yield_per_round": 3.220125786163522,
+          "ms_per_round": 34.08812578616352,
+          "drafted": 2210,
+          "accepted": 698
+        }
+      },
+      "requests": [
+        {
+          "id": "p1",
+          "n": 256,
+          "rounds": 117,
+          "ms": 3952.857,
+          "drafted": 810,
+          "accepted": 138,
+          "exact": true
+        },
+        {
+          "id": "p2",
+          "n": 256,
+          "rounds": 44,
+          "ms": 1526.676,
+          "drafted": 308,
+          "accepted": 210,
+          "exact": true
+        },
+        {
+          "id": "p3",
+          "n": 256,
+          "rounds": 99,
+          "ms": 3361.08,
+          "drafted": 693,
+          "accepted": 156,
+          "exact": true
+        },
+        {
+          "id": "math",
+          "n": 256,
+          "rounds": 49,
+          "ms": 1670.049,
+          "drafted": 339,
+          "accepted": 206,
+          "exact": true
+        },
+        {
+          "id": "json",
+          "n": 256,
+          "rounds": 41,
+          "ms": 1398.166,
+          "drafted": 281,
+          "accepted": 214,
+          "exact": true
+        },
+        {
+          "id": "zh_dict",
+          "n": 256,
+          "rounds": 103,
+          "ms": 3510.285,
+          "drafted": 721,
+          "accepted": 151,
+          "exact": true
+        },
+        {
+          "id": "en_edit",
+          "n": 256,
+          "rounds": 79,
+          "ms": 2685.056,
+          "drafted": 545,
+          "accepted": 175,
+          "exact": true
+        },
+        {
+          "id": "code",
+          "n": 256,
+          "rounds": 55,
+          "ms": 1894.251,
+          "drafted": 385,
+          "accepted": 199,
+          "exact": true
+        },
+        {
+          "id": "zh_json",
+          "n": 256,
+          "rounds": 81,
+          "ms": 2750.432,
+          "drafted": 559,
+          "accepted": 173,
+          "exact": true
+        }
+      ]
+    },
+    "keepft3-1": {
+      "groups": {
+        "standard": {
+          "n": 1280,
+          "rounds": 320,
+          "ms": 6706.534,
+          "tps": 190.85864620980078,
+          "yield_per_round": 4.0,
+          "ms_per_round": 20.957918749999997,
+          "drafted": 955,
+          "accepted": 955
+        },
+        "holdout": {
+          "n": 1024,
+          "rounds": 256,
+          "ms": 5360.417,
+          "tps": 191.0299142771915,
+          "yield_per_round": 4.0,
+          "ms_per_round": 20.93912890625,
+          "drafted": 764,
+          "accepted": 764
+        }
+      },
+      "requests": [
+        {
+          "id": "p1",
+          "n": 256,
+          "rounds": 64,
+          "ms": 1346.73,
+          "drafted": 191,
+          "accepted": 191,
+          "exact": true
+        },
+        {
+          "id": "p2",
+          "n": 256,
+          "rounds": 64,
+          "ms": 1339.47,
+          "drafted": 191,
+          "accepted": 191,
+          "exact": true
+        },
+        {
+          "id": "p3",
+          "n": 256,
+          "rounds": 64,
+          "ms": 1339.41,
+          "drafted": 191,
+          "accepted": 191,
+          "exact": true
+        },
+        {
+          "id": "math",
+          "n": 256,
+          "rounds": 64,
+          "ms": 1339.322,
+          "drafted": 191,
+          "accepted": 191,
+          "exact": true
+        },
+        {
+          "id": "json",
+          "n": 256,
+          "rounds": 64,
+          "ms": 1341.602,
+          "drafted": 191,
+          "accepted": 191,
+          "exact": true
+        },
+        {
+          "id": "zh_dict",
+          "n": 256,
+          "rounds": 64,
+          "ms": 1341.688,
+          "drafted": 191,
+          "accepted": 191,
+          "exact": true
+        },
+        {
+          "id": "en_edit",
+          "n": 256,
+          "rounds": 64,
+          "ms": 1340.204,
+          "drafted": 191,
+          "accepted": 191,
+          "exact": true
+        },
+        {
+          "id": "code",
+          "n": 256,
+          "rounds": 64,
+          "ms": 1338.279,
+          "drafted": 191,
+          "accepted": 191,
+          "exact": true
+        },
+        {
+          "id": "zh_json",
+          "n": 256,
+          "rounds": 64,
+          "ms": 1340.246,
+          "drafted": 191,
+          "accepted": 191,
+          "exact": true
+        }
+      ]
+    },
+    "keepft4-1": {
+      "groups": {
+        "standard": {
+          "n": 1280,
+          "rounds": 255,
+          "ms": 6228.221,
+          "tps": 205.51614979622593,
+          "yield_per_round": 5.019607843137255,
+          "ms_per_round": 24.42439607843137,
+          "drafted": 1020,
+          "accepted": 1020
+        },
+        "holdout": {
+          "n": 1024,
+          "rounds": 204,
+          "ms": 4984.0019999999995,
+          "tps": 205.4573814376479,
+          "yield_per_round": 5.019607843137255,
+          "ms_per_round": 24.431382352941174,
+          "drafted": 816,
+          "accepted": 816
+        }
+      },
+      "requests": [
+        {
+          "id": "p1",
+          "n": 256,
+          "rounds": 51,
+          "ms": 1244.017,
+          "drafted": 204,
+          "accepted": 204,
+          "exact": true
+        },
+        {
+          "id": "p2",
+          "n": 256,
+          "rounds": 51,
+          "ms": 1245.177,
+          "drafted": 204,
+          "accepted": 204,
+          "exact": true
+        },
+        {
+          "id": "p3",
+          "n": 256,
+          "rounds": 51,
+          "ms": 1246.89,
+          "drafted": 204,
+          "accepted": 204,
+          "exact": true
+        },
+        {
+          "id": "math",
+          "n": 256,
+          "rounds": 51,
+          "ms": 1246.774,
+          "drafted": 204,
+          "accepted": 204,
+          "exact": true
+        },
+        {
+          "id": "json",
+          "n": 256,
+          "rounds": 51,
+          "ms": 1245.363,
+          "drafted": 204,
+          "accepted": 204,
+          "exact": true
+        },
+        {
+          "id": "zh_dict",
+          "n": 256,
+          "rounds": 51,
+          "ms": 1246.512,
+          "drafted": 204,
+          "accepted": 204,
+          "exact": true
+        },
+        {
+          "id": "en_edit",
+          "n": 256,
+          "rounds": 51,
+          "ms": 1247.654,
+          "drafted": 204,
+          "accepted": 204,
+          "exact": true
+        },
+        {
+          "id": "code",
+          "n": 256,
+          "rounds": 51,
+          "ms": 1243.793,
+          "drafted": 204,
+          "accepted": 204,
+          "exact": true
+        },
+        {
+          "id": "zh_json",
+          "n": 256,
+          "rounds": 51,
+          "ms": 1246.043,
+          "drafted": 204,
+          "accepted": 204,
+          "exact": true
+        }
+      ]
+    },
+    "keepft7-1": {
+      "groups": {
+        "standard": {
+          "n": 1280,
+          "rounds": 160,
+          "ms": 5614.92,
+          "tps": 227.96406716391328,
+          "yield_per_round": 8.0,
+          "ms_per_round": 35.09325,
+          "drafted": 1115,
+          "accepted": 1115
+        },
+        "holdout": {
+          "n": 1024,
+          "rounds": 128,
+          "ms": 4627.57,
+          "tps": 221.28244413374622,
+          "yield_per_round": 8.0,
+          "ms_per_round": 36.152890625,
+          "drafted": 892,
+          "accepted": 892
+        }
+      },
+      "requests": [
+        {
+          "id": "p1",
+          "n": 256,
+          "rounds": 32,
+          "ms": 1122.471,
+          "drafted": 223,
+          "accepted": 223,
+          "exact": true
+        },
+        {
+          "id": "p2",
+          "n": 256,
+          "rounds": 32,
+          "ms": 1122.674,
+          "drafted": 223,
+          "accepted": 223,
+          "exact": true
+        },
+        {
+          "id": "p3",
+          "n": 256,
+          "rounds": 32,
+          "ms": 1123.646,
+          "drafted": 223,
+          "accepted": 223,
+          "exact": true
+        },
+        {
+          "id": "math",
+          "n": 256,
+          "rounds": 32,
+          "ms": 1122.538,
+          "drafted": 223,
+          "accepted": 223,
+          "exact": true
+        },
+        {
+          "id": "json",
+          "n": 256,
+          "rounds": 32,
+          "ms": 1123.591,
+          "drafted": 223,
+          "accepted": 223,
+          "exact": true
+        },
+        {
+          "id": "zh_dict",
+          "n": 256,
+          "rounds": 32,
+          "ms": 1122.247,
+          "drafted": 223,
+          "accepted": 223,
+          "exact": true
+        },
+        {
+          "id": "en_edit",
+          "n": 256,
+          "rounds": 32,
+          "ms": 1125.514,
+          "drafted": 223,
+          "accepted": 223,
+          "exact": true
+        },
+        {
+          "id": "code",
+          "n": 256,
+          "rounds": 32,
+          "ms": 1208.66,
+          "drafted": 223,
+          "accepted": 223,
+          "exact": true
+        },
+        {
+          "id": "zh_json",
+          "n": 256,
+          "rounds": 32,
+          "ms": 1171.149,
+          "drafted": 223,
+          "accepted": 223,
+          "exact": true
+        }
+      ]
+    },
+    "lattice3-1": {
+      "groups": {
+        "standard": {
+          "n": 1280,
+          "rounds": 348,
+          "ms": 6983.8150000000005,
+          "tps": 183.28091451448813,
+          "yield_per_round": 3.67816091954023,
+          "ms_per_round": 20.06843390804598,
+          "drafted": 1040,
+          "accepted": 926
+        },
+        "holdout": {
+          "n": 1024,
+          "rounds": 295,
+          "ms": 5946.732,
+          "tps": 172.19541758397722,
+          "yield_per_round": 3.471186440677966,
+          "ms_per_round": 20.158413559322035,
+          "drafted": 882,
+          "accepted": 723
+        }
+      },
+      "requests": [
+        {
+          "id": "p1",
+          "n": 256,
+          "rounds": 77,
+          "ms": 1539.371,
+          "drafted": 230,
+          "accepted": 178,
+          "exact": true
+        },
+        {
+          "id": "p2",
+          "n": 256,
+          "rounds": 64,
+          "ms": 1283.144,
+          "drafted": 191,
+          "accepted": 191,
+          "exact": true
+        },
+        {
+          "id": "p3",
+          "n": 256,
+          "rounds": 76,
+          "ms": 1534.959,
+          "drafted": 228,
+          "accepted": 178,
+          "exact": true
+        },
+        {
+          "id": "math",
+          "n": 256,
+          "rounds": 66,
+          "ms": 1322.61,
+          "drafted": 196,
+          "accepted": 189,
+          "exact": true
+        },
+        {
+          "id": "json",
+          "n": 256,
+          "rounds": 65,
+          "ms": 1303.731,
+          "drafted": 195,
+          "accepted": 190,
+          "exact": true
+        },
+        {
+          "id": "zh_dict",
+          "n": 256,
+          "rounds": 86,
+          "ms": 1719.439,
+          "drafted": 256,
+          "accepted": 169,
+          "exact": true
+        },
+        {
+          "id": "en_edit",
+          "n": 256,
+          "rounds": 68,
+          "ms": 1371.237,
+          "drafted": 203,
+          "accepted": 187,
+          "exact": true
+        },
+        {
+          "id": "code",
+          "n": 256,
+          "rounds": 67,
+          "ms": 1360.112,
+          "drafted": 201,
+          "accepted": 187,
+          "exact": true
+        },
+        {
+          "id": "zh_json",
+          "n": 256,
+          "rounds": 74,
+          "ms": 1495.944,
+          "drafted": 222,
+          "accepted": 180,
+          "exact": true
+        }
+      ]
+    },
+    "lattice4-1": {
+      "groups": {
+        "standard": {
+          "n": 1280,
+          "rounds": 297,
+          "ms": 7185.517,
+          "tps": 178.1361034981895,
+          "yield_per_round": 4.30976430976431,
+          "ms_per_round": 24.193659932659934,
+          "drafted": 1179,
+          "accepted": 978
+        },
+        "holdout": {
+          "n": 1024,
+          "rounds": 252,
+          "ms": 6303.376,
+          "tps": 162.45262855967977,
+          "yield_per_round": 4.063492063492063,
+          "ms_per_round": 25.013396825396825,
+          "drafted": 1004,
+          "accepted": 765
+        }
+      },
+      "requests": [
+        {
+          "id": "p1",
+          "n": 256,
+          "rounds": 70,
+          "ms": 1689.281,
+          "drafted": 278,
+          "accepted": 185,
+          "exact": true
+        },
+        {
+          "id": "p2",
+          "n": 256,
+          "rounds": 52,
+          "ms": 1259.105,
+          "drafted": 205,
+          "accepted": 203,
+          "exact": true
+        },
+        {
+          "id": "p3",
+          "n": 256,
+          "rounds": 69,
+          "ms": 1665.328,
+          "drafted": 275,
+          "accepted": 186,
+          "exact": true
+        },
+        {
+          "id": "math",
+          "n": 256,
+          "rounds": 54,
+          "ms": 1309.769,
+          "drafted": 214,
+          "accepted": 201,
+          "exact": true
+        },
+        {
+          "id": "json",
+          "n": 256,
+          "rounds": 52,
+          "ms": 1262.034,
+          "drafted": 207,
+          "accepted": 203,
+          "exact": true
+        },
+        {
+          "id": "zh_dict",
+          "n": 256,
+          "rounds": 77,
+          "ms": 1872.266,
+          "drafted": 308,
+          "accepted": 177,
+          "exact": true
+        },
+        {
+          "id": "en_edit",
+          "n": 256,
+          "rounds": 57,
+          "ms": 1379.816,
+          "drafted": 225,
+          "accepted": 198,
+          "exact": true
+        },
+        {
+          "id": "code",
+          "n": 256,
+          "rounds": 54,
+          "ms": 1325.045,
+          "drafted": 216,
+          "accepted": 200,
+          "exact": true
+        },
+        {
+          "id": "zh_json",
+          "n": 256,
+          "rounds": 64,
+          "ms": 1726.249,
+          "drafted": 255,
+          "accepted": 190,
+          "exact": true
+        }
+      ]
+    },
+    "lattice7-1": {
+      "groups": {
+        "standard": {
+          "n": 1280,
+          "rounds": 220,
+          "ms": 7524.057000000001,
+          "tps": 170.12098659008032,
+          "yield_per_round": 5.818181818181818,
+          "ms_per_round": 34.20025909090909,
+          "drafted": 1521,
+          "accepted": 1054
+        },
+        "holdout": {
+          "n": 1024,
+          "rounds": 195,
+          "ms": 7174.028,
+          "tps": 142.73710668539348,
+          "yield_per_round": 5.251282051282051,
+          "ms_per_round": 36.78988717948718,
+          "drafted": 1350,
+          "accepted": 823
+        }
+      },
+      "requests": [
+        {
+          "id": "p1",
+          "n": 256,
+          "rounds": 63,
+          "ms": 2126.678,
+          "drafted": 433,
+          "accepted": 192,
+          "exact": true
+        },
+        {
+          "id": "p2",
+          "n": 256,
+          "rounds": 32,
+          "ms": 1120.544,
+          "drafted": 224,
+          "accepted": 222,
+          "exact": true
+        },
+        {
+          "id": "p3",
+          "n": 256,
+          "rounds": 57,
+          "ms": 1934.852,
+          "drafted": 394,
+          "accepted": 198,
+          "exact": true
+        },
+        {
+          "id": "math",
+          "n": 256,
+          "rounds": 35,
+          "ms": 1196.93,
+          "drafted": 239,
+          "accepted": 220,
+          "exact": true
+        },
+        {
+          "id": "json",
+          "n": 256,
+          "rounds": 33,
+          "ms": 1145.053,
+          "drafted": 231,
+          "accepted": 222,
+          "exact": true
+        },
+        {
+          "id": "zh_dict",
+          "n": 256,
+          "rounds": 66,
+          "ms": 2735.829,
+          "drafted": 456,
+          "accepted": 189,
+          "exact": true
+        },
+        {
+          "id": "en_edit",
+          "n": 256,
+          "rounds": 41,
+          "ms": 1424.343,
+          "drafted": 286,
+          "accepted": 213,
+          "exact": true
+        },
+        {
+          "id": "code",
+          "n": 256,
+          "rounds": 37,
+          "ms": 1264.451,
+          "drafted": 255,
+          "accepted": 218,
+          "exact": true
+        },
+        {
+          "id": "zh_json",
+          "n": 256,
+          "rounds": 51,
+          "ms": 1749.405,
+          "drafted": 353,
+          "accepted": 203,
+          "exact": true
+        }
+      ]
+    },
+    "online7-1": {
+      "groups": {
+        "standard": {
+          "n": 1280,
+          "rounds": 349,
+          "ms": 12206.388,
+          "tps": 104.86312576660679,
+          "yield_per_round": 3.667621776504298,
+          "ms_per_round": 34.97532378223496,
+          "drafted": 2419,
+          "accepted": 925
+        },
+        "holdout": {
+          "n": 1024,
+          "rounds": 311,
+          "ms": 10696.948,
+          "tps": 95.72823949410616,
+          "yield_per_round": 3.292604501607717,
+          "ms_per_round": 34.39533118971061,
+          "drafted": 2164,
+          "accepted": 706
+        }
+      },
+      "requests": [
+        {
+          "id": "p1",
+          "n": 256,
+          "rounds": 112,
+          "ms": 3817.253,
+          "drafted": 775,
+          "accepted": 143,
+          "exact": true
+        },
+        {
+          "id": "p2",
+          "n": 256,
+          "rounds": 45,
+          "ms": 1547.516,
+          "drafted": 305,
+          "accepted": 209,
+          "exact": true
+        },
+        {
+          "id": "p3",
+          "n": 256,
+          "rounds": 105,
+          "ms": 3837.732,
+          "drafted": 735,
+          "accepted": 150,
+          "exact": true
+        },
+        {
+          "id": "math",
+          "n": 256,
+          "rounds": 43,
+          "ms": 1487.339,
+          "drafted": 299,
+          "accepted": 212,
+          "exact": true
+        },
+        {
+          "id": "json",
+          "n": 256,
+          "rounds": 44,
+          "ms": 1516.548,
+          "drafted": 305,
+          "accepted": 211,
+          "exact": true
+        },
+        {
+          "id": "zh_dict",
+          "n": 256,
+          "rounds": 108,
+          "ms": 3712.678,
+          "drafted": 756,
+          "accepted": 146,
+          "exact": true
+        },
+        {
+          "id": "en_edit",
+          "n": 256,
+          "rounds": 69,
+          "ms": 2379.539,
+          "drafted": 479,
+          "accepted": 185,
+          "exact": true
+        },
+        {
+          "id": "code",
+          "n": 256,
+          "rounds": 50,
+          "ms": 1716.846,
+          "drafted": 345,
+          "accepted": 205,
+          "exact": true
+        },
+        {
+          "id": "zh_json",
+          "n": 256,
+          "rounds": 84,
+          "ms": 2887.885,
+          "drafted": 584,
+          "accepted": 170,
+          "exact": true
+        }
+      ]
+    },
+    "oracle3-1": {
+      "groups": {
+        "standard": {
+          "n": 1280,
+          "rounds": 320,
+          "ms": 5500.866,
+          "tps": 232.6906345291814,
+          "yield_per_round": 4.0,
+          "ms_per_round": 17.19020625,
+          "drafted": 955,
+          "accepted": 955
+        },
+        "holdout": {
+          "n": 1024,
+          "rounds": 256,
+          "ms": 4410.294,
+          "tps": 232.1840675474243,
+          "yield_per_round": 4.0,
+          "ms_per_round": 17.2277109375,
+          "drafted": 764,
+          "accepted": 764
+        }
+      },
+      "requests": [
+        {
+          "id": "p1",
+          "n": 256,
+          "rounds": 64,
+          "ms": 1098.142,
+          "drafted": 191,
+          "accepted": 191,
+          "exact": true
+        },
+        {
+          "id": "p2",
+          "n": 256,
+          "rounds": 64,
+          "ms": 1100.515,
+          "drafted": 191,
+          "accepted": 191,
+          "exact": true
+        },
+        {
+          "id": "p3",
+          "n": 256,
+          "rounds": 64,
+          "ms": 1100.941,
+          "drafted": 191,
+          "accepted": 191,
+          "exact": true
+        },
+        {
+          "id": "math",
+          "n": 256,
+          "rounds": 64,
+          "ms": 1100.575,
+          "drafted": 191,
+          "accepted": 191,
+          "exact": true
+        },
+        {
+          "id": "json",
+          "n": 256,
+          "rounds": 64,
+          "ms": 1100.693,
+          "drafted": 191,
+          "accepted": 191,
+          "exact": true
+        },
+        {
+          "id": "zh_dict",
+          "n": 256,
+          "rounds": 64,
+          "ms": 1099.936,
+          "drafted": 191,
+          "accepted": 191,
+          "exact": true
+        },
+        {
+          "id": "en_edit",
+          "n": 256,
+          "rounds": 64,
+          "ms": 1103.773,
+          "drafted": 191,
+          "accepted": 191,
+          "exact": true
+        },
+        {
+          "id": "code",
+          "n": 256,
+          "rounds": 64,
+          "ms": 1100.938,
+          "drafted": 191,
+          "accepted": 191,
+          "exact": true
+        },
+        {
+          "id": "zh_json",
+          "n": 256,
+          "rounds": 64,
+          "ms": 1105.647,
+          "drafted": 191,
+          "accepted": 191,
+          "exact": true
+        }
+      ]
+    },
+    "oracle4-1": {
+      "groups": {
+        "standard": {
+          "n": 1280,
+          "rounds": 255,
+          "ms": 5166.092,
+          "tps": 247.76949384563807,
+          "yield_per_round": 5.019607843137255,
+          "ms_per_round": 20.259184313725488,
+          "drafted": 1020,
+          "accepted": 1020
+        },
+        "holdout": {
+          "n": 1024,
+          "rounds": 204,
+          "ms": 4135.902,
+          "tps": 247.58807147751565,
+          "yield_per_round": 5.019607843137255,
+          "ms_per_round": 20.274029411764705,
+          "drafted": 816,
+          "accepted": 816
+        }
+      },
+      "requests": [
+        {
+          "id": "p1",
+          "n": 256,
+          "rounds": 51,
+          "ms": 1032.892,
+          "drafted": 204,
+          "accepted": 204,
+          "exact": true
+        },
+        {
+          "id": "p2",
+          "n": 256,
+          "rounds": 51,
+          "ms": 1032.033,
+          "drafted": 204,
+          "accepted": 204,
+          "exact": true
+        },
+        {
+          "id": "p3",
+          "n": 256,
+          "rounds": 51,
+          "ms": 1032.798,
+          "drafted": 204,
+          "accepted": 204,
+          "exact": true
+        },
+        {
+          "id": "math",
+          "n": 256,
+          "rounds": 51,
+          "ms": 1034.245,
+          "drafted": 204,
+          "accepted": 204,
+          "exact": true
+        },
+        {
+          "id": "json",
+          "n": 256,
+          "rounds": 51,
+          "ms": 1034.124,
+          "drafted": 204,
+          "accepted": 204,
+          "exact": true
+        },
+        {
+          "id": "zh_dict",
+          "n": 256,
+          "rounds": 51,
+          "ms": 1037.396,
+          "drafted": 204,
+          "accepted": 204,
+          "exact": true
+        },
+        {
+          "id": "en_edit",
+          "n": 256,
+          "rounds": 51,
+          "ms": 1033.611,
+          "drafted": 204,
+          "accepted": 204,
+          "exact": true
+        },
+        {
+          "id": "code",
+          "n": 256,
+          "rounds": 51,
+          "ms": 1032.13,
+          "drafted": 204,
+          "accepted": 204,
+          "exact": true
+        },
+        {
+          "id": "zh_json",
+          "n": 256,
+          "rounds": 51,
+          "ms": 1032.765,
+          "drafted": 204,
+          "accepted": 204,
+          "exact": true
+        }
+      ]
+    },
+    "oracle7-1": {
+      "groups": {
+        "standard": {
+          "n": 1280,
+          "rounds": 160,
+          "ms": 4740.752,
+          "tps": 269.99935875152295,
+          "yield_per_round": 8.0,
+          "ms_per_round": 29.629700000000003,
+          "drafted": 1115,
+          "accepted": 1115
+        },
+        "holdout": {
+          "n": 1024,
+          "rounds": 128,
+          "ms": 3798.169,
+          "tps": 269.60359057219415,
+          "yield_per_round": 8.0,
+          "ms_per_round": 29.6731953125,
+          "drafted": 892,
+          "accepted": 892
+        }
+      },
+      "requests": [
+        {
+          "id": "p1",
+          "n": 256,
+          "rounds": 32,
+          "ms": 947.01,
+          "drafted": 223,
+          "accepted": 223,
+          "exact": true
+        },
+        {
+          "id": "p2",
+          "n": 256,
+          "rounds": 32,
+          "ms": 946.823,
+          "drafted": 223,
+          "accepted": 223,
+          "exact": true
+        },
+        {
+          "id": "p3",
+          "n": 256,
+          "rounds": 32,
+          "ms": 948.673,
+          "drafted": 223,
+          "accepted": 223,
+          "exact": true
+        },
+        {
+          "id": "math",
+          "n": 256,
+          "rounds": 32,
+          "ms": 949.782,
+          "drafted": 223,
+          "accepted": 223,
+          "exact": true
+        },
+        {
+          "id": "json",
+          "n": 256,
+          "rounds": 32,
+          "ms": 948.464,
+          "drafted": 223,
+          "accepted": 223,
+          "exact": true
+        },
+        {
+          "id": "zh_dict",
+          "n": 256,
+          "rounds": 32,
+          "ms": 949.448,
+          "drafted": 223,
+          "accepted": 223,
+          "exact": true
+        },
+        {
+          "id": "en_edit",
+          "n": 256,
+          "rounds": 32,
+          "ms": 953.429,
+          "drafted": 223,
+          "accepted": 223,
+          "exact": true
+        },
+        {
+          "id": "code",
+          "n": 256,
+          "rounds": 32,
+          "ms": 947.905,
+          "drafted": 223,
+          "accepted": 223,
+          "exact": true
+        },
+        {
+          "id": "zh_json",
+          "n": 256,
+          "rounds": 32,
+          "ms": 947.387,
+          "drafted": 223,
+          "accepted": 223,
+          "exact": true
+        }
+      ]
+    },
+    "phaseft7-1": {
+      "groups": {
+        "standard": {
+          "n": 1280,
+          "rounds": 350,
+          "ms": 12092.926,
+          "tps": 105.84700510033717,
+          "yield_per_round": 3.657142857142857,
+          "ms_per_round": 34.55121714285714,
+          "drafted": 2426,
+          "accepted": 924
+        },
+        "holdout": {
+          "n": 1024,
+          "rounds": 309,
+          "ms": 10430.87,
+          "tps": 98.17014304655315,
+          "yield_per_round": 3.313915857605178,
+          "ms_per_round": 33.75686084142395,
+          "drafted": 2153,
+          "accepted": 708
+        }
+      },
+      "requests": [
+        {
+          "id": "p1",
+          "n": 256,
+          "rounds": 113,
+          "ms": 4099.471,
+          "drafted": 782,
+          "accepted": 142,
+          "exact": true
+        },
+        {
+          "id": "p2",
+          "n": 256,
+          "rounds": 45,
+          "ms": 1519.917,
+          "drafted": 305,
+          "accepted": 209,
+          "exact": true
+        },
+        {
+          "id": "p3",
+          "n": 256,
+          "rounds": 105,
+          "ms": 3520.356,
+          "drafted": 735,
+          "accepted": 150,
+          "exact": true
+        },
+        {
+          "id": "math",
+          "n": 256,
+          "rounds": 43,
+          "ms": 1462.749,
+          "drafted": 299,
+          "accepted": 212,
+          "exact": true
+        },
+        {
+          "id": "json",
+          "n": 256,
+          "rounds": 44,
+          "ms": 1490.433,
+          "drafted": 305,
+          "accepted": 211,
+          "exact": true
+        },
+        {
+          "id": "zh_dict",
+          "n": 256,
+          "rounds": 104,
+          "ms": 3507.708,
+          "drafted": 728,
+          "accepted": 150,
+          "exact": true
+        },
+        {
+          "id": "en_edit",
+          "n": 256,
+          "rounds": 70,
+          "ms": 2368.28,
+          "drafted": 487,
+          "accepted": 184,
+          "exact": true
+        },
+        {
+          "id": "code",
+          "n": 256,
+          "rounds": 51,
+          "ms": 1721.987,
+          "drafted": 354,
+          "accepted": 204,
+          "exact": true
+        },
+        {
+          "id": "zh_json",
+          "n": 256,
+          "rounds": 84,
+          "ms": 2832.895,
+          "drafted": 584,
+          "accepted": 170,
+          "exact": true
+        }
+      ]
+    },
+    "phasereal3-1": {
+      "groups": {
+        "standard": {
+          "n": 1280,
+          "rounds": 425,
+          "ms": 8777.007,
+          "tps": 145.83559065180194,
+          "yield_per_round": 3.011764705882353,
+          "ms_per_round": 20.65178117647059,
+          "drafted": 1272,
+          "accepted": 848
+        },
+        "holdout": {
+          "n": 1024,
+          "rounds": 362,
+          "ms": 7602.773,
+          "tps": 134.6876988172605,
+          "yield_per_round": 2.8287292817679557,
+          "ms_per_round": 21.00213535911602,
+          "drafted": 1084,
+          "accepted": 655
+        }
+      },
+      "requests": [
+        {
+          "id": "p1",
+          "n": 256,
+          "rounds": 114,
+          "ms": 2334.54,
+          "drafted": 340,
+          "accepted": 141,
+          "exact": true
+        },
+        {
+          "id": "p2",
+          "n": 256,
+          "rounds": 71,
+          "ms": 1483.436,
+          "drafted": 213,
+          "accepted": 183,
+          "exact": true
+        },
+        {
+          "id": "p3",
+          "n": 256,
+          "rounds": 97,
+          "ms": 1996.006,
+          "drafted": 291,
+          "accepted": 158,
+          "exact": true
+        },
+        {
+          "id": "math",
+          "n": 256,
+          "rounds": 74,
+          "ms": 1539.974,
+          "drafted": 222,
+          "accepted": 180,
+          "exact": true
+        },
+        {
+          "id": "json",
+          "n": 256,
+          "rounds": 69,
+          "ms": 1423.051,
+          "drafted": 206,
+          "accepted": 186,
+          "exact": true
+        },
+        {
+          "id": "zh_dict",
+          "n": 256,
+          "rounds": 109,
+          "ms": 2250.888,
+          "drafted": 327,
+          "accepted": 145,
+          "exact": true
+        },
+        {
+          "id": "en_edit",
+          "n": 256,
+          "rounds": 88,
+          "ms": 1939.598,
+          "drafted": 264,
+          "accepted": 166,
+          "exact": true
+        },
+        {
+          "id": "code",
+          "n": 256,
+          "rounds": 74,
+          "ms": 1524.945,
+          "drafted": 220,
+          "accepted": 181,
+          "exact": true
+        },
+        {
+          "id": "zh_json",
+          "n": 256,
+          "rounds": 91,
+          "ms": 1887.342,
+          "drafted": 273,
+          "accepted": 163,
+          "exact": true
+        }
+      ]
+    },
+    "record3-1": {
+      "groups": {
+        "standard": {
+          "n": 1280,
+          "rounds": 425,
+          "ms": 8549.506000000001,
+          "tps": 149.71625261155438,
+          "yield_per_round": 3.011764705882353,
+          "ms_per_round": 20.116484705882357,
+          "drafted": 1272,
+          "accepted": 848
+        },
+        "holdout": {
+          "n": 1024,
+          "rounds": 362,
+          "ms": 7611.063,
+          "tps": 134.54099644162713,
+          "yield_per_round": 2.8287292817679557,
+          "ms_per_round": 21.02503591160221,
+          "drafted": 1084,
+          "accepted": 655
+        }
+      },
+      "requests": [
+        {
+          "id": "p1",
+          "n": 256,
+          "rounds": 114,
+          "ms": 2272.454,
+          "drafted": 340,
+          "accepted": 141,
+          "exact": true
+        },
+        {
+          "id": "p2",
+          "n": 256,
+          "rounds": 71,
+          "ms": 1441.873,
+          "drafted": 213,
+          "accepted": 183,
+          "exact": true
+        },
+        {
+          "id": "p3",
+          "n": 256,
+          "rounds": 97,
+          "ms": 1940.835,
+          "drafted": 291,
+          "accepted": 158,
+          "exact": true
+        },
+        {
+          "id": "math",
+          "n": 256,
+          "rounds": 74,
+          "ms": 1504.068,
+          "drafted": 222,
+          "accepted": 180,
+          "exact": true
+        },
+        {
+          "id": "json",
+          "n": 256,
+          "rounds": 69,
+          "ms": 1390.276,
+          "drafted": 206,
+          "accepted": 186,
+          "exact": true
+        },
+        {
+          "id": "zh_dict",
+          "n": 256,
+          "rounds": 109,
+          "ms": 2489.546,
+          "drafted": 327,
+          "accepted": 145,
+          "exact": true
+        },
+        {
+          "id": "en_edit",
+          "n": 256,
+          "rounds": 88,
+          "ms": 1781.017,
+          "drafted": 264,
+          "accepted": 166,
+          "exact": true
+        },
+        {
+          "id": "code",
+          "n": 256,
+          "rounds": 74,
+          "ms": 1500.589,
+          "drafted": 220,
+          "accepted": 181,
+          "exact": true
+        },
+        {
+          "id": "zh_json",
+          "n": 256,
+          "rounds": 91,
+          "ms": 1839.911,
+          "drafted": 273,
+          "accepted": 163,
+          "exact": true
+        }
+      ]
+    },
+    "record4-1": {
+      "groups": {
+        "standard": {
+          "n": 1280,
+          "rounds": 384,
+          "ms": 9309.004,
+          "tps": 137.5012837033908,
+          "yield_per_round": 3.3333333333333335,
+          "ms_per_round": 24.24219791666667,
+          "drafted": 1524,
+          "accepted": 890
+        },
+        "holdout": {
+          "n": 1024,
+          "rounds": 325,
+          "ms": 7898.034,
+          "tps": 129.65251858880325,
+          "yield_per_round": 3.1507692307692308,
+          "ms_per_round": 24.301643076923074,
+          "drafted": 1298,
+          "accepted": 693
+        }
+      },
+      "requests": [
+        {
+          "id": "p1",
+          "n": 256,
+          "rounds": 113,
+          "ms": 2718.456,
+          "drafted": 448,
+          "accepted": 142,
+          "exact": true
+        },
+        {
+          "id": "p2",
+          "n": 256,
+          "rounds": 60,
+          "ms": 1470.778,
+          "drafted": 237,
+          "accepted": 194,
+          "exact": true
+        },
+        {
+          "id": "p3",
+          "n": 256,
+          "rounds": 92,
+          "ms": 2220.69,
+          "drafted": 366,
+          "accepted": 163,
+          "exact": true
+        },
+        {
+          "id": "math",
+          "n": 256,
+          "rounds": 59,
+          "ms": 1435.894,
+          "drafted": 236,
+          "accepted": 196,
+          "exact": true
+        },
+        {
+          "id": "json",
+          "n": 256,
+          "rounds": 60,
+          "ms": 1463.186,
+          "drafted": 237,
+          "accepted": 195,
+          "exact": true
+        },
+        {
+          "id": "zh_dict",
+          "n": 256,
+          "rounds": 103,
+          "ms": 2484.882,
+          "drafted": 411,
+          "accepted": 152,
+          "exact": true
+        },
+        {
+          "id": "en_edit",
+          "n": 256,
+          "rounds": 83,
+          "ms": 2025.749,
+          "drafted": 332,
+          "accepted": 171,
+          "exact": true
+        },
+        {
+          "id": "code",
+          "n": 256,
+          "rounds": 57,
+          "ms": 1388.28,
+          "drafted": 228,
+          "accepted": 198,
+          "exact": true
+        },
+        {
+          "id": "zh_json",
+          "n": 256,
+          "rounds": 82,
+          "ms": 1999.123,
+          "drafted": 327,
+          "accepted": 172,
+          "exact": true
+        }
+      ]
+    },
+    "record7-1": {
+      "groups": {
+        "standard": {
+          "n": 1280,
+          "rounds": 330,
+          "ms": 11887.092,
+          "tps": 107.67982615092068,
+          "yield_per_round": 3.878787878787879,
+          "ms_per_round": 36.02149090909091,
+          "drafted": 2281,
+          "accepted": 944
+        },
+        "holdout": {
+          "n": 1024,
+          "rounds": 290,
+          "ms": 10455.787,
+          "tps": 97.9361955250236,
+          "yield_per_round": 3.5310344827586206,
+          "ms_per_round": 36.054437931034485,
+          "drafted": 2019,
+          "accepted": 727
+        }
+      },
+      "requests": [
+        {
+          "id": "p1",
+          "n": 256,
+          "rounds": 109,
+          "ms": 3872.204,
+          "drafted": 751,
+          "accepted": 146,
+          "exact": true
+        },
+        {
+          "id": "p2",
+          "n": 256,
+          "rounds": 47,
+          "ms": 1704.586,
+          "drafted": 324,
+          "accepted": 207,
+          "exact": true
+        },
+        {
+          "id": "p3",
+          "n": 256,
+          "rounds": 80,
+          "ms": 2872.285,
+          "drafted": 560,
+          "accepted": 175,
+          "exact": true
+        },
+        {
+          "id": "math",
+          "n": 256,
+          "rounds": 46,
+          "ms": 1661.505,
+          "drafted": 319,
+          "accepted": 209,
+          "exact": true
+        },
+        {
+          "id": "json",
+          "n": 256,
+          "rounds": 48,
+          "ms": 1776.512,
+          "drafted": 327,
+          "accepted": 207,
+          "exact": true
+        },
+        {
+          "id": "zh_dict",
+          "n": 256,
+          "rounds": 96,
+          "ms": 3463.065,
+          "drafted": 672,
+          "accepted": 158,
+          "exact": true
+        },
+        {
+          "id": "en_edit",
+          "n": 256,
+          "rounds": 72,
+          "ms": 2598.299,
+          "drafted": 501,
+          "accepted": 182,
+          "exact": true
+        },
+        {
+          "id": "code",
+          "n": 256,
+          "rounds": 46,
+          "ms": 1664.164,
+          "drafted": 321,
+          "accepted": 209,
+          "exact": true
+        },
+        {
+          "id": "zh_json",
+          "n": 256,
+          "rounds": 76,
+          "ms": 2730.259,
+          "drafted": 525,
+          "accepted": 178,
+          "exact": true
+        }
+      ]
+    },
+    "replay3-1": {
+      "groups": {
+        "standard": {
+          "n": 1280,
+          "rounds": 425,
+          "ms": 7345.873,
+          "tps": 174.24749924209146,
+          "yield_per_round": 3.011764705882353,
+          "ms_per_round": 17.28440705882353,
+          "drafted": 1272,
+          "accepted": 848
+        },
+        "holdout": {
+          "n": 1024,
+          "rounds": 362,
+          "ms": 6277.598,
+          "tps": 163.11971553450857,
+          "yield_per_round": 2.8287292817679557,
+          "ms_per_round": 17.34143093922652,
+          "drafted": 1084,
+          "accepted": 655
+        }
+      },
+      "requests": [
+        {
+          "id": "p1",
+          "n": 256,
+          "rounds": 114,
+          "ms": 1954.924,
+          "drafted": 340,
+          "accepted": 141,
+          "exact": true
+        },
+        {
+          "id": "p2",
+          "n": 256,
+          "rounds": 71,
+          "ms": 1239.809,
+          "drafted": 213,
+          "accepted": 183,
+          "exact": true
+        },
+        {
+          "id": "p3",
+          "n": 256,
+          "rounds": 97,
+          "ms": 1665.54,
+          "drafted": 291,
+          "accepted": 158,
+          "exact": true
+        },
+        {
+          "id": "math",
+          "n": 256,
+          "rounds": 74,
+          "ms": 1293.261,
+          "drafted": 222,
+          "accepted": 180,
+          "exact": true
+        },
+        {
+          "id": "json",
+          "n": 256,
+          "rounds": 69,
+          "ms": 1192.339,
+          "drafted": 206,
+          "accepted": 186,
+          "exact": true
+        },
+        {
+          "id": "zh_dict",
+          "n": 256,
+          "rounds": 109,
+          "ms": 1885.96,
+          "drafted": 327,
+          "accepted": 145,
+          "exact": true
+        },
+        {
+          "id": "en_edit",
+          "n": 256,
+          "rounds": 88,
+          "ms": 1530.95,
+          "drafted": 264,
+          "accepted": 166,
+          "exact": true
+        },
+        {
+          "id": "code",
+          "n": 256,
+          "rounds": 74,
+          "ms": 1277.539,
+          "drafted": 220,
+          "accepted": 181,
+          "exact": true
+        },
+        {
+          "id": "zh_json",
+          "n": 256,
+          "rounds": 91,
+          "ms": 1583.149,
+          "drafted": 273,
+          "accepted": 163,
+          "exact": true
+        }
+      ]
+    },
+    "replay4-1": {
+      "groups": {
+        "standard": {
+          "n": 1280,
+          "rounds": 384,
+          "ms": 7732.387,
+          "tps": 165.53749831714322,
+          "yield_per_round": 3.3333333333333335,
+          "ms_per_round": 20.136424479166667,
+          "drafted": 1524,
+          "accepted": 890
+        },
+        "holdout": {
+          "n": 1024,
+          "rounds": 325,
+          "ms": 6775.97,
+          "tps": 151.12227474442773,
+          "yield_per_round": 3.1507692307692308,
+          "ms_per_round": 20.849138461538463,
+          "drafted": 1298,
+          "accepted": 693
+        }
+      },
+      "requests": [
+        {
+          "id": "p1",
+          "n": 256,
+          "rounds": 113,
+          "ms": 2255.611,
+          "drafted": 448,
+          "accepted": 142,
+          "exact": true
+        },
+        {
+          "id": "p2",
+          "n": 256,
+          "rounds": 60,
+          "ms": 1224.658,
+          "drafted": 237,
+          "accepted": 194,
+          "exact": true
+        },
+        {
+          "id": "p3",
+          "n": 256,
+          "rounds": 92,
+          "ms": 1844.54,
+          "drafted": 366,
+          "accepted": 163,
+          "exact": true
+        },
+        {
+          "id": "math",
+          "n": 256,
+          "rounds": 59,
+          "ms": 1194.715,
+          "drafted": 236,
+          "accepted": 196,
+          "exact": true
+        },
+        {
+          "id": "json",
+          "n": 256,
+          "rounds": 60,
+          "ms": 1212.863,
+          "drafted": 237,
+          "accepted": 195,
+          "exact": true
+        },
+        {
+          "id": "zh_dict",
+          "n": 256,
+          "rounds": 103,
+          "ms": 2062.717,
+          "drafted": 411,
+          "accepted": 152,
+          "exact": true
+        },
+        {
+          "id": "en_edit",
+          "n": 256,
+          "rounds": 83,
+          "ms": 1684.746,
+          "drafted": 332,
+          "accepted": 171,
+          "exact": true
+        },
+        {
+          "id": "code",
+          "n": 256,
+          "rounds": 57,
+          "ms": 1365.194,
+          "drafted": 228,
+          "accepted": 198,
+          "exact": true
+        },
+        {
+          "id": "zh_json",
+          "n": 256,
+          "rounds": 82,
+          "ms": 1663.313,
+          "drafted": 327,
+          "accepted": 172,
+          "exact": true
+        }
+      ]
+    },
+    "replay7-1": {
+      "groups": {
+        "standard": {
+          "n": 1280,
+          "rounds": 330,
+          "ms": 9753.692,
+          "tps": 131.23235796250282,
+          "yield_per_round": 3.878787878787879,
+          "ms_per_round": 29.556642424242423,
+          "drafted": 2281,
+          "accepted": 944
+        },
+        "holdout": {
+          "n": 1024,
+          "rounds": 290,
+          "ms": 8630.016,
+          "tps": 118.65563169291923,
+          "yield_per_round": 3.5310344827586206,
+          "ms_per_round": 29.758675862068966,
+          "drafted": 2019,
+          "accepted": 727
+        }
+      },
+      "requests": [
+        {
+          "id": "p1",
+          "n": 256,
+          "rounds": 109,
+          "ms": 3189.144,
+          "drafted": 751,
+          "accepted": 146,
+          "exact": true
+        },
+        {
+          "id": "p2",
+          "n": 256,
+          "rounds": 47,
+          "ms": 1409.906,
+          "drafted": 324,
+          "accepted": 207,
+          "exact": true
+        },
+        {
+          "id": "p3",
+          "n": 256,
+          "rounds": 80,
+          "ms": 2368.735,
+          "drafted": 560,
+          "accepted": 175,
+          "exact": true
+        },
+        {
+          "id": "math",
+          "n": 256,
+          "rounds": 46,
+          "ms": 1371.406,
+          "drafted": 319,
+          "accepted": 209,
+          "exact": true
+        },
+        {
+          "id": "json",
+          "n": 256,
+          "rounds": 48,
+          "ms": 1414.501,
+          "drafted": 327,
+          "accepted": 207,
+          "exact": true
+        },
+        {
+          "id": "zh_dict",
+          "n": 256,
+          "rounds": 96,
+          "ms": 2850.992,
+          "drafted": 672,
+          "accepted": 158,
+          "exact": true
+        },
+        {
+          "id": "en_edit",
+          "n": 256,
+          "rounds": 72,
+          "ms": 2144.417,
+          "drafted": 501,
+          "accepted": 182,
+          "exact": true
+        },
+        {
+          "id": "code",
+          "n": 256,
+          "rounds": 46,
+          "ms": 1386.041,
+          "drafted": 321,
+          "accepted": 209,
+          "exact": true
+        },
+        {
+          "id": "zh_json",
+          "n": 256,
+          "rounds": 76,
+          "ms": 2248.566,
+          "drafted": 525,
+          "accepted": 178,
+          "exact": true
+        }
+      ]
+    },
+    "stock7-1": {
+      "groups": {
+        "standard": {
+          "n": 1280,
+          "rounds": 1270,
+          "ms": 44654.82,
+          "tps": 28.66431887979842,
+          "yield_per_round": 1.0078740157480315,
+          "ms_per_round": 35.16127559055118,
+          "drafted": 8785,
+          "accepted": 0
+        },
+        "holdout": {
+          "n": 1024,
+          "rounds": 1016,
+          "ms": 36415.189,
+          "tps": 28.120134156107223,
+          "yield_per_round": 1.0078740157480315,
+          "ms_per_round": 35.84172145669291,
+          "drafted": 7028,
+          "accepted": 0
+        }
+      },
+      "requests": [
+        {
+          "id": "p1",
+          "n": 256,
+          "rounds": 254,
+          "ms": 8925.488,
+          "drafted": 1757,
+          "accepted": 0,
+          "exact": true
+        },
+        {
+          "id": "p2",
+          "n": 256,
+          "rounds": 254,
+          "ms": 8935.587,
+          "drafted": 1757,
+          "accepted": 0,
+          "exact": true
+        },
+        {
+          "id": "p3",
+          "n": 256,
+          "rounds": 254,
+          "ms": 8923.572,
+          "drafted": 1757,
+          "accepted": 0,
+          "exact": true
+        },
+        {
+          "id": "math",
+          "n": 256,
+          "rounds": 254,
+          "ms": 8938.321,
+          "drafted": 1757,
+          "accepted": 0,
+          "exact": true
+        },
+        {
+          "id": "json",
+          "n": 256,
+          "rounds": 254,
+          "ms": 8931.852,
+          "drafted": 1757,
+          "accepted": 0,
+          "exact": true
+        },
+        {
+          "id": "zh_dict",
+          "n": 256,
+          "rounds": 254,
+          "ms": 8933.628,
+          "drafted": 1757,
+          "accepted": 0,
+          "exact": true
+        },
+        {
+          "id": "en_edit",
+          "n": 256,
+          "rounds": 254,
+          "ms": 8932.235,
+          "drafted": 1757,
+          "accepted": 0,
+          "exact": true
+        },
+        {
+          "id": "code",
+          "n": 256,
+          "rounds": 254,
+          "ms": 8931.44,
+          "drafted": 1757,
+          "accepted": 0,
+          "exact": true
+        },
+        {
+          "id": "zh_json",
+          "n": 256,
+          "rounds": 254,
+          "ms": 9617.886,
+          "drafted": 1757,
+          "accepted": 0,
+          "exact": true
+        }
+      ]
+    }
+  },
+  "phase": {
+    "phaseft7-1": {
+      "standard": {
+        "rounds": 350,
+        "ms_round": {
+          "draft": 5.458925648459366,
+          "target": 28.300767641381494,
+          "catchup": 0.17672415556652205
+        }
+      },
+      "holdout": {
+        "rounds": 309,
+        "ms_round": {
+          "draft": 4.51679538082464,
+          "target": 28.48233372156891,
+          "catchup": 0.17778588983329754
+        }
+      }
+    },
+    "phasereal3-1": {
+      "standard": {
+        "rounds": 425,
+        "ms_round": {
+          "draft": 2.8115887107218014,
+          "target": 17.125363163650036,
+          "catchup": 0.20099876503295758
+        }
+      },
+      "holdout": {
+        "rounds": 362,
+        "ms_round": {
+          "draft": 2.8140534504023456,
+          "target": 17.508926070732635,
+          "catchup": 0.1984704009293275
+        }
+      }
+    }
+  },
+  "profile_eight_columns": {
+    "rounds": 20,
+    "ms": {
+      "other": 1.9253935000000002,
+      "Q2 preparation": 2.659494,
+      "Q2 projections": 20.302964,
+      "GDN": 2.3509274999999996,
+      "flash attention": 0.7960965
+    },
+    "calls": {
+      "other": 393,
+      "Q2 preparation": 514,
+      "Q2 projections": 257,
+      "GDN": 96,
+      "flash attention": 16
+    }
+  },
+  "profile_four_columns_prior": {
+    "full_rounds": 20,
+    "categories": {
+      "GDN": {
+        "ms": 1.3499469999999998,
+        "calls": 96.0
+      },
+      "Q2 preparation": {
+        "ms": 1.8968395,
+        "calls": 257.0
+      },
+      "Q2 projections": {
+        "ms": 10.900878000000002,
+        "calls": 257.0
+      },
+      "flash attention": {
+        "ms": 0.5184875,
+        "calls": 16.0
+      },
+      "other": {
+        "ms": 1.8155595000000047,
+        "calls": 393.0
+      }
+    }
+  },
+  "adapt-real7": {
+    "standard": {
+      "n": 2560,
+      "rounds": 730,
+      "ms": 19038.129,
+      "tps": 134.4669951548285,
+      "yield_per_round": 3.506849315068493,
+      "ms_per_round": 26.07962876712329,
+      "drafted": 3066,
+      "accepted": 1818
+    },
+    "holdout": {
+      "n": 2048,
+      "rounds": 668,
+      "ms": 16766.433,
+      "tps": 122.14881960879812,
+      "yield_per_round": 3.065868263473054,
+      "ms_per_round": 25.099450598802395,
+      "drafted": 2510,
+      "accepted": 1366
+    }
+  },
+  "adapt-ideal7": {
+    "standard": {
+      "n": 2560,
+      "rounds": 444,
+      "ms": 13518.072,
+      "tps": 189.37611813282248,
+      "yield_per_round": 5.7657657657657655,
+      "ms_per_round": 30.44610810810811,
+      "drafted": 2342,
+      "accepted": 2104
+    },
+    "holdout": {
+      "n": 2048,
+      "rounds": 402,
+      "ms": 11587.447,
+      "tps": 176.74298747601608,
+      "yield_per_round": 5.0945273631840795,
+      "ms_per_round": 28.82449502487562,
+      "drafted": 1932,
+      "accepted": 1634
+    }
+  },
+  "models_and_sha256": [
+    [
+      "0f5793d779b29cabacd85dc74ba4e040ca741d9e",
+      "f63a94fedab264f65213496b140eb6f88e78046768effafc86ee3c3b7e9d013a",
+      1143007104
+    ],
+    [
+      "2d9571f8ce46e151f61c6499c99dee6079e1d610",
+      "1a25c56858e1ebe93f2718ac1d49d1151f9323325c1bbfd6209370f4db131ebd",
+      1143006816
+    ]
+  ],
+  "original_sha256": {
+    "llama-server": "fa2b2aebfca2fce9e6f3fb138290d8feee0f1f5c8fb80313c0a3537648e800d7",
+    "libggml-hip.so": "b98583965bed679cb35986669341228c35866d71d8addafc6f7103ac2e058d68",
+    "libllama.so.0": "6f3c9686d674d7bcc9eecc78bc2c232cce49f6f0fe7b45a44eaa16adb4fe7dbc"
+  },
+  "private_core_sha256": "dbb1fde979b925f0b5a9e48ac2343c74d3621dcfbba924ec08c72f6d015c00c3"
+}

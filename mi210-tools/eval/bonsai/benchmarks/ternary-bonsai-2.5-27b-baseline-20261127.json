@@ -1,0 +1,87 @@
+{
+  "model": "Ternary-Bonsai-2.5-27B-Q2_0-mtp.gguf",
+  "model_sha256": "b0f83de8481c3200c529aef5fb495dbfedf2a4a3f017f7a3ea0a69c67be1d306",
+  "hardware": {
+    "gpu": "AMD Instinct MI210"
+  },
+  "build": {
+    "number": 12110,
+    "llama-bench_sha256": "a1de7f3986c5bf6b0f6650befd74e8674d9adaa18eb1eecfcd31c81367d622eb",
+    "libllama.so.0.9.0_sha256": "b0640b81e93b3f9e66270a03d9aa20bee84b6b8e9b81fc09236997a650ccab50",
+    "libggml-hip.so_sha256": "4c6a94dd55ce87448e74c50b50ea147e636573ac7d98eab5239185bdfd58efa4"
+  },
+  "settings": {
+    "gpu_layers": 99,
+    "flash_attention": true,
+    "threads": 8,
+    "batch": 2048,
+    "ubatch": 512,
+    "repetitions": 3,
+    "warmup": true,
+    "mtp_speculative_decoding": false
+  },
+  "tests": [
+    {
+      "n_prompt": 512,
+      "n_gen": 0,
+      "n_depth": 0,
+      "avg_ts": 914.644032,
+      "stddev_ts": 2.521255,
+      "samples_ts": [
+        911.733,
+        916.086,
+        916.113
+      ]
+    },
+    {
+      "n_prompt": 2048,
+      "n_gen": 0,
+      "n_depth": 0,
+      "avg_ts": 905.083593,
+      "stddev_ts": 0.29345,
+      "samples_ts": [
+        905.164,
+        905.329,
+        904.758
+      ]
+    },
+    {
+      "n_prompt": 8192,
+      "n_gen": 0,
+      "n_depth": 0,
+      "avg_ts": 858.153838,
+      "stddev_ts": 0.677868,
+      "samples_ts": [
+        858.788,
+        858.235,
+        857.439
+      ]
+    },
+    {
+      "n_prompt": 0,
+      "n_gen": 128,
+      "n_depth": 0,
+      "avg_ts": 45.255786,
+      "stddev_ts": 0.029116,
+      "samples_ts": [
+        45.2867,
+        45.2518,
+        45.2289
+      ]
+    },
+    {
+      "n_prompt": 0,
+      "n_gen": 128,
+      "n_depth": 8192,
+      "avg_ts": 43.758057,
+      "stddev_ts": 0.045626,
+      "samples_ts": [
+        43.7109,
+        43.7612,
+        43.802
+      ]
+    }
+  ],
+  "peak_temp_c": 64,
+  "peak_vram_gib": 8.85
+}

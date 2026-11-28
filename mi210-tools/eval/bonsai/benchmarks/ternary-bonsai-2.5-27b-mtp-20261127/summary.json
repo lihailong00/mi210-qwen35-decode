@@ -1,0 +1,405 @@
+{
+  "model": "Ternary-Bonsai-2.5-27B-Q2_0-mtp.gguf",
+  "configs": {
+    "0": {
+      "rounds": 3,
+      "requests": 15,
+      "generated_tokens": 3840,
+      "decode_seconds": 47.985867,
+      "decode_tps": 80.02356193751798,
+      "http_wall_tps": 74.75981337237138,
+      "run_tps": [
+        80.19640098601474,
+        80.92651246751954,
+        78.97221609364921
+      ],
+      "draft_tokens": 0,
+      "accepted_tokens": 0,
+      "matches": [
+        {
+          "tag": "mtp-screen-k0",
+          "same": true
+        },
+        {
+          "tag": "mtp-screen-k0",
+          "same": true
+        },
+        {
+          "tag": "mtp-screen-k0",
+          "same": true
+        },
+        {
+          "tag": "mtp-screen-k0",
+          "same": true
+        },
+        {
+          "tag": "mtp-screen-k0",
+          "same": true
+        },
+        {
+          "tag": "mtp-repeat2-k0",
+          "same": true
+        },
+        {
+          "tag": "mtp-repeat2-k0",
+          "same": true
+        },
+        {
+          "tag": "mtp-repeat2-k0",
+          "same": true
+        },
+        {
+          "tag": "mtp-repeat2-k0",
+          "same": true
+        },
+        {
+          "tag": "mtp-repeat2-k0",
+          "same": true
+        },
+        {
+          "tag": "mtp-repeat3-k0",
+          "same": true
+        },
+        {
+          "tag": "mtp-repeat3-k0",
+          "same": true
+        },
+        {
+          "tag": "mtp-repeat3-k0",
+          "same": true
+        },
+        {
+          "tag": "mtp-repeat3-k0",
+          "same": true
+        },
+        {
+          "tag": "mtp-repeat3-k0",
+          "same": true
+        }
+      ],
+      "all_outputs_identical": true,
+      "peak_vram_gib": 16.613300323486328,
+      "peak_temperature_c": 64.0,
+      "per_prompt_tps": {
+        "p1": 80.02871863913664,
+        "p2": 80.06693929737507,
+        "p3": 80.00232506757227,
+        "math": 79.98862661715287,
+        "json": 80.03124553210984
+      }
+    },
+    "1": {
+      "rounds": 3,
+      "requests": 15,
+      "generated_tokens": 3840,
+      "decode_seconds": 48.130027,
+      "decode_tps": 79.78387379670491,
+      "http_wall_tps": 74.03512842553764,
+      "run_tps": [
+        79.22891939738732,
+        80.39605104646766,
+        79.73522920452274
+      ],
+      "draft_tokens": 2061,
+      "accepted_tokens": 1755,
+      "acceptance": 0.851528384279476,
+      "matches": [
+        {
+          "tag": "mtp-screen-k1",
+          "same": true
+        },
+        {
+          "tag": "mtp-screen-k1",
+          "same": true
+        },
+        {
+          "tag": "mtp-screen-k1",
+          "same": true
+        },
+        {
+          "tag": "mtp-screen-k1",
+          "same": true
+        },
+        {
+          "tag": "mtp-screen-k1",
+          "same": true
+        },
+        {
+          "tag": "mtp-repeat2-k1",
+          "same": true
+        },
+        {
+          "tag": "mtp-repeat2-k1",
+          "same": true
+        },
+        {
+          "tag": "mtp-repeat2-k1",
+          "same": true
+        },
+        {
+          "tag": "mtp-repeat2-k1",
+          "same": true
+        },
+        {
+          "tag": "mtp-repeat2-k1",
+          "same": true
+        },
+        {
+          "tag": "mtp-repeat3-k1",
+          "same": true
+        },
+        {
+          "tag": "mtp-repeat3-k1",
+          "same": true
+        },
+        {
+          "tag": "mtp-repeat3-k1",
+          "same": true
+        },
+        {
+          "tag": "mtp-repeat3-k1",
+          "same": true
+        },
+        {
+          "tag": "mtp-repeat3-k1",
+          "same": true
+        }
+      ],
+      "all_outputs_identical": true,
+      "peak_vram_gib": 18.106090545654297,
+      "peak_temperature_c": 61.0,
+      "per_prompt_tps": {
+        "p1": 74.93948490227959,
+        "p2": 81.83451675492469,
+        "p3": 73.88412602438464,
+        "math": 84.83875169056125,
+        "json": 84.86335066807237
+      }
+    },
+    "2": {
+      "rounds": 3,
+      "requests": 15,
+      "generated_tokens": 3840,
+      "decode_seconds": 46.805047,
+      "decode_tps": 82.04243444088412,
+      "http_wall_tps": 75.68817485777294,
+      "run_tps": [
+        82.37706751154646,
+        82.28829872606785,
+        81.46808026515315
+      ],
+      "draft_tokens": 3060,
+      "accepted_tokens": 2286,
+      "acceptance": 0.7470588235294118,
+      "matches": [
+        {
+          "tag": "mtp-screen-k2",
+          "same": true
+        },
+        {
+          "tag": "mtp-screen-k2",
+          "same": true
+        },
+        {
+          "tag": "mtp-screen-k2",
+          "same": true
+        },
+        {
+          "tag": "mtp-screen-k2",
+          "same": true
+        },
+        {
+          "tag": "mtp-screen-k2",
+          "same": true
+        },
+        {
+          "tag": "mtp-repeat2-k2",
+          "same": true
+        },
+        {
+          "tag": "mtp-repeat2-k2",
+          "same": true
+        },
+        {
+          "tag": "mtp-repeat2-k2",
+          "same": true
+        },
+        {
+          "tag": "mtp-repeat2-k2",
+          "same": true
+        },
+        {
+          "tag": "mtp-repeat2-k2",
+          "same": true
+        },
+        {
+          "tag": "mtp-repeat3-k2",
+          "same": true
+        },
+        {
+          "tag": "mtp-repeat3-k2",
+          "same": true
+        },
+        {
+          "tag": "mtp-repeat3-k2",
+          "same": true
+        },
+        {
+          "tag": "mtp-repeat3-k2",
+          "same": true
+        },
+        {
+          "tag": "mtp-repeat3-k2",
+          "same": true
+        }
+      ],
+      "all_outputs_identical": true,
+      "peak_vram_gib": 18.252689361572266,
+      "peak_temperature_c": 61.0,
+      "per_prompt_tps": {
+        "p1": 69.237874018623,
+        "p2": 91.18793298684294,
+        "p3": 71.53788760168301,
+        "math": 90.89256498818396,
+        "json": 94.74955459690173
+      }
+    },
+    "3": {
+      "rounds": 3,
+      "requests": 15,
+      "generated_tokens": 3840,
+      "decode_seconds": 54.77666,
+      "decode_tps": 70.10285037459386,
+      "http_wall_tps": 65.57068308257564,
+      "run_tps": [
+        69.75729638158549,
+        70.15564962624303,
+        70.39859906787855
+      ],
+      "draft_tokens": 3816,
+      "accepted_tokens": 2544,
+      "acceptance": 0.6666666666666666,
+      "matches": [
+        {
+          "tag": "mtp-screen-k3",
+          "same": true
+        },
+        {
+          "tag": "mtp-screen-k3",
+          "same": true
+        },
+        {
+          "tag": "mtp-screen-k3",
+          "same": true
+        },
+        {
+          "tag": "mtp-screen-k3",
+          "same": true
+        },
+        {
+          "tag": "mtp-screen-k3",
+          "same": true
+        },
+        {
+          "tag": "mtp-repeat2-k3",
+          "same": true
+        },
+        {
+          "tag": "mtp-repeat2-k3",
+          "same": true
+        },
+        {
+          "tag": "mtp-repeat2-k3",
+          "same": true
+        },
+        {
+          "tag": "mtp-repeat2-k3",
+          "same": true
+        },
+        {
+          "tag": "mtp-repeat2-k3",
+          "same": true
+        },
+        {
+          "tag": "mtp-repeat3-k3",
+          "same": true
+        },
+        {
+          "tag": "mtp-repeat3-k3",
+          "same": true
+        },
+        {
+          "tag": "mtp-repeat3-k3",
+          "same": true
+        },
+        {
+          "tag": "mtp-repeat3-k3",
+          "same": true
+        },
+        {
+          "tag": "mtp-repeat3-k3",
+          "same": true
+        }
+      ],
+      "all_outputs_identical": true,
+      "peak_vram_gib": 18.40103530883789,
+      "peak_temperature_c": 61.0,
+      "per_prompt_tps": {
+        "p1": 52.38038499173747,
+        "p2": 84.30566599939317,
+        "p3": 60.30347251421902,
+        "math": 80.92732599676543,
+        "json": 87.47756394120141
+      }
+    },
+    "5": {
+      "rounds": 1,
+      "requests": 5,
+      "generated_tokens": 1280,
+      "decode_seconds": 17.231099,
+      "decode_tps": 74.28429260373932,
+      "http_wall_tps": 69.18573733555097,
+      "run_tps": [
+        74.28429260373932
+      ],
+      "draft_tokens": 1695,
+      "accepted_tokens": 933,
+      "acceptance": 0.5504424778761062,
+      "matches": [
+        {
+          "tag": "mtp-screen-k5",
+          "same": false
+        },
+        {
+          "tag": "mtp-screen-k5",
+          "same": false
+        },
+        {
+          "tag": "mtp-screen-k5",
+          "same": true
+        },
+        {
+          "tag": "mtp-screen-k5",
+          "same": true
+        },
+        {
+          "tag": "mtp-screen-k5",
+          "same": true
+        }
+      ],
+      "all_outputs_identical": false,
+      "peak_vram_gib": 18.691967010498047,
+      "peak_temperature_c": 61.0,
+      "per_prompt_tps": {
+        "p1": 56.56771000209919,
+        "p2": 100.6831905087215,
+        "p3": 58.39631847709701,
+        "math": 82.3356037804907,
+        "json": 95.88532115589754
+      }
+    }
+  },
+  "hip_backend_sha256": "b4665f08566308dbed1164c79ae9a980b57facfacdcd4316ec72c7adf89c2b6d",
+  "backend_changed": false,
+  "test_servers_stopped": true
+}

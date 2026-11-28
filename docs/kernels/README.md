@@ -17,6 +17,10 @@
 | IQ3_S / IQ3_XXS 模块（无损重排 + LDS 码表 + 移动读取窗口；残差、SwiGLU、多任务尾部） | 权重为 IQ3_S/IQ3_XXS，K%256==0，N%4==0 | 通用 | `iq3gemv.cuh`、`mmvq-iq3.cu` | `GGML_MMVQ_IQ3`（及 `_MULTI`、`_SM`、`_PF`） | Q27 §五.3 |
 | IQ4_XS / Q4_K 模块（同尺寸 SoA） | 权重为 IQ4_XS/Q4_K；配置只按类型和 K 选（K > 8192 用轮次分块布局），是在 Q27 的形状上调出来的 | 通用 | `iq4k-gemv.cuh`、`mmvq-iq4k.cu` | `GGML_MMVQ_IQ4K`、`_GROUP`、`_X`/`_Q` 覆盖配置 | Q27 §五.4 |
 | 低比特模块 | IQ2_S/IQ2_XS/IQ2_XXS/Q2_K/IQ1_M | 通用 | `lowbit-gemv.cuh`、`mmvq-lowbit.cu` | `GGML_MMVQ_LOWBIT` | Q27 §五.5 |
+| Q2_0 单 token GEMV（同尺寸 SoA 无损重排） | CDNA2 wave64；连续矩阵，4096≤K≤32768、K%256=0，128≤N≤1048576、N%8=0；单列 F32 输出 | 通用（在 Bonsai 上调优）；SwiGLU / 残差融合，其他形状回退 | `mmvq-q2-0.cu` | `GGML_MMVQ_Q2_0` | [Bonsai 记录](../models/ternary-bonsai-2.5-27b/README.md) |
+| Q2_0 多列 MFMA 验证 | gfx90a、3/4 列 F32；K 为 1024 的整数倍时支持 2/3/4 列四行交错布局 | 稠密 Q2_0 矩阵；单列和多列共用重排权重 | `mmvq-q2-0.cu` | `GGML_MMVQ_Q2_0_MFMA`、`GGML_MMVQ_Q2_0_TILE` | [Bonsai 四行交错优化](../../mi210-tools/eval/bonsai/benchmarks/bonsai-mtp-tile4-20261127/REPORT.md) |
+| Q2_0 验证输入融合与分组投影 | MI210 gfx90a，2–4 列、1024 点 Hadamard、连续共享输入和 1–3 个投影 | 同轮共享一次 Q8 准备 | ggml-cuda.cu、fwht.cu、mmvq-q2-0.cu | GGML_MMVQ_Q2_0_FUSED_INPUT | [Bonsai 测量](../../mi210-tools/eval/bonsai/benchmarks/bonsai-mtp-fused-input-20261127/REPORT.md) |
+| Q2_0 八列验证 | gfx90a，输入宽 5120、6144、17408 | 成对行布局与八列 Hadamard/Q8 准备 | mmvq-q2-0.cu、fwht.cu | BONSAI_Q2_EIGHT、BONSAI_Q2_EIGHT_PREP | [真实权重验证](../../mi210-tools/eval/bonsai/benchmarks/bonsai-q2-eight-20261128/REPORT.md) |
 | Q6_K 单 token GEMV | Q6_K，K%256==0、K ≤ 32768、N ≥ 64（为 MTP 草稿层写的） | 通用 | `q6k-gemv.cuh`、`mmvq-q6k.cu` | `GGML_MMVQ_Q6K` | Q27 §十三.17 |
 | IQ3 + IQ4 混合配对（两个 GEMV 共用输入时一次启动） | 一个 IQ3 和一个 IQ4_XS/Q4_K GEMV 读同一个输入 | 通用（混合量化配方才有） | `mixgemv.cuh` | `GGML_MMVQ_MIX` | Q27 §五.9 |
 | BF16 细矩阵 GEMV | 行数很少的 BF16 矩阵 | 通用 | `mmvf.cu` | `GGML_MMVF_THIN`、`GGML_MMVF_EPI` | Q27 §三、§五 |

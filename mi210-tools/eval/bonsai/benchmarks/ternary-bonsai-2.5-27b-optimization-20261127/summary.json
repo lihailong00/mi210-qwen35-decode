@@ -1,0 +1,1799 @@
+{
+  "base_commit": "fa8aaeeaa74c864c2e0c1f620c622ffeb1390b48",
+  "model_sha256": "b0f83de8481c3200c529aef5fb495dbfedf2a4a3f017f7a3ea0a69c67be1d306",
+  "benchmarks": {
+    "tg0-base": {
+      "median_process_mean_tps": 44.973663,
+      "process_mean_range_tps": [
+        38.867542,
+        45.342949
+      ],
+      "median_sample_tps": 45.0938,
+      "processes": 3,
+      "samples": 9
+    },
+    "tg0-off": {
+      "median_process_mean_tps": 55.229536,
+      "process_mean_range_tps": [
+        54.517449,
+        55.699864
+      ],
+      "median_sample_tps": 55.2594,
+      "processes": 3,
+      "samples": 9
+    },
+    "tg0-q2": {
+      "median_process_mean_tps": 79.434506,
+      "process_mean_range_tps": [
+        79.261772,
+        82.406209
+      ],
+      "median_sample_tps": 79.4506,
+      "processes": 3,
+      "samples": 9
+    },
+    "tg8192-base": {
+      "median_process_mean_tps": 43.076061,
+      "process_mean_range_tps": [
+        43.076061,
+        43.076061
+      ],
+      "median_sample_tps": 43.1316,
+      "processes": 1,
+      "samples": 3
+    },
+    "tg8192-q2": {
+      "median_process_mean_tps": 74.208612,
+      "process_mean_range_tps": [
+        74.208612,
+        74.208612
+      ],
+      "median_sample_tps": 74.6616,
+      "processes": 1,
+      "samples": 3
+    },
+    "tg32768-base": {
+      "median_process_mean_tps": 39.970305,
+      "process_mean_range_tps": [
+        39.970305,
+        39.970305
+      ],
+      "median_sample_tps": 40.4257,
+      "processes": 1,
+      "samples": 3
+    },
+    "tg32768-q2": {
+      "median_process_mean_tps": 63.580367,
+      "process_mean_range_tps": [
+        63.580367,
+        63.580367
+      ],
+      "median_sample_tps": 64.2511,
+      "processes": 1,
+      "samples": 3
+    },
+    "pp8192-u512-base": {
+      "median_process_mean_tps": 865.356538,
+      "process_mean_range_tps": [
+        857.308153,
+        868.252364
+      ],
+      "median_sample_tps": 860.829,
+      "processes": 4,
+      "samples": 6
+    },
+    "pp8192-u512-q2": {
+      "median_process_mean_tps": 1302.4532605,
+      "process_mean_range_tps": [
+        1300.231375,
+        1304.465895
+      ],
+      "median_sample_tps": 1303.77,
+      "processes": 4,
+      "samples": 6
+    },
+    "pp8192-u4096-base": {
+      "median_process_mean_tps": 1188.7912569999999,
+      "process_mean_range_tps": [
+        1168.379413,
+        1212.162863
+      ],
+      "median_sample_tps": 1208.2150000000001,
+      "processes": 4,
+      "samples": 6
+    },
+    "pp8192-u4096-q2": {
+      "median_process_mean_tps": 1949.9243219999998,
+      "process_mean_range_tps": [
+        1948.327869,
+        1954.260745
+      ],
+      "median_sample_tps": 1950.685,
+      "processes": 4,
+      "samples": 6
+    },
+    "pp512-u4096-base": {
+      "median_process_mean_tps": 881.005614,
+      "process_mean_range_tps": [
+        881.005614,
+        881.005614
+      ],
+      "median_sample_tps": 882.18,
+      "processes": 1,
+      "samples": 3
+    },
+    "pp512-u4096-q2": {
+      "median_process_mean_tps": 1328.186931,
+      "process_mean_range_tps": [
+        1328.186931,
+        1328.186931
+      ],
+      "median_sample_tps": 1329.77,
+      "processes": 1,
+      "samples": 3
+    },
+    "pp2048-u4096-base": {
+      "median_process_mean_tps": 1073.109242,
+      "process_mean_range_tps": [
+        1073.109242,
+        1073.109242
+      ],
+      "median_sample_tps": 1073.79,
+      "processes": 1,
+      "samples": 3
+    },
+    "pp2048-u4096-q2": {
+      "median_process_mean_tps": 1879.910892,
+      "process_mean_range_tps": [
+        1879.910892,
+        1879.910892
+      ],
+      "median_sample_tps": 1880.16,
+      "processes": 1,
+      "samples": 3
+    }
+  },
+  "runs": {
+    "accept-tg-base-0": {
+      "status": {
+        "name": "accept-tg-base-0",
+        "returncode": 0,
+        "elapsed_seconds": 9.51,
+        "peak_temp_c": 49.0,
+        "peak_vram_bytes": 8190709760
+      },
+      "measurements": [
+        {
+          "build_number": 12110,
+          "model_size": 7901057024,
+          "model_n_params": 27320697856,
+          "n_batch": 2048,
+          "n_ubatch": 512,
+          "n_threads": 8,
+          "cpu_strict": false,
+          "poll": 50,
+          "n_gpu_layers": 99,
+          "n_cpu_moe": 0,
+          "main_gpu": 0,
+          "no_kv_offload": false,
+          "flash_attn": 1,
+          "embeddings": false,
+          "no_op_offload": 0,
+          "no_host": false,
+          "repack": true,
+          "fit_target": 0,
+          "fit_min_ctx": 0,
+          "n_prompt": 0,
+          "n_gen": 128,
+          "n_depth": 0,
+          "avg_ns": 2822930705,
+          "stddev_ns": 526865,
+          "avg_ts": 45.342949,
+          "stddev_ts": 0.008377,
+          "samples_ns": [
+            2823300944,
+            2822334328,
+            2823156845
+          ],
+          "samples_ts": [
+            45.337,
+            45.3525,
+            45.3393
+          ]
+        }
+      ]
+    },
+    "accept-tg-q2-0": {
+      "status": {
+        "name": "accept-tg-q2-0",
+        "returncode": 0,
+        "elapsed_seconds": 6.01,
+        "peak_temp_c": 55.0,
+        "peak_vram_bytes": 16069550080
+      },
+      "measurements": [
+        {
+          "build_number": 0,
+          "model_size": 7901057024,
+          "model_n_params": 27320697856,
+          "n_batch": 2048,
+          "n_ubatch": 512,
+          "n_threads": 8,
+          "cpu_strict": false,
+          "poll": 50,
+          "n_gpu_layers": 99,
+          "n_cpu_moe": 0,
+          "main_gpu": 0,
+          "no_kv_offload": false,
+          "flash_attn": 1,
+          "embeddings": false,
+          "no_op_offload": 0,
+          "no_host": false,
+          "repack": true,
+          "fit_target": 0,
+          "fit_min_ctx": 0,
+          "n_prompt": 0,
+          "n_gen": 128,
+          "n_depth": 0,
+          "avg_ns": 1611390623,
+          "stddev_ns": 739661,
+          "avg_ts": 79.434506,
+          "stddev_ts": 0.036399,
+          "samples_ns": [
+            1612236221,
+            1610871848,
+            1611063801
+          ],
+          "samples_ts": [
+            79.3928,
+            79.4601,
+            79.4506
+          ]
+        }
+      ]
+    },
+    "accept-tg-off-0": {
+      "status": {
+        "name": "accept-tg-off-0",
+        "returncode": 0,
+        "elapsed_seconds": 8.51,
+        "peak_temp_c": 56.0,
+        "peak_vram_bytes": 8543219712
+      },
+      "measurements": [
+        {
+          "build_number": 0,
+          "model_size": 7901057024,
+          "model_n_params": 27320697856,
+          "n_batch": 2048,
+          "n_ubatch": 512,
+          "n_threads": 8,
+          "cpu_strict": false,
+          "poll": 50,
+          "n_gpu_layers": 99,
+          "n_cpu_moe": 0,
+          "main_gpu": 0,
+          "no_kv_offload": false,
+          "flash_attn": 1,
+          "embeddings": false,
+          "no_op_offload": 0,
+          "no_host": false,
+          "repack": true,
+          "fit_target": 0,
+          "fit_min_ctx": 0,
+          "n_prompt": 0,
+          "n_gen": 128,
+          "n_depth": 0,
+          "avg_ns": 2347873891,
+          "stddev_ns": 2470170,
+          "avg_ts": 54.517449,
+          "stddev_ts": 0.057312,
+          "samples_ns": [
+            2350717015,
+            2346644371,
+            2346260288
+          ],
+          "samples_ts": [
+            54.4515,
+            54.546,
+            54.5549
+          ]
+        }
+      ]
+    },
+    "accept-tg-off-1": {
+      "status": {
+        "name": "accept-tg-off-1",
+        "returncode": 0,
+        "elapsed_seconds": 8.01,
+        "peak_temp_c": 58.0,
+        "peak_vram_bytes": 8543211520
+      },
+      "measurements": [
+        {
+          "build_number": 0,
+          "model_size": 7901057024,
+          "model_n_params": 27320697856,
+          "n_batch": 2048,
+          "n_ubatch": 512,
+          "n_threads": 8,
+          "cpu_strict": false,
+          "poll": 50,
+          "n_gpu_layers": 99,
+          "n_cpu_moe": 0,
+          "main_gpu": 0,
+          "no_kv_offload": false,
+          "flash_attn": 1,
+          "embeddings": false,
+          "no_op_offload": 0,
+          "no_host": false,
+          "repack": true,
+          "fit_target": 0,
+          "fit_min_ctx": 0,
+          "n_prompt": 0,
+          "n_gen": 128,
+          "n_depth": 0,
+          "avg_ns": 2298057475,
+          "stddev_ns": 9608421,
+          "avg_ts": 55.699864,
+          "stddev_ts": 0.232337,
+          "samples_ns": [
+            2309129442,
+            2291904709,
+            2293138274
+          ],
+          "samples_ts": [
+            55.4321,
+            55.8487,
+            55.8187
+          ]
+        }
+      ]
+    },
+    "accept-tg-q2-1": {
+      "status": {
+        "name": "accept-tg-q2-1",
+        "returncode": 0,
+        "elapsed_seconds": 6.01,
+        "peak_temp_c": 61.0,
+        "peak_vram_bytes": 16069517312
+      },
+      "measurements": [
+        {
+          "build_number": 0,
+          "model_size": 7901057024,
+          "model_n_params": 27320697856,
+          "n_batch": 2048,
+          "n_ubatch": 512,
+          "n_threads": 8,
+          "cpu_strict": false,
+          "poll": 50,
+          "n_gpu_layers": 99,
+          "n_cpu_moe": 0,
+          "main_gpu": 0,
+          "no_kv_offload": false,
+          "flash_attn": 1,
+          "embeddings": false,
+          "no_op_offload": 0,
+          "no_host": false,
+          "repack": true,
+          "fit_target": 0,
+          "fit_min_ctx": 0,
+          "n_prompt": 0,
+          "n_gen": 128,
+          "n_depth": 0,
+          "avg_ns": 1553284026,
+          "stddev_ns": 2648924,
+          "avg_ts": 82.406209,
+          "stddev_ts": 0.140395,
+          "samples_ns": [
+            1556341700,
+            1551686107,
+            1551824271
+          ],
+          "samples_ts": [
+            82.2441,
+            82.4909,
+            82.4836
+          ]
+        }
+      ]
+    },
+    "accept-tg-base-1": {
+      "status": {
+        "name": "accept-tg-base-1",
+        "returncode": 0,
+        "elapsed_seconds": 10.01,
+        "peak_temp_c": 56.0,
+        "peak_vram_bytes": 8190754816
+      },
+      "measurements": [
+        {
+          "build_number": 12110,
+          "model_size": 7901057024,
+          "model_n_params": 27320697856,
+          "n_batch": 2048,
+          "n_ubatch": 512,
+          "n_threads": 8,
+          "cpu_strict": false,
+          "poll": 50,
+          "n_gpu_layers": 99,
+          "n_cpu_moe": 0,
+          "main_gpu": 0,
+          "no_kv_offload": false,
+          "flash_attn": 1,
+          "embeddings": false,
+          "no_op_offload": 0,
+          "no_host": false,
+          "repack": true,
+          "fit_target": 0,
+          "fit_min_ctx": 0,
+          "n_prompt": 0,
+          "n_gen": 128,
+          "n_depth": 0,
+          "avg_ns": 2846154736,
+          "stddev_ns": 13809252,
+          "avg_ts": 44.973663,
+          "stddev_ts": 0.2176,
+          "samples_ns": [
+            2838529288,
+            2837839605,
+            2862095315
+          ],
+          "samples_ts": [
+            45.0938,
+            45.1047,
+            44.7225
+          ]
+        }
+      ]
+    },
+    "accept-tg-base-2": {
+      "status": {
+        "name": "accept-tg-base-2",
+        "returncode": 0,
+        "elapsed_seconds": 25.53,
+        "peak_temp_c": 51.0,
+        "peak_vram_bytes": 8190754816
+      },
+      "measurements": [
+        {
+          "build_number": 12110,
+          "model_size": 7901057024,
+          "model_n_params": 27320697856,
+          "n_batch": 2048,
+          "n_ubatch": 512,
+          "n_threads": 8,
+          "cpu_strict": false,
+          "poll": 50,
+          "n_gpu_layers": 99,
+          "n_cpu_moe": 0,
+          "main_gpu": 0,
+          "no_kv_offload": false,
+          "flash_attn": 1,
+          "embeddings": false,
+          "no_op_offload": 0,
+          "no_host": false,
+          "repack": true,
+          "fit_target": 0,
+          "fit_min_ctx": 0,
+          "n_prompt": 0,
+          "n_gen": 128,
+          "n_depth": 0,
+          "avg_ns": 3397437077,
+          "stddev_ns": 775136961,
+          "avg_ts": 38.867542,
+          "stddev_ts": 7.837644,
+          "samples_ns": [
+            4292341085,
+            2964035649,
+            2935934498
+          ],
+          "samples_ts": [
+            29.8206,
+            43.1844,
+            43.5977
+          ]
+        }
+      ]
+    },
+    "accept-tg-q2-2": {
+      "status": {
+        "name": "accept-tg-q2-2",
+        "returncode": 0,
+        "elapsed_seconds": 7.51,
+        "peak_temp_c": 56.0,
+        "peak_vram_bytes": 16069574656
+      },
+      "measurements": [
+        {
+          "build_number": 0,
+          "model_size": 7901057024,
+          "model_n_params": 27320697856,
+          "n_batch": 2048,
+          "n_ubatch": 512,
+          "n_threads": 8,
+          "cpu_strict": false,
+          "poll": 50,
+          "n_gpu_layers": 99,
+          "n_cpu_moe": 0,
+          "main_gpu": 0,
+          "no_kv_offload": false,
+          "flash_attn": 1,
+          "embeddings": false,
+          "no_op_offload": 0,
+          "no_host": false,
+          "repack": true,
+          "fit_target": 0,
+          "fit_min_ctx": 0,
+          "n_prompt": 0,
+          "n_gen": 128,
+          "n_depth": 0,
+          "avg_ns": 1614903693,
+          "stddev_ns": 1985978,
+          "avg_ts": 79.261772,
+          "stddev_ts": 0.09752,
+          "samples_ns": [
+            1616269664,
+            1612626002,
+            1615815414
+          ],
+          "samples_ts": [
+            79.1947,
+            79.3736,
+            79.217
+          ]
+        }
+      ]
+    },
+    "accept-tg-off-2": {
+      "status": {
+        "name": "accept-tg-off-2",
+        "returncode": 0,
+        "elapsed_seconds": 8.01,
+        "peak_temp_c": 56.0,
+        "peak_vram_bytes": 8543240192
+      },
+      "measurements": [
+        {
+          "build_number": 0,
+          "model_size": 7901057024,
+          "model_n_params": 27320697856,
+          "n_batch": 2048,
+          "n_ubatch": 512,
+          "n_threads": 8,
+          "cpu_strict": false,
+          "poll": 50,
+          "n_gpu_layers": 99,
+          "n_cpu_moe": 0,
+          "main_gpu": 0,
+          "no_kv_offload": false,
+          "flash_attn": 1,
+          "embeddings": false,
+          "no_op_offload": 0,
+          "no_host": false,
+          "repack": true,
+          "fit_target": 0,
+          "fit_min_ctx": 0,
+          "n_prompt": 0,
+          "n_gen": 128,
+          "n_depth": 0,
+          "avg_ns": 2317602145,
+          "stddev_ns": 2392780,
+          "avg_ts": 55.229536,
+          "stddev_ts": 0.056976,
+          "samples_ns": [
+            2320360864,
+            2316346012,
+            2316099560
+          ],
+          "samples_ts": [
+            55.1638,
+            55.2594,
+            55.2653
+          ]
+        }
+      ]
+    },
+    "accept-d8192-base": {
+      "status": {
+        "name": "accept-d8192-base",
+        "returncode": 0,
+        "elapsed_seconds": 20.02,
+        "peak_temp_c": 60.0,
+        "peak_vram_bytes": 9503019008
+      },
+      "measurements": [
+        {
+          "build_number": 12110,
+          "model_size": 7901057024,
+          "model_n_params": 27320697856,
+          "n_batch": 2048,
+          "n_ubatch": 512,
+          "n_threads": 8,
+          "cpu_strict": false,
+          "poll": 50,
+          "n_gpu_layers": 99,
+          "n_cpu_moe": 0,
+          "main_gpu": 0,
+          "no_kv_offload": false,
+          "flash_attn": 1,
+          "embeddings": false,
+          "no_op_offload": 0,
+          "no_host": false,
+          "repack": true,
+          "fit_target": 0,
+          "fit_min_ctx": 0,
+          "n_prompt": 0,
+          "n_gen": 128,
+          "n_depth": 8192,
+          "avg_ns": 2971811059,
+          "stddev_ns": 37986794,
+          "avg_ts": 43.076061,
+          "stddev_ts": 0.549517,
+          "samples_ns": [
+            2967661831,
+            3011702053,
+            2936069295
+          ],
+          "samples_ts": [
+            43.1316,
+            42.5009,
+            43.5957
+          ]
+        }
+      ]
+    },
+    "accept-d8192-q2": {
+      "status": {
+        "name": "accept-d8192-q2",
+        "returncode": 0,
+        "elapsed_seconds": 13.51,
+        "peak_temp_c": 64.0,
+        "peak_vram_bytes": 17460756480
+      },
+      "measurements": [
+        {
+          "build_number": 0,
+          "model_size": 7901057024,
+          "model_n_params": 27320697856,
+          "n_batch": 2048,
+          "n_ubatch": 512,
+          "n_threads": 8,
+          "cpu_strict": false,
+          "poll": 50,
+          "n_gpu_layers": 99,
+          "n_cpu_moe": 0,
+          "main_gpu": 0,
+          "no_kv_offload": false,
+          "flash_attn": 1,
+          "embeddings": false,
+          "no_op_offload": 0,
+          "no_host": false,
+          "repack": true,
+          "fit_target": 0,
+          "fit_min_ctx": 0,
+          "n_prompt": 0,
+          "n_gen": 128,
+          "n_depth": 8192,
+          "avg_ns": 1725271553,
+          "stddev_ns": 32483667,
+          "avg_ts": 74.208612,
+          "stddev_ts": 1.385682,
+          "samples_ns": [
+            1714401130,
+            1699617151,
+            1761796378
+          ],
+          "samples_ts": [
+            74.6616,
+            75.3111,
+            72.6531
+          ]
+        }
+      ]
+    },
+    "accept-d32768-base": {
+      "status": {
+        "name": "accept-d32768-base",
+        "returncode": 0,
+        "elapsed_seconds": 98.61,
+        "peak_temp_c": 63.0,
+        "peak_vram_bytes": 11133865984
+      },
+      "measurements": [
+        {
+          "build_number": 12110,
+          "model_size": 7901057024,
+          "model_n_params": 27320697856,
+          "n_batch": 2048,
+          "n_ubatch": 512,
+          "n_threads": 8,
+          "cpu_strict": false,
+          "poll": 50,
+          "n_gpu_layers": 99,
+          "n_cpu_moe": 0,
+          "main_gpu": 0,
+          "no_kv_offload": false,
+          "flash_attn": 1,
+          "embeddings": false,
+          "no_op_offload": 0,
+          "no_host": false,
+          "repack": true,
+          "fit_target": 0,
+          "fit_min_ctx": 0,
+          "n_prompt": 0,
+          "n_gen": 128,
+          "n_depth": 32768,
+          "avg_ns": 3203232813,
+          "stddev_ns": 64482368,
+          "avg_ts": 39.970305,
+          "stddev_ts": 0.795375,
+          "samples_ns": [
+            3277689791,
+            3165707016,
+            3166301634
+          ],
+          "samples_ts": [
+            39.0519,
+            40.4333,
+            40.4257
+          ]
+        }
+      ]
+    },
+    "accept-d32768-q2": {
+      "status": {
+        "name": "accept-d32768-q2",
+        "returncode": 0,
+        "elapsed_seconds": 35.54,
+        "peak_temp_c": 66.0,
+        "peak_vram_bytes": 19098083328
+      },
+      "measurements": [
+        {
+          "build_number": 0,
+          "model_size": 7901057024,
+          "model_n_params": 27320697856,
+          "n_batch": 2048,
+          "n_ubatch": 512,
+          "n_threads": 8,
+          "cpu_strict": false,
+          "poll": 50,
+          "n_gpu_layers": 99,
+          "n_cpu_moe": 0,
+          "main_gpu": 0,
+          "no_kv_offload": false,
+          "flash_attn": 1,
+          "embeddings": false,
+          "no_op_offload": 0,
+          "no_host": false,
+          "repack": true,
+          "fit_target": 0,
+          "fit_min_ctx": 0,
+          "n_prompt": 0,
+          "n_gen": 128,
+          "n_depth": 32768,
+          "avg_ns": 2013661785,
+          "stddev_ns": 37544353,
+          "avg_ts": 63.580367,
+          "stddev_ts": 1.172821,
+          "samples_ns": [
+            2057013668,
+            1991787942,
+            1992183745
+          ],
+          "samples_ts": [
+            62.2261,
+            64.2639,
+            64.2511
+          ]
+        }
+      ]
+    },
+    "accept-pp8192-u512-base-0": {
+      "status": {
+        "name": "accept-pp8192-u512-base-0",
+        "returncode": 0,
+        "elapsed_seconds": 39.54,
+        "peak_temp_c": 67.0,
+        "peak_vram_bytes": 9411584000
+      },
+      "measurements": [
+        {
+          "build_number": 12110,
+          "model_size": 7901057024,
+          "model_n_params": 27320697856,
+          "n_batch": 2048,
+          "n_ubatch": 512,
+          "n_threads": 8,
+          "cpu_strict": false,
+          "poll": 50,
+          "n_gpu_layers": 99,
+          "n_cpu_moe": 0,
+          "main_gpu": 0,
+          "no_kv_offload": false,
+          "flash_attn": 1,
+          "embeddings": false,
+          "no_op_offload": 0,
+          "no_host": false,
+          "repack": true,
+          "fit_target": 0,
+          "fit_min_ctx": 0,
+          "n_prompt": 8192,
+          "n_gen": 0,
+          "n_depth": 0,
+          "avg_ns": 9555495290,
+          "stddev_ns": 8197360,
+          "avg_ts": 857.308153,
+          "stddev_ts": 0.735628,
+          "samples_ns": [
+            9546467139,
+            9557548364,
+            9562470368
+          ],
+          "samples_ts": [
+            858.118,
+            857.124,
+            856.682
+          ]
+        }
+      ]
+    },
+    "accept-pp8192-u512-q2-0": {
+      "status": {
+        "name": "accept-pp8192-u512-q2-0",
+        "returncode": 0,
+        "elapsed_seconds": 26.53,
+        "peak_temp_c": 68.0,
+        "peak_vram_bytes": 15492788224
+      },
+      "measurements": [
+        {
+          "build_number": 0,
+          "model_size": 7901057024,
+          "model_n_params": 27320697856,
+          "n_batch": 2048,
+          "n_ubatch": 512,
+          "n_threads": 8,
+          "cpu_strict": false,
+          "poll": 50,
+          "n_gpu_layers": 99,
+          "n_cpu_moe": 0,
+          "main_gpu": 0,
+          "no_kv_offload": false,
+          "flash_attn": 1,
+          "embeddings": false,
+          "no_op_offload": 0,
+          "no_host": false,
+          "repack": true,
+          "fit_target": 0,
+          "fit_min_ctx": 0,
+          "n_prompt": 8192,
+          "n_gen": 0,
+          "n_depth": 0,
+          "avg_ns": 6279964963,
+          "stddev_ns": 935733,
+          "avg_ts": 1304.465895,
+          "stddev_ts": 0.192974,
+          "samples_ns": [
+            6280038898,
+            6280854785,
+            6279001208
+          ],
+          "samples_ts": [
+            1304.45,
+            1304.28,
+            1304.67
+          ]
+        }
+      ]
+    },
+    "accept-pp8192-u4096-base-0": {
+      "status": {
+        "name": "accept-pp8192-u4096-base-0",
+        "returncode": 0,
+        "elapsed_seconds": 28.03,
+        "peak_temp_c": 70.0,
+        "peak_vram_bytes": 13559865344
+      },
+      "measurements": [
+        {
+          "build_number": 12110,
+          "model_size": 7901057024,
+          "model_n_params": 27320697856,
+          "n_batch": 4096,
+          "n_ubatch": 4096,
+          "n_threads": 8,
+          "cpu_strict": false,
+          "poll": 50,
+          "n_gpu_layers": 99,
+          "n_cpu_moe": 0,
+          "main_gpu": 0,
+          "no_kv_offload": false,
+          "flash_attn": 1,
+          "embeddings": false,
+          "no_op_offload": 0,
+          "no_host": false,
+          "repack": true,
+          "fit_target": 0,
+          "fit_min_ctx": 0,
+          "n_prompt": 8192,
+          "n_gen": 0,
+          "n_depth": 0,
+          "avg_ns": 6758175552,
+          "stddev_ns": 8882565,
+          "avg_ts": 1212.162863,
+          "stddev_ts": 1.59252,
+          "samples_ns": [
+            6750193945,
+            6756589000,
+            6767743713
+          ],
+          "samples_ts": [
+            1213.59,
+            1212.45,
+            1210.45
+          ]
+        }
+      ]
+    },
+    "accept-pp8192-u4096-q2-0": {
+      "status": {
+        "name": "accept-pp8192-u4096-q2-0",
+        "returncode": 0,
+        "elapsed_seconds": 18.02,
+        "peak_temp_c": 67.0,
+        "peak_vram_bytes": 14483542016
+      },
+      "measurements": [
+        {
+          "build_number": 0,
+          "model_size": 7901057024,
+          "model_n_params": 27320697856,
+          "n_batch": 4096,
+          "n_ubatch": 4096,
+          "n_threads": 8,
+          "cpu_strict": false,
+          "poll": 50,
+          "n_gpu_layers": 99,
+          "n_cpu_moe": 0,
+          "main_gpu": 0,
+          "no_kv_offload": false,
+          "flash_attn": 1,
+          "embeddings": false,
+          "no_op_offload": 0,
+          "no_host": false,
+          "repack": true,
+          "fit_target": 0,
+          "fit_min_ctx": 0,
+          "n_prompt": 8192,
+          "n_gen": 0,
+          "n_depth": 0,
+          "avg_ns": 4191877900,
+          "stddev_ns": 8498751,
+          "avg_ts": 1954.260745,
+          "stddev_ts": 3.958782,
+          "samples_ns": [
+            4184913290,
+            4189373116,
+            4201347295
+          ],
+          "samples_ts": [
+            1957.51,
+            1955.42,
+            1949.85
+          ]
+        }
+      ]
+    },
+    "accept-pp8192-u512-q2-1": {
+      "status": {
+        "name": "accept-pp8192-u512-q2-1",
+        "returncode": 0,
+        "elapsed_seconds": 14.01,
+        "peak_temp_c": 66.0,
+        "peak_vram_bytes": 21898567680
+      },
+      "measurements": [
+        {
+          "build_number": 0,
+          "model_size": 7901057024,
+          "model_n_params": 27320697856,
+          "n_batch": 2048,
+          "n_ubatch": 512,
+          "n_threads": 8,
+          "cpu_strict": false,
+          "poll": 50,
+          "n_gpu_layers": 99,
+          "n_cpu_moe": 0,
+          "main_gpu": 0,
+          "no_kv_offload": false,
+          "flash_attn": 1,
+          "embeddings": false,
+          "no_op_offload": 0,
+          "no_host": false,
+          "repack": true,
+          "fit_target": 0,
+          "fit_min_ctx": 0,
+          "n_prompt": 8192,
+          "n_gen": 0,
+          "n_depth": 0,
+          "avg_ns": 6293576095,
+          "stddev_ns": 0,
+          "avg_ts": 1301.644705,
+          "stddev_ts": 0.0,
+          "samples_ns": [
+            6293576095
+          ],
+          "samples_ts": [
+            1301.64
+          ]
+        }
+      ]
+    },
+    "accept-pp8192-u512-base-1": {
+      "status": {
+        "name": "accept-pp8192-u512-base-1",
+        "returncode": 0,
+        "elapsed_seconds": 20.02,
+        "peak_temp_c": 68.0,
+        "peak_vram_bytes": 9411612672
+      },
+      "measurements": [
+        {
+          "build_number": 12110,
+          "model_size": 7901057024,
+          "model_n_params": 27320697856,
+          "n_batch": 2048,
+          "n_ubatch": 512,
+          "n_threads": 8,
+          "cpu_strict": false,
+          "poll": 50,
+          "n_gpu_layers": 99,
+          "n_cpu_moe": 0,
+          "main_gpu": 0,
+          "no_kv_offload": false,
+          "flash_attn": 1,
+          "embeddings": false,
+          "no_op_offload": 0,
+          "no_host": false,
+          "repack": true,
+          "fit_target": 0,
+          "fit_min_ctx": 0,
+          "n_prompt": 8192,
+          "n_gen": 0,
+          "n_depth": 0,
+          "avg_ns": 9486531730,
+          "stddev_ns": 0,
+          "avg_ts": 863.540041,
+          "stddev_ts": 0.0,
+          "samples_ns": [
+            9486531730
+          ],
+          "samples_ts": [
+            863.54
+          ]
+        }
+      ]
+    },
+    "accept-pp8192-u4096-q2-1": {
+      "status": {
+        "name": "accept-pp8192-u4096-q2-1",
+        "returncode": 0,
+        "elapsed_seconds": 10.01,
+        "peak_temp_c": 68.0,
+        "peak_vram_bytes": 14483537920
+      },
+      "measurements": [
+        {
+          "build_number": 0,
+          "model_size": 7901057024,
+          "model_n_params": 27320697856,
+          "n_batch": 4096,
+          "n_ubatch": 4096,
+          "n_threads": 8,
+          "cpu_strict": false,
+          "poll": 50,
+          "n_gpu_layers": 99,
+          "n_cpu_moe": 0,
+          "main_gpu": 0,
+          "no_kv_offload": false,
+          "flash_attn": 1,
+          "embeddings": false,
+          "no_op_offload": 0,
+          "no_host": false,
+          "repack": true,
+          "fit_target": 0,
+          "fit_min_ctx": 0,
+          "n_prompt": 8192,
+          "n_gen": 0,
+          "n_depth": 0,
+          "avg_ns": 4197758491,
+          "stddev_ns": 0,
+          "avg_ts": 1951.517701,
+          "stddev_ts": 0.0,
+          "samples_ns": [
+            4197758491
+          ],
+          "samples_ts": [
+            1951.52
+          ]
+        }
+      ]
+    },
+    "accept-pp8192-u4096-base-1": {
+      "status": {
+        "name": "accept-pp8192-u4096-base-1",
+        "returncode": 0,
+        "elapsed_seconds": 15.01,
+        "peak_temp_c": 71.0,
+        "peak_vram_bytes": 13559869440
+      },
+      "measurements": [
+        {
+          "build_number": 12110,
+          "model_size": 7901057024,
+          "model_n_params": 27320697856,
+          "n_batch": 4096,
+          "n_ubatch": 4096,
+          "n_threads": 8,
+          "cpu_strict": false,
+          "poll": 50,
+          "n_gpu_layers": 99,
+          "n_cpu_moe": 0,
+          "main_gpu": 0,
+          "no_kv_offload": false,
+          "flash_attn": 1,
+          "embeddings": false,
+          "no_op_offload": 0,
+          "no_host": false,
+          "repack": true,
+          "fit_target": 0,
+          "fit_min_ctx": 0,
+          "n_prompt": 8192,
+          "n_gen": 0,
+          "n_depth": 0,
+          "avg_ns": 6992132662,
+          "stddev_ns": 0,
+          "avg_ts": 1171.602485,
+          "stddev_ts": 0.0,
+          "samples_ns": [
+            6992132662
+          ],
+          "samples_ts": [
+            1171.6
+          ]
+        }
+      ]
+    },
+    "accept-pp8192-u512-base-2": {
+      "status": {
+        "name": "accept-pp8192-u512-base-2",
+        "returncode": 0,
+        "elapsed_seconds": 20.02,
+        "peak_temp_c": 69.0,
+        "peak_vram_bytes": 9411584000
+      },
+      "measurements": [
+        {
+          "build_number": 12110,
+          "model_size": 7901057024,
+          "model_n_params": 27320697856,
+          "n_batch": 2048,
+          "n_ubatch": 512,
+          "n_threads": 8,
+          "cpu_strict": false,
+          "poll": 50,
+          "n_gpu_layers": 99,
+          "n_cpu_moe": 0,
+          "main_gpu": 0,
+          "no_kv_offload": false,
+          "flash_attn": 1,
+          "embeddings": false,
+          "no_op_offload": 0,
+          "no_host": false,
+          "repack": true,
+          "fit_target": 0,
+          "fit_min_ctx": 0,
+          "n_prompt": 8192,
+          "n_gen": 0,
+          "n_depth": 0,
+          "avg_ns": 9435044859,
+          "stddev_ns": 0,
+          "avg_ts": 868.252364,
+          "stddev_ts": 0.0,
+          "samples_ns": [
+            9435044859
+          ],
+          "samples_ts": [
+            868.252
+          ]
+        }
+      ]
+    },
+    "accept-pp8192-u512-q2-2": {
+      "status": {
+        "name": "accept-pp8192-u512-q2-2",
+        "returncode": 0,
+        "elapsed_seconds": 14.01,
+        "peak_temp_c": 68.0,
+        "peak_vram_bytes": 10337562624
+      },
+      "measurements": [
+        {
+          "build_number": 0,
+          "model_size": 7901057024,
+          "model_n_params": 27320697856,
+          "n_batch": 2048,
+          "n_ubatch": 512,
+          "n_threads": 8,
+          "cpu_strict": false,
+          "poll": 50,
+          "n_gpu_layers": 99,
+          "n_cpu_moe": 0,
+          "main_gpu": 0,
+          "no_kv_offload": false,
+          "flash_attn": 1,
+          "embeddings": false,
+          "no_op_offload": 0,
+          "no_host": false,
+          "repack": true,
+          "fit_target": 0,
+          "fit_min_ctx": 0,
+          "n_prompt": 8192,
+          "n_gen": 0,
+          "n_depth": 0,
+          "avg_ns": 6285766910,
+          "stddev_ns": 0,
+          "avg_ts": 1303.261816,
+          "stddev_ts": 0.0,
+          "samples_ns": [
+            6285766910
+          ],
+          "samples_ts": [
+            1303.26
+          ]
+        }
+      ]
+    },
+    "accept-pp8192-u4096-base-2": {
+      "status": {
+        "name": "accept-pp8192-u4096-base-2",
+        "returncode": 0,
+        "elapsed_seconds": 14.52,
+        "peak_temp_c": 71.0,
+        "peak_vram_bytes": 13559861248
+      },
+      "measurements": [
+        {
+          "build_number": 12110,
+          "model_size": 7901057024,
+          "model_n_params": 27320697856,
+          "n_batch": 4096,
+          "n_ubatch": 4096,
+          "n_threads": 8,
+          "cpu_strict": false,
+          "poll": 50,
+          "n_gpu_layers": 99,
+          "n_cpu_moe": 0,
+          "main_gpu": 0,
+          "no_kv_offload": false,
+          "flash_attn": 1,
+          "embeddings": false,
+          "no_op_offload": 0,
+          "no_host": false,
+          "repack": true,
+          "fit_target": 0,
+          "fit_min_ctx": 0,
+          "n_prompt": 8192,
+          "n_gen": 0,
+          "n_depth": 0,
+          "avg_ns": 6792815636,
+          "stddev_ns": 0,
+          "avg_ts": 1205.980029,
+          "stddev_ts": 0.0,
+          "samples_ns": [
+            6792815636
+          ],
+          "samples_ts": [
+            1205.98
+          ]
+        }
+      ]
+    },
+    "accept-pp8192-u4096-q2-2": {
+      "status": {
+        "name": "accept-pp8192-u4096-q2-2",
+        "returncode": 0,
+        "elapsed_seconds": 10.01,
+        "peak_temp_c": 69.0,
+        "peak_vram_bytes": 14483509248
+      },
+      "measurements": [
+        {
+          "build_number": 0,
+          "model_size": 7901057024,
+          "model_n_params": 27320697856,
+          "n_batch": 4096,
+          "n_ubatch": 4096,
+          "n_threads": 8,
+          "cpu_strict": false,
+          "poll": 50,
+          "n_gpu_layers": 99,
+          "n_cpu_moe": 0,
+          "main_gpu": 0,
+          "no_kv_offload": false,
+          "flash_attn": 1,
+          "embeddings": false,
+          "no_op_offload": 0,
+          "no_host": false,
+          "repack": true,
+          "fit_target": 0,
+          "fit_min_ctx": 0,
+          "n_prompt": 8192,
+          "n_gen": 0,
+          "n_depth": 0,
+          "avg_ns": 4204631126,
+          "stddev_ns": 0,
+          "avg_ts": 1948.327869,
+          "stddev_ts": 0.0,
+          "samples_ns": [
+            4204631126
+          ],
+          "samples_ts": [
+            1948.33
+          ]
+        }
+      ]
+    },
+    "accept-pp8192-u512-q2-3": {
+      "status": {
+        "name": "accept-pp8192-u512-q2-3",
+        "returncode": 0,
+        "elapsed_seconds": 14.01,
+        "peak_temp_c": 68.0,
+        "peak_vram_bytes": 10337542144
+      },
+      "measurements": [
+        {
+          "build_number": 0,
+          "model_size": 7901057024,
+          "model_n_params": 27320697856,
+          "n_batch": 2048,
+          "n_ubatch": 512,
+          "n_threads": 8,
+          "cpu_strict": false,
+          "poll": 50,
+          "n_gpu_layers": 99,
+          "n_cpu_moe": 0,
+          "main_gpu": 0,
+          "no_kv_offload": false,
+          "flash_attn": 1,
+          "embeddings": false,
+          "no_op_offload": 0,
+          "no_host": false,
+          "repack": true,
+          "fit_target": 0,
+          "fit_min_ctx": 0,
+          "n_prompt": 8192,
+          "n_gen": 0,
+          "n_depth": 0,
+          "avg_ns": 6300417109,
+          "stddev_ns": 0,
+          "avg_ts": 1300.231375,
+          "stddev_ts": 0.0,
+          "samples_ns": [
+            6300417109
+          ],
+          "samples_ts": [
+            1300.23
+          ]
+        }
+      ]
+    },
+    "accept-pp8192-u512-base-3": {
+      "status": {
+        "name": "accept-pp8192-u512-base-3",
+        "returncode": 0,
+        "elapsed_seconds": 20.02,
+        "peak_temp_c": 68.0,
+        "peak_vram_bytes": 9411612672
+      },
+      "measurements": [
+        {
+          "build_number": 12110,
+          "model_size": 7901057024,
+          "model_n_params": 27320697856,
+          "n_batch": 2048,
+          "n_ubatch": 512,
+          "n_threads": 8,
+          "cpu_strict": false,
+          "poll": 50,
+          "n_gpu_layers": 99,
+          "n_cpu_moe": 0,
+          "main_gpu": 0,
+          "no_kv_offload": false,
+          "flash_attn": 1,
+          "embeddings": false,
+          "no_op_offload": 0,
+          "no_host": false,
+          "repack": true,
+          "fit_target": 0,
+          "fit_min_ctx": 0,
+          "n_prompt": 8192,
+          "n_gen": 0,
+          "n_depth": 0,
+          "avg_ns": 9446788210,
+          "stddev_ns": 0,
+          "avg_ts": 867.173035,
+          "stddev_ts": 0.0,
+          "samples_ns": [
+            9446788210
+          ],
+          "samples_ts": [
+            867.173
+          ]
+        }
+      ]
+    },
+    "accept-pp8192-u4096-q2-3": {
+      "status": {
+        "name": "accept-pp8192-u4096-q2-3",
+        "returncode": 0,
+        "elapsed_seconds": 10.01,
+        "peak_temp_c": 69.0,
+        "peak_vram_bytes": 14483537920
+      },
+      "measurements": [
+        {
+          "build_number": 0,
+          "model_size": 7901057024,
+          "model_n_params": 27320697856,
+          "n_batch": 4096,
+          "n_ubatch": 4096,
+          "n_threads": 8,
+          "cpu_strict": false,
+          "poll": 50,
+          "n_gpu_layers": 99,
+          "n_cpu_moe": 0,
+          "main_gpu": 0,
+          "no_kv_offload": false,
+          "flash_attn": 1,
+          "embeddings": false,
+          "no_op_offload": 0,
+          "no_host": false,
+          "repack": true,
+          "fit_target": 0,
+          "fit_min_ctx": 0,
+          "n_prompt": 8192,
+          "n_gen": 0,
+          "n_depth": 0,
+          "avg_ns": 4204624492,
+          "stddev_ns": 0,
+          "avg_ts": 1948.330943,
+          "stddev_ts": 0.0,
+          "samples_ns": [
+            4204624492
+          ],
+          "samples_ts": [
+            1948.33
+          ]
+        }
+      ]
+    },
+    "accept-pp8192-u4096-base-3": {
+      "status": {
+        "name": "accept-pp8192-u4096-base-3",
+        "returncode": 0,
+        "elapsed_seconds": 15.02,
+        "peak_temp_c": 73.0,
+        "peak_vram_bytes": 13559873536
+      },
+      "measurements": [
+        {
+          "build_number": 12110,
+          "model_size": 7901057024,
+          "model_n_params": 27320697856,
+          "n_batch": 4096,
+          "n_ubatch": 4096,
+          "n_threads": 8,
+          "cpu_strict": false,
+          "poll": 50,
+          "n_gpu_layers": 99,
+          "n_cpu_moe": 0,
+          "main_gpu": 0,
+          "no_kv_offload": false,
+          "flash_attn": 1,
+          "embeddings": false,
+          "no_op_offload": 0,
+          "no_host": false,
+          "repack": true,
+          "fit_target": 0,
+          "fit_min_ctx": 0,
+          "n_prompt": 8192,
+          "n_gen": 0,
+          "n_depth": 0,
+          "avg_ns": 7011421043,
+          "stddev_ns": 0,
+          "avg_ts": 1168.379413,
+          "stddev_ts": 0.0,
+          "samples_ns": [
+            7011421043
+          ],
+          "samples_ts": [
+            1168.38
+          ]
+        }
+      ]
+    },
+    "accept-pp512-base": {
+      "status": {
+        "name": "accept-pp512-base",
+        "returncode": 0,
+        "elapsed_seconds": 3.5,
+        "peak_temp_c": 66.0,
+        "peak_vram_bytes": 8965525504
+      },
+      "measurements": [
+        {
+          "build_number": 12110,
+          "model_size": 7901057024,
+          "model_n_params": 27320697856,
+          "n_batch": 4096,
+          "n_ubatch": 4096,
+          "n_threads": 8,
+          "cpu_strict": false,
+          "poll": 50,
+          "n_gpu_layers": 99,
+          "n_cpu_moe": 0,
+          "main_gpu": 0,
+          "no_kv_offload": false,
+          "flash_attn": 1,
+          "embeddings": false,
+          "no_op_offload": 0,
+          "no_host": false,
+          "repack": true,
+          "fit_target": 0,
+          "fit_min_ctx": 0,
+          "n_prompt": 512,
+          "n_gen": 0,
+          "n_depth": 0,
+          "avg_ns": 581156185,
+          "stddev_ns": 1358802,
+          "avg_ts": 881.005614,
+          "stddev_ts": 2.056457,
+          "samples_ns": [
+            582724669,
+            580380645,
+            580363243
+          ],
+          "samples_ts": [
+            878.631,
+            882.18,
+            882.206
+          ]
+        }
+      ]
+    },
+    "accept-pp512-q2": {
+      "status": {
+        "name": "accept-pp512-q2",
+        "returncode": 0,
+        "elapsed_seconds": 3.0,
+        "peak_temp_c": 64.0,
+        "peak_vram_bytes": 9827930112
+      },
+      "measurements": [
+        {
+          "build_number": 0,
+          "model_size": 7901057024,
+          "model_n_params": 27320697856,
+          "n_batch": 4096,
+          "n_ubatch": 4096,
+          "n_threads": 8,
+          "cpu_strict": false,
+          "poll": 50,
+          "n_gpu_layers": 99,
+          "n_cpu_moe": 0,
+          "main_gpu": 0,
+          "no_kv_offload": false,
+          "flash_attn": 1,
+          "embeddings": false,
+          "no_op_offload": 0,
+          "no_host": false,
+          "repack": true,
+          "fit_target": 0,
+          "fit_min_ctx": 0,
+          "n_prompt": 512,
+          "n_gen": 0,
+          "n_depth": 0,
+          "avg_ns": 385489115,
+          "stddev_ns": 836339,
+          "avg_ts": 1328.186931,
+          "stddev_ts": 2.87798,
+          "samples_ns": [
+            386454464,
+            384983222,
+            385029659
+          ],
+          "samples_ts": [
+            1324.87,
+            1329.93,
+            1329.77
+          ]
+        }
+      ]
+    },
+    "accept-pp2048-base": {
+      "status": {
+        "name": "accept-pp2048-base",
+        "returncode": 0,
+        "elapsed_seconds": 8.51,
+        "peak_temp_c": 69.0,
+        "peak_vram_bytes": 10762645504
+      },
+      "measurements": [
+        {
+          "build_number": 12110,
+          "model_size": 7901057024,
+          "model_n_params": 27320697856,
+          "n_batch": 4096,
+          "n_ubatch": 4096,
+          "n_threads": 8,
+          "cpu_strict": false,
+          "poll": 50,
+          "n_gpu_layers": 99,
+          "n_cpu_moe": 0,
+          "main_gpu": 0,
+          "no_kv_offload": false,
+          "flash_attn": 1,
+          "embeddings": false,
+          "no_op_offload": 0,
+          "no_host": false,
+          "repack": true,
+          "fit_target": 0,
+          "fit_min_ctx": 0,
+          "n_prompt": 2048,
+          "n_gen": 0,
+          "n_depth": 0,
+          "avg_ns": 1908474818,
+          "stddev_ns": 2290326,
+          "avg_ts": 1073.109242,
+          "stddev_ts": 1.286936,
+          "samples_ns": [
+            1911116594,
+            1907260507,
+            1907047353
+          ],
+          "samples_ts": [
+            1071.62,
+            1073.79,
+            1073.91
+          ]
+        }
+      ]
+    },
+    "accept-pp2048-q2": {
+      "status": {
+        "name": "accept-pp2048-q2",
+        "returncode": 0,
+        "elapsed_seconds": 5.51,
+        "peak_temp_c": 66.0,
+        "peak_vram_bytes": 11622879232
+      },
+      "measurements": [
+        {
+          "build_number": 0,
+          "model_size": 7901057024,
+          "model_n_params": 27320697856,
+          "n_batch": 4096,
+          "n_ubatch": 4096,
+          "n_threads": 8,
+          "cpu_strict": false,
+          "poll": 50,
+          "n_gpu_layers": 99,
+          "n_cpu_moe": 0,
+          "main_gpu": 0,
+          "no_kv_offload": false,
+          "flash_attn": 1,
+          "embeddings": false,
+          "no_op_offload": 0,
+          "no_host": false,
+          "repack": true,
+          "fit_target": 0,
+          "fit_min_ctx": 0,
+          "n_prompt": 2048,
+          "n_gen": 0,
+          "n_depth": 0,
+          "avg_ns": 1089413576,
+          "stddev_ns": 626447,
+          "avg_ts": 1879.910892,
+          "stddev_ts": 1.077798,
+          "samples_ns": [
+            1090098663,
+            1088875457,
+            1089266610
+          ],
+          "samples_ts": [
+            1878.73,
+            1880.84,
+            1880.16
+          ]
+        }
+      ]
+    }
+  },
+  "exact_files": {
+    "raw-off.f32": {
+      "bytes": 508559360,
+      "sha256": "c078223d85c0b6ab81ed46add482bd2a64171fe2b2a535151615194f7159c4b8"
+    },
+    "raw-on.f32": {
+      "bytes": 508559360,
+      "sha256": "c078223d85c0b6ab81ed46add482bd2a64171fe2b2a535151615194f7159c4b8"
+    },
+    "qwen-before.f32": {
+      "bytes": 127139840,
+      "sha256": "a16e39a8386a261a3ee094c0ae26d0009c9f5aadf84e33233d5803dd53ac16ae"
+    },
+    "qwen-after.f32": {
+      "bytes": 127139840,
+      "sha256": "a16e39a8386a261a3ee094c0ae26d0009c9f5aadf84e33233d5803dd53ac16ae"
+    }
+  },
+  "server": {
+    "off": {
+      "tps": [
+        55.47527899260388,
+        55.463044362137865,
+        55.46071918141725
+      ],
+      "cache_same": true
+    },
+    "on": {
+      "tps": [
+        78.7079989018065,
+        78.71843901955253,
+        78.66217321906053
+      ],
+      "cache_same": true
+    },
+    "greedy_same": [
+      true,
+      true,
+      true
+    ]
+  },
+  "qwen_regression": {
+    "before": 80.554488,
+    "after": 80.870683
+  },
+  "profile": {
+    "profile": {
+      "all_kernel_ms": 644.384837,
+      "q2_gemv_ms": 468.320989,
+      "q2_pct": 72.67722052249346,
+      "q2_calls": 11121
+    },
+    "profile-q2": {
+      "all_kernel_ms": 483.23265,
+      "q2_gemv_ms": 282.796205,
+      "q2_pct": 58.5217503411659,
+      "q2_calls": 11121
+    }
+  },
+  "binary_sha256": {
+    "before": "7c433d1db64bdbbbc9c7a09a252424686b400cdf26fffd6c9d6192db04775e8a",
+    "after": "b4665f08566308dbed1164c79ae9a980b57facfacdcd4316ec72c7adf89c2b6d"
+  },
+  "verification": {
+    "new_operator_tests": {
+      "on": 22,
+      "off": 22
+    },
+    "patch_reverse_check": true,
+    "live_model_processes_at_end": 0,
+    "gpu_busy_pct_at_end": 0
+  }
+}

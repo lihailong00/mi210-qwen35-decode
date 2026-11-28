@@ -1,0 +1,112 @@
+{
+  "phase_runs": [
+    {
+      "tag": "phase-0-k3",
+      "k": 3,
+      "same_tokens_and_text": true,
+      "decode_tps": 88.27771894512264,
+      "steps": 425,
+      "output_tokens": 1280,
+      "total_decode_ms": 14499.695,
+      "phase_ms": {
+        "draft": 1203.462103381753,
+        "target": 12992.02838470228,
+        "catchup": 85.66408650949597
+      },
+      "calls": {
+        "draft": 425,
+        "target": 427,
+        "catchup": 427
+      }
+    },
+    {
+      "tag": "phase-1-k2",
+      "k": 2,
+      "same_tokens_and_text": true,
+      "decode_tps": 95.24487718359113,
+      "steps": 512,
+      "output_tokens": 1280,
+      "total_decode_ms": 13439.043,
+      "phase_ms": {
+        "draft": 978.3143005333841,
+        "target": 12140.129187842831,
+        "catchup": 95.14379687607288
+      },
+      "calls": {
+        "draft": 512,
+        "target": 513,
+        "catchup": 513
+      }
+    },
+    {
+      "tag": "phase-2-k3",
+      "k": 3,
+      "same_tokens_and_text": true,
+      "decode_tps": 90.21245597209277,
+      "steps": 425,
+      "output_tokens": 1280,
+      "total_decode_ms": 14188.728000000001,
+      "phase_ms": {
+        "draft": 1199.972864240408,
+        "target": 12688.438314944506,
+        "catchup": 83.46551842987537
+      },
+      "calls": {
+        "draft": 425,
+        "target": 427,
+        "catchup": 427
+      }
+    },
+    {
+      "tag": "phase-3-k0",
+      "k": 0,
+      "same_tokens_and_text": true,
+      "decode_tps": 81.29339829014579,
+      "steps": 0,
+      "output_tokens": 1280,
+      "total_decode_ms": 15745.436
+    }
+  ],
+  "trace": {
+    "full_width_rounds": 20,
+    "q2_calls_per_round": 401,
+    "q2_ms_mean": 23.86525475,
+    "q2_ms_median": 23.8668255,
+    "q8_quant_calls_per_round": 401,
+    "fwht_calls_per_round": 258,
+    "kernel_calls_per_round": 1821
+  },
+  "counters": {
+    "full_rounds": 15,
+    "median_q2_read_bytes": 7216959040.0,
+    "median_q2_ms": 24.923219,
+    "approx_read_GBps": 289.5676934829325,
+    "q2_tensor_bytes_in_gguf": 7199539200
+  },
+  "k3_aggregate": {
+    "tokens_per_round": 3.011764705882353,
+    "total_ms_per_round": 33.751085882352946,
+    "ms_per_round": {
+      "target": 30.212313764290336,
+      "draft": 2.8275705501437187,
+      "catchup": 0.19897600581102512,
+      "remaining": 0.5122255621078651
+    },
+    "total_tps": 89.23460170675814
+  },
+  "what_if": {
+    "25": 105.53238567598227,
+    "22": 117.92911154691909,
+    "20": 127.949099926553,
+    "16": 154.14298747556035
+  },
+  "bandwidth_GBps": {
+    "read_48_MB_measured": 1446,
+    "read_4_GB_measured": 1361
+  },
+  "Q2_read_only_floor_ms": [
+    4.990981355463347,
+    5.302688493754593
+  ],
+  "target_budget_for_245_tps_ms": 8.754145048804135
+}

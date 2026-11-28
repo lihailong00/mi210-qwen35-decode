@@ -1,0 +1,320 @@
+diff --git a/ggml/src/ggml-cuda/mmvq-fused-host.cuh b/ggml/src/ggml-cuda/mmvq-fused-host.cuh
+index 7f81276..91f8c64 100644
+--- a/ggml/src/ggml-cuda/mmvq-fused-host.cuh
++++ b/ggml/src/ggml-cuda/mmvq-fused-host.cuh
+@@ -144,3 +144,6 @@ bool ggml_cuda_mmvq_iq3_multi_nc(ggml_backend_cuda_context & ctx, const ggml_ten
+ bool ggml_cuda_mmvq_mix_member(const ggml_tensor * mm);
+ bool ggml_cuda_mmvq_mix(ggml_backend_cuda_context & ctx, ggml_tensor * const * mm, int n, ggml_tensor * glu = nullptr);
+ const void * ggml_cuda_mmvq_iq4k_soa_il4(const ggml_tensor * w, int device, cudaStream_t stream);
++
++bool ggml_cuda_mmvq_q2_0(ggml_backend_cuda_context & ctx, const ggml_tensor * w, const block_q8_1 * x,
++        ggml_tensor * dst, const ggml_cuda_mm_fusion_args_host * fusion);
+diff --git a/ggml/src/ggml-cuda/mmvq.cu b/ggml/src/ggml-cuda/mmvq.cu
+index 16e33f5..f84883f 100644
+--- a/ggml/src/ggml-cuda/mmvq.cu
++++ b/ggml/src/ggml-cuda/mmvq.cu
+@@ -2176,6 +2176,10 @@ void ggml_cuda_mul_mat_vec_q(
+     }
+ 
+ #if defined(GGML_USE_HIP)
++    if (!ids && ne11 == 1 && ne12 == 1 && ne13 == 1 &&
++            ggml_cuda_mmvq_q2_0(ctx, src0, src1_q8_1_ptr, dst, fusion)) {
++        return;
++    }
+     // IQ3_S / IQ3_XXS on the iq3gemv SoA re-layout (no codex packed copies are created for tensors handled here)
+     if (!ids && ne11 == 1 && ne12 == 1 && ne13 == 1 &&
+             ggml_cuda_mmvq_iq3(ctx, src0, src1_q8_1_ptr, dst, fusion)) {
+diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
+index d3e22d1..d78e396 100644
+--- a/tests/test-backend-ops.cpp
++++ b/tests/test-backend-ops.cpp
+@@ -12699,6 +12699,20 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+         test_cases.emplace_back(new test_mul_mat(type_a,    GGML_TYPE_F32, 16,  8, 16*256, { 1,  1}, {1, 1}));
+     }
+ 
++    // Q2_0 weight-cache GEMV: real Bonsai inner dimensions, fused epilogues,
++    // and fallback boundaries. Weight contexts exercise the repack cache lifetime.
++    for (int64_t k : { 4096, 5120, 6144, 17408 }) {
++        for (auto pattern : { GEMM_FUSION_MM, GEMM_FUSION_ADD, GEMM_FUSION_RES_INPLACE }) {
++            test_cases.emplace_back(new test_gemm_fusion(GGML_TYPE_Q2_0, 256, 1, k, pattern, true));
++        }
++        test_cases.emplace_back(new test_mix_pair(GGML_TYPE_Q2_0, GGML_TYPE_Q2_0, 256, 256, 1, k, true));
++    }
++    for (int64_t n : { 1, 2 }) {
++        test_cases.emplace_back(new test_gemm_fusion(GGML_TYPE_Q2_0, 129, n, 5120, GEMM_FUSION_MM, true));
++        test_cases.emplace_back(new test_gemm_fusion(GGML_TYPE_Q2_0, 256, n, 2048, GEMM_FUSION_MM, true));
++        test_cases.emplace_back(new test_gemm_fusion(GGML_TYPE_Q2_0, 256, n, 5120, GEMM_FUSION_FFN_ADD, true));
++    }
++
+     // Multi-column MMVQ coverage for the Q4_K weight-reuse path and a Q5_K control.
+     for (ggml_type type_a : { GGML_TYPE_Q4_K, GGML_TYPE_Q5_K }) {
+         for (int n = 1; n <= 8; ++n) {
+diff --git a/ggml/src/ggml-cuda/mmvq-q2-0.cu b/ggml/src/ggml-cuda/mmvq-q2-0.cu
+new file mode 100644
+index 0000000..d468585
+--- /dev/null
++++ b/ggml/src/ggml-cuda/mmvq-q2-0.cu
+@@ -0,0 +1,193 @@
++#include "common.cuh"
++#include "vecdotq.cuh"
++#include "unary.cuh"
++#include "iq3-repack.cuh"
++#include "mmvq-fused-host.cuh"
++
++#if defined(GGML_USE_HIP)
++#include <cstdlib>
++
++// Same-size, lossless SoA copy: eight packed bytes per 32 values followed by
++// one fp16 scale per 64 values. Transpose the two-bit codes within each word
++// so a shift and byte permutation feed four signed values directly to dp4a.
++static __global__ void q2_0_repack_kernel(const block_q2_0 * src, uint2 * codes, half * scales, const int64_t nblocks) {
++    const int64_t i = (int64_t) blockIdx.x*blockDim.x + threadIdx.x;
++    if (i >= nblocks) {
++        return;
++    }
++    const block_q2_0 & b = src[i];
++    scales[i] = b.d;
++#pragma unroll
++    for (int chunk = 0; chunk < 2; ++chunk) {
++        uint32_t words[2] = {};
++#pragma unroll
++        for (int word = 0; word < 2; ++word) {
++#pragma unroll
++            for (int j = 0; j < 16; ++j) {
++                const int k = 32*chunk + 16*word + j;
++                const uint32_t q = (b.qs[k/4] >> (2*(k%4))) & 3;
++                words[word] |= q << (8*(j%4) + 2*(j/4));
++            }
++        }
++        codes[2*i + chunk] = make_uint2(words[0], words[1]);
++    }
++}
++
++static void q2_0_repack(const void * src, void * dst, const ggml_tensor * w, hipStream_t stream) {
++    const int64_t nblocks = ggml_nelements(w)/QK2_0;
++    auto * codes = (uint2 *) dst;
++    auto * scales = (half *) (codes + 2*nblocks);
++    q2_0_repack_kernel<<<(nblocks + 255)/256, 256, 0, stream>>>(
++        (const block_q2_0 *) src, codes, scales, nblocks);
++    CUDA_CHECK(cudaGetLastError());
++}
++
++static __device__ __forceinline__ float q2_0_dot(const uint2 code, const float d, const block_q8_1 & x) {
++    int sum = 0;
++#pragma unroll
++    for (int j = 0; j < 4; ++j) {
++        const uint32_t a = (code.x >> (2*j)) & 0x03030303u;
++        const uint32_t b = (code.y >> (2*j)) & 0x03030303u;
++        const int qa = ggml_hip_perm(0x020100FF, 0x020100FF, a);
++        const int qb = ggml_hip_perm(0x020100FF, 0x020100FF, b);
++        sum = ggml_cuda_dp4a(qa, get_int_b4(x.qs, j), sum);
++        sum = ggml_cuda_dp4a(qb, get_int_b4(x.qs, j + 4), sum);
++    }
++    return d * __low2float(x.ds) * sum;
++}
++
++template<int R, bool GATE, bool BIAS>
++__launch_bounds__(128)
++static __global__ void q2_0_gemv_kernel(
++        const uint2 * codes, const half * scales, const uint2 * gate, const half * gate_scales,
++        const block_q8_1 * x, float * dst, const float * bias, const int chunks) {
++    constexpr int warp_size = ggml_cuda_get_physical_warp_size();
++    const int tid = threadIdx.x;
++    const int row0 = blockIdx.x*R;
++    float sums[R] = {};
++    float gate_sums[R] = {};
++    for (int k = tid; k < chunks; k += 128) {
++        const block_q8_1 xv = x[k];
++#pragma unroll
++        for (int r = 0; r < R; ++r) {
++            const int64_t offset = (int64_t) (row0 + r)*chunks + k;
++            sums[r] += q2_0_dot(codes[offset], __half2float(scales[offset/2]), xv);
++            if constexpr (GATE) {
++                gate_sums[r] += q2_0_dot(gate[offset], __half2float(gate_scales[offset/2]), xv);
++            }
++        }
++    }
++    // Match the generic Q2_0 GEMV: 128 lanes, then the same two-wave reduction.
++    __shared__ float partial[R][64];
++    __shared__ float gate_partial[GATE ? R : 1][64];
++    if (tid >= 64) {
++#pragma unroll
++        for (int r = 0; r < R; ++r) {
++            partial[r][tid - 64] = sums[r];
++            if constexpr (GATE) {
++                gate_partial[r][tid - 64] = gate_sums[r];
++            }
++        }
++    }
++    __syncthreads();
++    if (tid >= 64) {
++        return;
++    }
++#pragma unroll
++    for (int r = 0; r < R; ++r) {
++        sums[r] += partial[r][tid];
++        sums[r] = warp_reduce_sum<warp_size>(sums[r]);
++        if constexpr (GATE) {
++            gate_sums[r] += gate_partial[r][tid];
++            gate_sums[r] = warp_reduce_sum<warp_size>(gate_sums[r]);
++        }
++        if (tid == 0) {
++            float value = sums[r];
++            if constexpr (GATE || BIAS) {
++                value += BIAS ? bias[row0 + r] : 0.0f;
++            }
++            if constexpr (GATE) {
++                value *= ggml_cuda_op_silu_single(gate_sums[r] + 0.0f);
++            }
++            dst[row0 + r] = value;
++        }
++    }
++}
++
++template<int R>
++static void q2_0_launch(
++        const void * packed, const void * packed_gate, const block_q8_1 * x, float * dst,
++        const float * bias, const int K, const int N, cudaStream_t stream) {
++    const auto * codes = (const uint2 *) packed;
++    const auto * scales = (const half *) (codes + (int64_t) N*K/32);
++    const auto * gate = (const uint2 *) packed_gate;
++    const auto * gate_scales = gate ? (const half *) (gate + (int64_t) N*K/32) : nullptr;
++    const dim3 grid(N/R);
++    if (gate) {
++        q2_0_gemv_kernel<R, true, false><<<grid, 128, 0, stream>>>(
++            codes, scales, gate, gate_scales, x, dst, nullptr, K/32);
++    } else if (bias) {
++        q2_0_gemv_kernel<R, false, true><<<grid, 128, 0, stream>>>(
++            codes, scales, nullptr, nullptr, x, dst, bias, K/32);
++    } else {
++        q2_0_gemv_kernel<R, false, false><<<grid, 128, 0, stream>>>(
++            codes, scales, nullptr, nullptr, x, dst, nullptr, K/32);
++    }
++}
++
++static bool q2_0_weight_ok(const ggml_tensor * w) {
++    return w && w->type == GGML_TYPE_Q2_0 && ggml_is_matrix(w) && ggml_is_contiguous(w) &&
++        w->ne[0] >= 4096 && w->ne[0] <= 32768 && w->ne[0]%256 == 0 &&
++        w->ne[1] >= 128 && w->ne[1] <= 1048576 && w->ne[1]%8 == 0 &&
++        w->buffer && ggml_backend_buffer_get_usage(w->buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS;
++}
++#endif
++
++bool ggml_cuda_mmvq_q2_0(
++        ggml_backend_cuda_context & ctx, const ggml_tensor * w, const block_q8_1 * x,
++        ggml_tensor * dst, const ggml_cuda_mm_fusion_args_host * fusion) {
++#if defined(GGML_USE_HIP)
++    static const bool enabled = [] {
++        const char * e = getenv("GGML_MMVQ_Q2_0");
++        return e == nullptr || e[0] != '0';
++    }();
++    if (!enabled || !GGML_CUDA_CC_IS_CDNA2(ggml_cuda_info().devices[ctx.device].cc) ||
++            ggml_cuda_info().devices[ctx.device].warp_size != 64 || !q2_0_weight_ok(w) ||
++            dst->type != GGML_TYPE_F32 || !ggml_is_contiguous(dst) ||
++            dst->ne[0] != w->ne[1] || ggml_nelements(dst) != dst->ne[0]) {
++        return false;
++    }
++    const ggml_tensor * gate = fusion ? fusion->gate : nullptr;
++    const ggml_tensor * bias = fusion ? fusion->x_bias : nullptr;
++    if (fusion && (fusion->gate_bias || fusion->x_scale || fusion->gate_scale || fusion->shared_up ||
++            fusion->shared_gate || fusion->shared_dst)) {
++        return false;
++    }
++    if (gate && (bias || fusion->glu_op != GGML_GLU_OP_SWIGLU ||
++            !q2_0_weight_ok(gate) || !ggml_are_same_shape(w, gate))) {
++        return false;
++    }
++    if (bias && (bias->type != GGML_TYPE_F32 || !ggml_is_contiguous(bias) ||
++            !ggml_are_same_shape(bias, dst))) {
++        return false;
++    }
++    constexpr int kind = 0x7200;
++    const void * packed = ggml_cuda_get_repacked(w, ctx.device, ctx.stream(), kind, ggml_nbytes(w), q2_0_repack);
++    if (!packed) {
++        return false;
++    }
++    const void * packed_gate = gate ?
++        ggml_cuda_get_repacked(gate, ctx.device, ctx.stream(), kind, ggml_nbytes(gate), q2_0_repack) : nullptr;
++    if (gate && !packed_gate) {
++        return false;
++    }
++    const int K = (int) w->ne[0], N = (int) w->ne[1];
++    const auto * residual = bias ? (const float *) bias->data : nullptr;
++    q2_0_launch<2>(packed, packed_gate, x, (float *) dst->data, residual, K, N, ctx.stream());
++    CUDA_CHECK(cudaGetLastError());
++    return true;
++#else
++    GGML_UNUSED(ctx); GGML_UNUSED(w); GGML_UNUSED(x); GGML_UNUSED(dst); GGML_UNUSED(fusion);
++    return false;
++#endif
++}
+diff --git a/mi210-tools/eval/bonsai/logits.cpp b/mi210-tools/eval/bonsai/logits.cpp
+new file mode 100644
+index 0000000..6d5d97e
+--- /dev/null
++++ b/mi210-tools/eval/bonsai/logits.cpp
+@@ -0,0 +1,64 @@
++// Dump raw float32 logits for single-token decode equivalence checks.
++// Usage: logits MODEL INPUT OUTPUT [TOKEN_COUNT]
++// Build: c++ -O2 -std=c++17 -Iinclude -Iggml/include this.cpp -Lbuild/bin
++//        -Wl,-rpath,$PWD/build/bin -lllama -lggml -lggml-base -o logits
++#include "llama.h"
++#include "ggml-backend.h"
++#include <algorithm>
++#include <cstdio>
++#include <cstdlib>
++#include <fstream>
++#include <iterator>
++#include <string>
++#include <vector>
++
++int main(int argc, char ** argv) {
++    if (argc < 4 || argc > 5) {
++        std::fprintf(stderr, "usage: %s MODEL INPUT OUTPUT [TOKEN_COUNT]\n", argv[0]);
++        return 1;
++    }
++    std::ifstream input(argv[2], std::ios::binary);
++    std::ofstream output(argv[3], std::ios::binary);
++    if (!input || !output) return 1;
++    const std::string text((std::istreambuf_iterator<char>(input)), {});
++    const int count = argc == 5 ? std::atoi(argv[4]) : 512;
++    if (count <= 0 || count > 4096) return 1;
++    const char * backend_dir = std::getenv("BONSAI_BACKEND_DIR");
++    if (backend_dir) ggml_backend_load_all_from_path(backend_dir);
++    else ggml_backend_load_all();
++    llama_backend_init();
++    auto mp = llama_model_default_params();
++    mp.n_gpu_layers = 99;
++    llama_model * model = llama_model_load_from_file(argv[1], mp);
++    if (!model) return 1;
++    const llama_vocab * vocab = llama_model_get_vocab(model);
++    std::vector<llama_token> tokens(text.size() + 16);
++    int nt = llama_tokenize(vocab, text.data(), text.size(), tokens.data(), tokens.size(), true, true);
++    if (nt < count) {
++        llama_model_free(model);
++        return 1;
++    }
++    auto cp = llama_context_default_params();
++    cp.n_ctx = count + 32;
++    cp.n_batch = cp.n_ubatch = 1;
++    cp.n_threads = cp.n_threads_batch = 8;
++    cp.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
++    llama_context * ctx = llama_init_from_model(model, cp);
++    if (!ctx) { llama_model_free(model); return 1; }
++    int result = 0;
++    const size_t bytes = size_t(llama_vocab_n_tokens(vocab)) * sizeof(float);
++    for (int i = 0; i < count; ++i) {
++        llama_batch batch = llama_batch_get_one(&tokens[i], 1);
++        if (llama_decode(ctx, batch) != 0) { result = 1; break; }
++        output.write(reinterpret_cast<const char *>(llama_get_logits(ctx)), bytes);
++        if (!output) { result = 1; break; }
++    }
++    output.close();
++    if (!output) result = 1;
++    llama_free(ctx);
++    llama_model_free(model);
++    llama_backend_free();
++    std::fprintf(stderr, "raw float32 logits: %s, tokens=%d, bytes/token=%zu\n",
++                 result ? "FAILED" : "complete", count, bytes);
++    return result;
++}

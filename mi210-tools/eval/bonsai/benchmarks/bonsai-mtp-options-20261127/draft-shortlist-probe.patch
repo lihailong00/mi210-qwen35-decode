@@ -1,0 +1,58 @@
+--- a/ggml/src/ggml-cuda/mmvq-q2-0.cu
++++ b/ggml/src/ggml-cuda/mmvq-q2-0.cu
+@@ -272,6 +272,11 @@
+             if (tid == 0) dst[c*rows + row + r] = result;
+         }
+     }
++}
++
++static __global__ void q2_0_mask_rows(float * dst, int n) {
++    const int i = blockIdx.x * blockDim.x + threadIdx.x;
++    if (i < n) dst[i] = -INFINITY;
+ }
+ 
+ template<int C, bool TILED>
+@@ -627,6 +632,30 @@
+     const int K = (int) w->ne[0], N = (int) w->ne[1];
+     const auto * residual = bias ? (const float *) bias->data : nullptr;
+     auto * out = (float *) dst->data;
++    static const int draft_prefix = [] {
++        const char * value = getenv("BONSAI_DRAFT_ROWS"); return value ? atoi(value) : 0;
++    }();
++    static const int draft_tail = [] {
++        const char * value = getenv("BONSAI_DRAFT_TAIL"); return value ? atoi(value) : 0;
++    }();
++    if (tiled && !fusion && dst->ne[1] == 1 && K == 5120 && N == 248320 &&
++            draft_prefix >= 128 && draft_tail >= 0 && draft_prefix + draft_tail < N &&
++            draft_prefix % 4 == 0 && draft_tail % 4 == 0 && strcmp(dst->name, "bonsai_probe_mtp_head") == 0) {
++        const auto * codes = static_cast<const uint2 *>(packed);
++        const int chunks = K / QK8_1;
++        const auto * scales = reinterpret_cast<const half *>(codes + int64_t(N)*chunks);
++        const int end = N - draft_tail;
++        q2_0_mask_rows<<<(end-draft_prefix + 255)/256,256,0,ctx.stream()>>>(out + draft_prefix, end-draft_prefix);
++        q2_0_gemv_dispatch<true,false,false>(codes,scales,nullptr,nullptr,x,out,nullptr,K,draft_prefix,ctx.stream());
++        if (draft_tail) {
++            q2_0_gemv_dispatch<true,false,false>(codes+int64_t(end)*chunks,scales+int64_t(end)*(chunks/2),
++                nullptr,nullptr,x,out+end,nullptr,K,draft_tail,ctx.stream());
++        }
++        static const bool logged = (fprintf(stderr, "Bonsai experiment: packed draft head rows %d+%d of %d\n", draft_prefix,draft_tail,N),true);
++        (void) logged;
++        CUDA_CHECK(cudaGetLastError());
++        return true;
++    }
+     if (tiled) {
+         q2_0_dispatch<true>(dst->ne[1], packed, packed_gate, x, out, residual, K, N, ctx.stream());
+     } else {
+--- a/src/models/qwen35.cpp
++++ b/src/models/qwen35.cpp
+@@ -976,6 +976,10 @@
+         cur = build_lora_mm(head_w, cur, head_s);
+     }
+     cb(cur, "result_output", -1);
++    if (head_w->type == GGML_TYPE_Q2_0 && cur->op == GGML_OP_MUL_MAT && cur->src[0] == head_w) {
++        ggml_set_name(cur, "bonsai_probe_mtp_head");
++    }
++
+ 
+     res->t_logits = cur;
+ }

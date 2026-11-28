@@ -1,0 +1,494 @@
+[
+  [
+    {
+      "id": "b0-00",
+      "prompt": "Explain why bread becomes stale and how storage changes its texture.",
+      "n": 144
+    },
+    {
+      "id": "b0-01",
+      "prompt": "Write a polite note asking a neighbor to return a borrowed stepladder.",
+      "n": 144
+    },
+    {
+      "id": "b0-02",
+      "prompt": "用通俗语言解释影子为何会随一天中的时间改变方向。",
+      "n": 144
+    },
+    {
+      "id": "b0-03",
+      "prompt": "给社区跑步小组写一段雨天改期通知，包括集合方式。",
+      "n": 144
+    },
+    {
+      "id": "b0-04",
+      "prompt": "Write a Python function that groups anagrams and describe its time complexity.",
+      "n": 144
+    },
+    {
+      "id": "b0-05",
+      "prompt": "Implement a Go function that reverses a UTF-8 string by rune.",
+      "n": 144
+    },
+    {
+      "id": "b0-06",
+      "prompt": "A bicycle shop rents 14 bikes for 3 hours at 6 dollars per bike per hour. Apply a 15 percent discount and show the bill.",
+      "n": 144
+    },
+    {
+      "id": "b0-07",
+      "prompt": "以 JSON 对象列出四种常见云的外观和可能的天气。",
+      "n": 144
+    },
+    {
+      "id": "b0-08",
+      "prompt": "Continue this scene. A delivery driver found a paper crown on a park bench at dawn.",
+      "n": 144
+    },
+    {
+      "id": "b0-09",
+      "prompt": "Design a SQL query that returns the most recent invoice for each customer.",
+      "n": 144
+    },
+    {
+      "id": "b0-10",
+      "prompt": "用三点说明冰箱后面为什么要留出空间。",
+      "n": 144
+    },
+    {
+      "id": "b0-11",
+      "prompt": "Give a concise procedure for shelving donated board games in a youth center.",
+      "n": 144
+    },
+    {
+      "id": "b0-12",
+      "prompt": "A recipe uses 375 grams of flour for 15 cookies. Calculate the flour needed for 42.",
+      "n": 144
+    },
+    {
+      "id": "b0-13",
+      "prompt": "用 Python 实现一个循环队列，解释队满和队空的判断。",
+      "n": 144
+    },
+    {
+      "id": "b0-14",
+      "prompt": "Return a YAML inventory of four camping utensils, with material, weight_g, and purpose.",
+      "n": 144
+    },
+    {
+      "id": "b0-15",
+      "prompt": "Tell a short story in which a tailor repairs a kite instead of a coat.",
+      "n": 144
+    }
+  ],
+  [
+    {
+      "id": "b1-00",
+      "prompt": "What makes a piano note sound different from the same note on a flute?",
+      "n": 144
+    },
+    {
+      "id": "b1-01",
+      "prompt": "Rewrite this for a building notice. The rooftop garden will close Friday while the railing is repainted.",
+      "n": 144
+    },
+    {
+      "id": "b1-02",
+      "prompt": "请解释轮船靠岸时为什么要提前减速。",
+      "n": 144
+    },
+    {
+      "id": "b1-03",
+      "prompt": "给小学科学角写一则介绍，讲解怎么观察豆芽的生长。",
+      "n": 144
+    },
+    {
+      "id": "b1-04",
+      "prompt": "Write a Python generator that yields the lines of a file in groups of three.",
+      "n": 144
+    },
+    {
+      "id": "b1-05",
+      "prompt": "Write a Rust function to count distinct adjacent pairs in a slice of integers.",
+      "n": 144
+    },
+    {
+      "id": "b1-06",
+      "prompt": "There are 540 seats in a hall. Adults fill two thirds of them and children fill one fifth of the rest. How many seats are empty?",
+      "n": 144
+    },
+    {
+      "id": "b1-07",
+      "prompt": "输出一个 JSON 数组，描述三种面料的洗涤方式和温度。",
+      "n": 144
+    },
+    {
+      "id": "b1-08",
+      "prompt": "Continue a quiet mystery about a violin case that arrives at the wrong address.",
+      "n": 144
+    },
+    {
+      "id": "b1-09",
+      "prompt": "Write SQL to count daily active customers from a purchases table, including dates with no sales.",
+      "n": 144
+    },
+    {
+      "id": "b1-10",
+      "prompt": "说明茶壶盖上小孔的作用，并设计一个课堂演示。",
+      "n": 144
+    },
+    {
+      "id": "b1-11",
+      "prompt": "Draft three clear instructions for returning shared paintbrushes after an art class.",
+      "n": 144
+    },
+    {
+      "id": "b1-12",
+      "prompt": "A runner covers 4.8 km in 28 minutes, rests for 3 minutes, then covers 2.2 km in 14 minutes. Find the average speed.",
+      "n": 144
+    },
+    {
+      "id": "b1-13",
+      "prompt": "用 JavaScript 编写一个按首次出现顺序去重的函数，附两个例子。",
+      "n": 144
+    },
+    {
+      "id": "b1-14",
+      "prompt": "Return a CSV table with six imaginary train departures, platforms and destinations.",
+      "n": 144
+    },
+    {
+      "id": "b1-15",
+      "prompt": "描写一位灯塔看守人收到旧同学来信的那个夜晚。",
+      "n": 144
+    }
+  ],
+  [
+    {
+      "id": "b2-00",
+      "prompt": "How does the thickness of a guitar string affect its pitch?",
+      "n": 144
+    },
+    {
+      "id": "b2-01",
+      "prompt": "Write a friendly email reminding volunteers that the food collection point has moved.",
+      "n": 144
+    },
+    {
+      "id": "b2-02",
+      "prompt": "解释风筝为什么能飞起来，并说明放线太快会怎样。",
+      "n": 144
+    },
+    {
+      "id": "b2-03",
+      "prompt": "为社区夜读活动写一段邀请，告诉大家如何参加。",
+      "n": 144
+    },
+    {
+      "id": "b2-04",
+      "prompt": "Implement a Python parser for a string containing comma-separated integers and ranges such as 2-5.",
+      "n": 144
+    },
+    {
+      "id": "b2-05",
+      "prompt": "In C++, write binary search to find the first value strictly greater than x in a sorted array.",
+      "n": 144
+    },
+    {
+      "id": "b2-06",
+      "prompt": "A fruit seller mixes 8 kg of apples at 3 dollars per kg with 12 kg at 4 dollars. Find the average cost per kg.",
+      "n": 144
+    },
+    {
+      "id": "b2-07",
+      "prompt": "列出五项厨房清洁任务，按区域、工具和频率组成 JSON。",
+      "n": 144
+    },
+    {
+      "id": "b2-08",
+      "prompt": "Start a story about an apprentice who misreads an ancient weather chart.",
+      "n": 144
+    },
+    {
+      "id": "b2-09",
+      "prompt": "Write a Postgres query to identify overlapping reservations for the same studio.",
+      "n": 144
+    },
+    {
+      "id": "b2-10",
+      "prompt": "用简单的比喻解释钟摆的周期与摆长的关系。",
+      "n": 144
+    },
+    {
+      "id": "b2-11",
+      "prompt": "Explain how to organize a set of unlabelled audio recordings for a small oral history archive.",
+      "n": 144
+    },
+    {
+      "id": "b2-12",
+      "prompt": "A tank holds 85 liters and leaks 0.4 liters per minute while receiving 1.1 liters per minute. How long to add 28 liters net?",
+      "n": 144
+    },
+    {
+      "id": "b2-13",
+      "prompt": "用 Python 写一个括号匹配函数，支持三类括号并处理空输入。",
+      "n": 144
+    },
+    {
+      "id": "b2-14",
+      "prompt": "Make a Markdown table comparing four imaginary garden tools by reach, material, and storage space.",
+      "n": 144
+    },
+    {
+      "id": "b2-15",
+      "prompt": "写一段关于闹钟打断一场奇妙梦境的短篇开头。",
+      "n": 144
+    }
+  ],
+  [
+    {
+      "id": "b3-00",
+      "prompt": "Explain why water beads on waxed paper and spreads across a cotton towel.",
+      "n": 144
+    },
+    {
+      "id": "b3-01",
+      "prompt": "Draft an instruction card explaining how visitors can request a locker key at a climbing gym.",
+      "n": 144
+    },
+    {
+      "id": "b3-02",
+      "prompt": "用几句话说明为什么山上的水常常比平地更早沸腾。",
+      "n": 144
+    },
+    {
+      "id": "b3-03",
+      "prompt": "帮我写一封邀请新同事参加周末陶艺课的邮件。",
+      "n": 144
+    },
+    {
+      "id": "b3-04",
+      "prompt": "Write a Python function that checks whether two strings are rotations of each other.",
+      "n": 144
+    },
+    {
+      "id": "b3-05",
+      "prompt": "Show a TypeScript type and a function for updating a todo list item immutably.",
+      "n": 144
+    },
+    {
+      "id": "b3-06",
+      "prompt": "A group buys 7 museum tickets at 18 dollars each and 4 guidebooks at 9 dollars each. Split the total evenly among six people.",
+      "n": 144
+    },
+    {
+      "id": "b3-07",
+      "prompt": "用 JSON 描述三套摄影器材的镜头焦距、用途和重量。",
+      "n": 144
+    },
+    {
+      "id": "b3-08",
+      "prompt": "Continue a story in which a postcard carries a date that has not yet happened.",
+      "n": 144
+    },
+    {
+      "id": "b3-09",
+      "prompt": "Write a SQL query to show products selling above their category average.",
+      "n": 144
+    },
+    {
+      "id": "b3-10",
+      "prompt": "给孩子说明雪地上的脚印为何有时过一会儿更硬。",
+      "n": 144
+    },
+    {
+      "id": "b3-11",
+      "prompt": "Give step-by-step instructions for packing fragile ceramic bowls into a moving box.",
+      "n": 144
+    },
+    {
+      "id": "b3-12",
+      "prompt": "A rectangular yard is 18 by 11 meters with a one-meter path inside the border. Find the planted area.",
+      "n": 144
+    },
+    {
+      "id": "b3-13",
+      "prompt": "写一个检查 IPv4 字面地址格式的 Python 函数并列出合法与非法示例。",
+      "n": 144
+    },
+    {
+      "id": "b3-14",
+      "prompt": "Give a JSON object with six aquarium fish and fields for habitat and preferred temperature.",
+      "n": 144
+    },
+    {
+      "id": "b3-15",
+      "prompt": "写一段早餐店老板与第一次送牛奶的学生的对话。",
+      "n": 144
+    }
+  ],
+  [
+    {
+      "id": "b4-00",
+      "prompt": "Describe how a prism separates sunlight into colors using an everyday analogy.",
+      "n": 144
+    },
+    {
+      "id": "b4-01",
+      "prompt": "Edit this volunteer bulletin for clarity. The costume room opens late Tuesday because shelves are being numbered.",
+      "n": 144
+    },
+    {
+      "id": "b4-02",
+      "prompt": "解释冬天玻璃窗上水汽凝结的过程。",
+      "n": 144
+    },
+    {
+      "id": "b4-03",
+      "prompt": "写一张给邻居的便条，请他们暂时照顾阳台上的薄荷。",
+      "n": 144
+    },
+    {
+      "id": "b4-04",
+      "prompt": "In Python, implement breadth-first traversal of a tree and show the visitation order.",
+      "n": 144
+    },
+    {
+      "id": "b4-05",
+      "prompt": "Create a Swift function to validate a six-digit postal code string.",
+      "n": 144
+    },
+    {
+      "id": "b4-06",
+      "prompt": "A pottery class has a fixed fee of 65 dollars and charges 7 dollars per bowl. Find the maximum number of bowls for a budget of 190.",
+      "n": 144
+    },
+    {
+      "id": "b4-07",
+      "prompt": "用 JSON 列出四项雨水收集装置部件及其作用。",
+      "n": 144
+    },
+    {
+      "id": "b4-08",
+      "prompt": "Continue a dialogue between two bakers who discover that their recipes have been swapped.",
+      "n": 144
+    },
+    {
+      "id": "b4-09",
+      "prompt": "Write a SQL query to compute weekly bike hires using a date column.",
+      "n": 144
+    },
+    {
+      "id": "b4-10",
+      "prompt": "解释为什么弹簧压缩后能把小车推出去。",
+      "n": 144
+    },
+    {
+      "id": "b4-11",
+      "prompt": "Write a plain-language guide to labeling seed packets before storing them for winter.",
+      "n": 144
+    },
+    {
+      "id": "b4-12",
+      "prompt": "Two buses leave every 18 and 24 minutes. They leave together at 8 am. When do they next coincide?",
+      "n": 144
+    },
+    {
+      "id": "b4-13",
+      "prompt": "用 Python 写一个生成矩阵主对角线和副对角线元素的函数。",
+      "n": 144
+    },
+    {
+      "id": "b4-14",
+      "prompt": "Output a TSV of five imaginary conference talks, durations, rooms, and start times.",
+      "n": 144
+    },
+    {
+      "id": "b4-15",
+      "prompt": "写一篇短文，描述第一次听到山谷回声时的反应。",
+      "n": 144
+    }
+  ],
+  [
+    {
+      "id": "b5-00",
+      "prompt": "Explain how a thermostat keeps a room near a chosen temperature.",
+      "n": 144
+    },
+    {
+      "id": "b5-01",
+      "prompt": "Draft an announcement about a delayed outdoor choir rehearsal and the new meeting point.",
+      "n": 144
+    },
+    {
+      "id": "b5-02",
+      "prompt": "用日常例子解释为什么筷子插在水里看上去弯了。",
+      "n": 144
+    },
+    {
+      "id": "b5-03",
+      "prompt": "写一段手工皂包装说明，交代保存方式与香味。",
+      "n": 144
+    },
+    {
+      "id": "b5-04",
+      "prompt": "Write a Python function that converts a list of intervals into nonoverlapping intervals.",
+      "n": 144
+    },
+    {
+      "id": "b5-05",
+      "prompt": "Write Java code that counts letters in a string while ignoring case and punctuation.",
+      "n": 144
+    },
+    {
+      "id": "b5-06",
+      "prompt": "A greenhouse produces 320 seedlings. Twelve percent fail, then 15 extra seedlings are donated. Estimate the final number and explain rounding.",
+      "n": 144
+    },
+    {
+      "id": "b5-07",
+      "prompt": "用 JSON 列出三个戏剧道具的尺寸、材料和舞台用途。",
+      "n": 144
+    },
+    {
+      "id": "b5-08",
+      "prompt": "Continue a story about a night janitor who finds a cabinet full of unplayed cassettes.",
+      "n": 144
+    },
+    {
+      "id": "b5-09",
+      "prompt": "Write an SQL query that counts pairs of items purchased in the same order.",
+      "n": 144
+    },
+    {
+      "id": "b5-10",
+      "prompt": "用简明的语言解释泡沫为什么能帮助隔热。",
+      "n": 144
+    },
+    {
+      "id": "b5-11",
+      "prompt": "Give a clear plan for organizing donated photographs before a neighborhood exhibition.",
+      "n": 144
+    },
+    {
+      "id": "b5-12",
+      "prompt": "A ferry travels 48 km downstream in 2 hours and returns upstream in 3 hours. Find the current speed.",
+      "n": 144
+    },
+    {
+      "id": "b5-13",
+      "prompt": "用 Python 编写检查字符串是否可通过一次删除变成回文的函数。",
+      "n": 144
+    },
+    {
+      "id": "b5-14",
+      "prompt": "Produce YAML for a fictional tea tasting with five teas, steeping times, and aroma notes.",
+      "n": 144
+    },
+    {
+      "id": "b5-15",
+      "prompt": "描写从河岸旧仓库传来的手风琴声，用一个细节结束。",
+      "n": 144
+    }
+  ]
+]

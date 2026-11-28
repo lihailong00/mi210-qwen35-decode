@@ -1,0 +1,64 @@
+--- a/ggml/src/ggml-cuda/mmvq-q2-0.cu
++++ b/ggml/src/ggml-cuda/mmvq-q2-0.cu
+@@ -433,6 +433,17 @@
+         }
+     }
+     q2_0_verify_rows<C, true>(proj.codes, proj.scales, activations, activation_scales, proj.dst, chunks, proj.rows, row);
++}
++
++__launch_bounds__(128)
++static __global__ void q2_0_verify_gate_up(q2_0_projection first, q2_0_projection second,
++        const q2_0_words * activations, const float4 * activation_scales) {
++    constexpr int rows = 17408;
++    const int row = blockIdx.x * 8;
++    const bool upper = row >= rows;
++    const auto proj = upper ? second : first;
++    q2_0_verify_rows<4, true>(proj.codes, proj.scales, activations, activation_scales,
++            proj.dst, 5120 / 32, rows, upper ? row - rows : row);
+ }
+ 
+ #endif
+@@ -543,7 +554,13 @@
+                    static_cast<float *>(outputs[i]->data), rows};
+         total_rows += rows;
+     }
+-    if (count == 1) {
++    static const bool gate_up_enabled = [] {
++        const char * value = getenv("GGML_MMVQ_Q2_0_FFN_GATE_UP");
++        return !value || value[0] != '0';
++    }();
++    if (gate_up_enabled && C == 4 && width == 5120 && count == 2 && proj[0].rows == 17408 && proj[1].rows == 17408) {
++        q2_0_verify_gate_up<<<total_rows / 8, 128, 0, ctx.stream()>>>(proj[0], proj[1], words, dy);
++    } else if (count == 1) {
+         q2_0_verify_mfma<C, true><<<total_rows / 8, 128, 0, ctx.stream()>>>(
+                 proj[0].codes, proj[0].scales, words, dy, proj[0].dst, chunks, total_rows);
+     } else {
+--- a/mi210-tools/eval/bonsai/fwht-group-check.cpp
++++ b/mi210-tools/eval/bonsai/fwht-group-check.cpp
+@@ -13,7 +13,7 @@
+ // Run twice in separate processes with GGML_MMVQ_Q2_0_FUSED_INPUT=0 and =1,
+ // then compare the two binary output files.
+ static void run_case(ggml_backend_t backend, int width, int columns, int count, int escape,
+-                     bool strided, std::ofstream & dump) {
++                     bool strided, std::ofstream & dump, bool gate_up = false) {
+     constexpr int block = 1024;
+     const ggml_init_params params = {2u << 20, nullptr, true};
+     ggml_context * weights = ggml_init(params);
+@@ -31,7 +31,8 @@
+     auto * graph = ggml_new_graph_custom(ctx, 64, false);
+     std::vector<ggml_tensor *> matrices, outputs;
+     for (int i = 0; i < count; ++i) {
+-        auto * w = ggml_new_tensor_2d(weights, GGML_TYPE_Q2_0, width, 128 + i * 72);
++        const int rows = gate_up ? 17408 : 128 + i * 72;
++        auto * w = ggml_new_tensor_2d(weights, GGML_TYPE_Q2_0, width, rows);
+         matrices.push_back(w);
+         outputs.push_back(ggml_mul_mat(ctx, w, act));
+         ggml_set_output(outputs.back());
+@@ -104,6 +105,7 @@
+     run_case(backend, 5120, 4, 3, 0, true, dump);
+     run_case(backend, 5120, 5, 2, 0, false, dump);
+     run_case(backend, 5120, 4, 4, 0, false, dump);
++    run_case(backend, 5120, 4, 2, 0, false, dump, true);
+     ggml_backend_free(backend);
+     dump.close();
+     return dump.good() ? 0 : 1;

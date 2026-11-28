@@ -1,0 +1,134 @@
+--- a/ggml/src/ggml-cuda/mmvq-q2-0.cu
++++ b/ggml/src/ggml-cuda/mmvq-q2-0.cu
+@@ -433,6 +433,87 @@
+         }
+     }
+     q2_0_verify_rows<C, true>(proj.codes, proj.scales, activations, activation_scales, proj.dst, chunks, proj.rows, row);
++}
++
++// Two tiled FFN projections share a four-column Q8 input. A single wave owns
++// eight rows. Each quad processes one of 16 K chunks for four adjacent rows.
++__launch_bounds__(64)
++static __global__ void q2_0_verify_gate_up(q2_0_projection gate, q2_0_projection up,
++        const q2_0_words * activations, const float4 * activation_scales) {
++    constexpr int rows = 17408;
++    constexpr int chunks = 5120 / QK8_1;
++    constexpr int slots = 16;
++    constexpr int parts = 128 / slots;
++    using int4_acc = int __attribute__((ext_vector_type(4)));
++    const int global_row = blockIdx.x * 8;
++    const bool use_up = global_row >= rows;
++    const auto proj = use_up ? up : gate;
++    const int row0 = use_up ? global_row - rows : global_row;
++    const int lane = threadIdx.x % 4;
++    const int slot = threadIdx.x / 4;
++    float sums[parts][2][4] = {};
++
++#pragma unroll
++    for (int slice = 0; slice < chunks / slots; ++slice) {
++        const int k = slice * slots + slot;
++        const q2_0_words x = activations[4 * k + lane];
++        const float4 dy = activation_scales[k];
++        uint2 codes[2];
++        float scales[2];
++#pragma unroll
++        for (int g = 0; g < 2; ++g) {
++            const int row = row0 + 4 * g + lane;
++            codes[g] = proj.codes[q2_0_offset<true>(row, k, chunks)];
++            scales[g] = __half2float(proj.scales[q2_0_offset<true>(row, k / 2, chunks / 2)]);
++        }
++        // Issue both rows' loads before starting their independent dot products.
++        asm volatile("" ::: "memory");
++        int4_acc dots[2] = {};
++#pragma unroll
++        for (int j = 0; j < 8; ++j) {
++            const int a = q2_0_component(j < 4 ? x.lo : x.hi, j % 4);
++#pragma unroll
++            for (int g = 0; g < 2; ++g) {
++                const uint32_t word = j < 4 ? codes[g].x : codes[g].y;
++                const uint32_t sel = (word >> (2 * (j % 4))) & 0x03030303u;
++                const int wt = ggml_hip_perm(0x020100ff, 0x020100ff, sel);
++#if defined(__gfx90a__)
++                dots[g] = __builtin_amdgcn_mfma_i32_4x4x4i8(a, wt, dots[g], 0, 0, 0);
++#endif
++            }
++        }
++#pragma unroll
++        for (int g = 0; g < 2; ++g) {
++#pragma unroll
++            for (int c = 0; c < 4; ++c) {
++                sums[slice % parts][g][c] += scales[g] * q2_0_component(dy, c) * dots[g][c];
++            }
++        }
++    }
++
++    // Preserve the generic kernel's reduction tree. Slots 16 apart reside
++    // in registers, and the final 16 partial sums are all in the same wave.
++#pragma unroll
++    for (int g = 0; g < 2; ++g) {
++#pragma unroll
++        for (int c = 0; c < 4; ++c) {
++#pragma unroll
++            for (int span = parts / 2; span > 0; span /= 2) {
++#pragma unroll
++                for (int i = 0; i < span; ++i) {
++                    sums[i][g][c] += sums[i + span][g][c];
++                }
++            }
++            float v = sums[0][g][c];
++#pragma unroll
++            for (int span = slots / 2; span > 0; span /= 2) {
++                v += __shfl_xor(v, 4 * span, 64);
++            }
++            if (slot == 0) {
++                proj.dst[c * rows + row0 + 4 * g + lane] = v;
++            }
++        }
++    }
+ }
+ 
+ #endif
+@@ -543,7 +624,13 @@
+                    static_cast<float *>(outputs[i]->data), rows};
+         total_rows += rows;
+     }
+-    if (count == 1) {
++    static const bool gate_up_enabled = [] {
++        const char * value = getenv("GGML_MMVQ_Q2_0_FFN_GATE_UP");
++        return !value || value[0] != '0';
++    }();
++    if (gate_up_enabled && C == 4 && width == 5120 && count == 2 && proj[0].rows == 17408 && proj[1].rows == 17408) {
++        q2_0_verify_gate_up<<<total_rows / 8, 64, 0, ctx.stream()>>>(proj[0], proj[1], words, dy);
++    } else if (count == 1) {
+         q2_0_verify_mfma<C, true><<<total_rows / 8, 128, 0, ctx.stream()>>>(
+                 proj[0].codes, proj[0].scales, words, dy, proj[0].dst, chunks, total_rows);
+     } else {
+--- a/mi210-tools/eval/bonsai/fwht-group-check.cpp
++++ b/mi210-tools/eval/bonsai/fwht-group-check.cpp
+@@ -13,7 +13,7 @@
+ // Run twice in separate processes with GGML_MMVQ_Q2_0_FUSED_INPUT=0 and =1,
+ // then compare the two binary output files.
+ static void run_case(ggml_backend_t backend, int width, int columns, int count, int escape,
+-                     bool strided, std::ofstream & dump) {
++                     bool strided, std::ofstream & dump, bool gate_up = false) {
+     constexpr int block = 1024;
+     const ggml_init_params params = {2u << 20, nullptr, true};
+     ggml_context * weights = ggml_init(params);
+@@ -31,7 +31,8 @@
+     auto * graph = ggml_new_graph_custom(ctx, 64, false);
+     std::vector<ggml_tensor *> matrices, outputs;
+     for (int i = 0; i < count; ++i) {
+-        auto * w = ggml_new_tensor_2d(weights, GGML_TYPE_Q2_0, width, 128 + i * 72);
++        const int rows = gate_up ? 17408 : 128 + i * 72;
++        auto * w = ggml_new_tensor_2d(weights, GGML_TYPE_Q2_0, width, rows);
+         matrices.push_back(w);
+         outputs.push_back(ggml_mul_mat(ctx, w, act));
+         ggml_set_output(outputs.back());
+@@ -104,6 +105,7 @@
+     run_case(backend, 5120, 4, 3, 0, true, dump);
+     run_case(backend, 5120, 5, 2, 0, false, dump);
+     run_case(backend, 5120, 4, 4, 0, false, dump);
++    run_case(backend, 5120, 4, 2, 0, false, dump, true);
+     ggml_backend_free(backend);
+     dump.close();
+     return dump.good() ? 0 : 1;

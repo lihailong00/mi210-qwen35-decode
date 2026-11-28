@@ -1,0 +1,512 @@
+--- a/ggml/src/ggml-cuda/fwht.cu
++++ b/ggml/src/ggml-cuda/fwht.cu
+@@ -59,6 +59,57 @@
+ #pragma unroll
+     for (int i = 0; i < el_w; ++i) {
+         dst[i * warp_size + lane] = reg[i];
++    }
++}
++
++template<int N, int NT>
++static __device__ __forceinline__ void fwht_wide_transform(float (&reg)[N / NT], float * s) {
++    constexpr int warp_size = ggml_cuda_get_physical_warp_size();
++    constexpr int NE = N / NT;
++    const int tid = threadIdx.x;
++    const int lane = tid % warp_size;
++    // stages within a warp: partner differs in the lane bits
++#pragma unroll
++    for (int h = 1; h < warp_size; h *= 2) {
++#pragma unroll
++        for (int j = 0; j < NE; j++) {
++            const float val  = reg[j];
++            const float val2 = __shfl_xor_sync(0xFFFFFFFF, val, h, warp_size);
++            reg[j] = (lane & h) == 0 ? val + val2 : val2 - val;
++        }
++    }
++
++    // stages across warps: partner differs in the thread-index bits above the lane
++#pragma unroll
++    for (int h = warp_size; h < NT; h *= 2) {
++#pragma unroll
++        for (int j = 0; j < NE; j++) {
++            s[j * NT + tid] = reg[j];
++        }
++        __syncthreads();
++#pragma unroll
++        for (int j = 0; j < NE; j++) {
++            const float val  = reg[j];
++            const float val2 = s[j * NT + (tid ^ h)];
++            reg[j] = (tid & h) == 0 ? val + val2 : val2 - val;
++        }
++        __syncthreads();
++    }
++
++    // stages above the block width: partner is another register of the same thread
++#pragma unroll
++    for (int h = NT; h < N; h *= 2) {
++        const int step = h / NT;
++#pragma unroll
++        for (int j = 0; j < NE; j += 2 * step) {
++#pragma unroll
++            for (int k = 0; k < step; k++) {
++                const float x = reg[j + k];
++                const float y = reg[j + k + step];
++                reg[j + k]        = x + y;
++                reg[j + k + step] = x - y;
++            }
++        }
+     }
+ }
+ 
+@@ -83,7 +134,6 @@
+     dst += r * N;
+ 
+     const int tid  = threadIdx.x;
+-    const int lane = tid % warp_size;
+ 
+     ggml_cuda_pdl_sync();
+ 
+@@ -93,55 +143,51 @@
+         reg[i] = ggml_cuda_cast<float>(src[i * NT + tid]) * scale;
+     }
+ 
+-    // stages within a warp: partner differs in the lane bits
+-#pragma unroll
+-    for (int h = 1; h < warp_size; h *= 2) {
+-#pragma unroll
+-        for (int j = 0; j < NE; j++) {
+-            const float val  = reg[j];
+-            const float val2 = __shfl_xor_sync(0xFFFFFFFF, val, h, warp_size);
+-            reg[j] = (lane & h) == 0 ? val + val2 : val2 - val;
+-        }
+-    }
+-
+-    // stages across warps: partner differs in the thread-index bits above the lane
+-#pragma unroll
+-    for (int h = warp_size; h < NT; h *= 2) {
+-#pragma unroll
+-        for (int j = 0; j < NE; j++) {
+-            s[j * NT + tid] = reg[j];
+-        }
+-        __syncthreads();
+-#pragma unroll
+-        for (int j = 0; j < NE; j++) {
+-            const float val  = reg[j];
+-            const float val2 = s[j * NT + (tid ^ h)];
+-            reg[j] = (tid & h) == 0 ? val + val2 : val2 - val;
+-        }
+-        __syncthreads();
+-    }
+-
+-    // stages above the block width: partner is another register of the same thread
+-#pragma unroll
+-    for (int h = NT; h < N; h *= 2) {
+-        const int step = h / NT;
+-#pragma unroll
+-        for (int j = 0; j < NE; j += 2 * step) {
+-#pragma unroll
+-            for (int k = 0; k < step; k++) {
+-                const float x = reg[j + k];
+-                const float y = reg[j + k + step];
+-                reg[j + k]        = x + y;
+-                reg[j + k + step] = x - y;
+-            }
+-        }
+-    }
++    fwht_wide_transform<N, NT>(reg, s);
+ 
+ #pragma unroll
+     for (int i = 0; i < NE; ++i) {
+         dst[i * NT + tid] = reg[i];
+     }
+ }
++
++#if defined(GGML_USE_HIP)
++// One normalized 1024-point transform for a column. Its Q8 blocks are interleaved across four columns.
++__launch_bounds__(GGML_CUDA_FWHT_BLOCK_NT, 1)
++static __global__ void fwht_signed_q8_tile4(const float * src, const float * signs, int width, int cols,
++        int8_t * bytes, float * scales) {
++    constexpr int N = 1024;
++    constexpr int NT = GGML_CUDA_FWHT_BLOCK_NT;
++    const int col = blockIdx.x / (width / N);
++    const int pos = (blockIdx.x % (width / N)) * N + threadIdx.x;
++    __shared__ float s[N];
++    float reg[N / NT];
++#pragma unroll
++    for (int i = 0; i < N / NT; ++i) {
++        const int k = pos + i * NT;
++        reg[i] = col < cols ? (src[col * width + k] * signs[k]) * (1.0f / 32.0f) : 0.0f;
++    }
++    fwht_wide_transform<N, NT>(reg, s);
++#pragma unroll
++    for (int i = 0; i < N / NT; ++i) {
++        const int k = pos + i * NT;
++        const int group = 4 * (k / 32) + col;
++        const float amax = warp_reduce_max<32>(fabsf(reg[i]));
++        const float d = amax / 127.0f;
++        bytes[32 * group + k % 32] = amax == 0.0f ? 0 : roundf(reg[i] / d);
++        if (k % 32 == 0) {
++            scales[group] = __half2float(__float2half(d));
++        }
++    }
++}
++
++void ggml_cuda_fwht_q2_0_q8(ggml_backend_cuda_context & ctx, const float * src, const float * signs,
++        int width, int cols, int8_t * bytes, float * scales) {
++    fwht_signed_q8_tile4<<<4 * (width / 1024), GGML_CUDA_FWHT_BLOCK_NT, 0, ctx.stream()>>>(
++            src, signs, width, cols, bytes, scales);
++    CUDA_CHECK(cudaGetLastError());
++}
++#endif
+ 
+ template <typename T>
+ static bool ggml_cuda_op_fwht_impl(ggml_backend_cuda_context & ctx, const ggml_tensor * src, ggml_tensor * dst) {
+--- a/ggml/src/ggml-cuda/fwht.cuh
++++ b/ggml/src/ggml-cuda/fwht.cuh
+@@ -4,3 +4,8 @@
+ 
+ // Returns whether the Fast Walsh-Hadamard transform could be used.
+ bool ggml_cuda_op_fwht(ggml_backend_cuda_context & ctx, const ggml_tensor * src, ggml_tensor * dst);
++
++#if defined(GGML_USE_HIP)
++void ggml_cuda_fwht_q2_0_q8(ggml_backend_cuda_context & ctx, const float * src, const float * signs,
++        int width, int cols, int8_t * bytes, float * scales);
++#endif
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -6569,6 +6569,66 @@
+ }
+ #endif // defined(GGML_USE_HIP)
+ 
++#if defined(GGML_USE_HIP)
++// MUL by a per-feature vector -> reshape -> normalized FWHT1024 -> reshape -> 1..3 Q2_0 projections.
++// The packed activation lives only between the two launches of this fusion.
++static int ggml_cuda_try_q2_0_fwht_group(ggml_backend_cuda_context * ctx, ggml_cgraph * graph, int i) {
++    static const bool enabled = ggml_cuda_env_int("GGML_MMVQ_Q2_0_FUSED_INPUT", 1) != 0;
++    if (!enabled || i + 4 >= graph->n_nodes) {
++        return 0;
++    }
++    auto ** nodes = graph->nodes + i;
++    const ggml_tensor * mul = nodes[0];
++    const ggml_tensor * blocks = nodes[1];
++    const ggml_tensor * fwht = nodes[2];
++    const ggml_tensor * act = nodes[3];
++    const ggml_tensor * x = mul->src[0];
++    const ggml_tensor * signs = mul->src[1];
++    if (!ggml_is_matrix(mul) || mul->ne[1] < 2 || mul->ne[1] > 4 || mul->ne[0] % 1024 != 0 ||
++            blocks->op != GGML_OP_RESHAPE || blocks->src[0] != mul || blocks->ne[0] != 1024 ||
++            fwht->op != GGML_OP_MUL_MAT || fwht->src[1] != blocks || !ggml_cuda_op_mul_mat_use_fwht(fwht) ||
++            act->op != GGML_OP_RESHAPE || act->src[0] != fwht || !ggml_are_same_shape(act, mul) ||
++            x->type != GGML_TYPE_F32 || signs->type != GGML_TYPE_F32 || mul->type != GGML_TYPE_F32 ||
++            !ggml_are_same_shape(x, mul) || signs->ne[0] != x->ne[0] || !ggml_is_vector(signs) ||
++            !ggml_is_contiguous(x) || !ggml_is_contiguous(signs)) {
++        return 0;
++    }
++    const auto buft = ggml_backend_cuda_buffer_type(ctx->device);
++    if (!x->buffer || x->buffer->buft != buft || !signs->buffer || signs->buffer->buft != buft) {
++        return 0;
++    }
++    int indices[7] = {i, i + 1, i + 2, i + 3};
++    const ggml_op ops[] = {GGML_OP_MUL, GGML_OP_RESHAPE, GGML_OP_MUL_MAT, GGML_OP_RESHAPE,
++                           GGML_OP_MUL_MAT, GGML_OP_MUL_MAT, GGML_OP_MUL_MAT};
++    ggml_tensor * outputs[3] = {};
++    int count = 0;
++    for (int j = i + 4; j < graph->n_nodes && count < 3; ++j) {
++        ggml_tensor * t = graph->nodes[j];
++        if (ggml_cuda_is_view_or_noop(t)) {
++            continue;
++        }
++        if (t->op != GGML_OP_MUL_MAT || t->src[1] != act || t->src[0]->type != GGML_TYPE_Q2_0 ||
++                t->type != GGML_TYPE_F32 || !ggml_is_matrix(t) || t->ne[1] != x->ne[1] ||
++                !ggml_is_contiguous(t) || !t->buffer || t->buffer->buft != buft) {
++            break;
++        }
++        // Different thread blocks write these outputs concurrently.
++        for (int k = 0; k < count; ++k) {
++            const uintptr_t a = (uintptr_t) t->data, b = (uintptr_t) outputs[k]->data;
++            if (a < b + ggml_nbytes(outputs[k]) && b < a + ggml_nbytes(t)) {
++                return 0;
++            }
++        }
++        indices[4 + count] = j;
++        outputs[count++] = t;
++    }
++    if (!count || !ggml_can_fuse_subgraph_ext(graph, indices, 4 + count, ops, indices + 4, count)) {
++        return 0;
++    }
++    return ggml_cuda_mmvq_q2_0_fwht_group(*ctx, x, signs, outputs, count) ? indices[3 + count] - i : 0;
++}
++#endif
++
+ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
+ 
+     if (ggml_cuda_fusion_disabled()) {
+@@ -6578,6 +6638,12 @@
+     ggml_tensor * node = cgraph->nodes[i];
+ 
+ #if defined(GGML_USE_HIP)
++    if (node->op == GGML_OP_MUL && cuda_ctx->stream_context().concurrent_events.empty()) {
++        const int skip = ggml_cuda_try_q2_0_fwht_group(cuda_ctx, cgraph, i);
++        if (skip) {
++            return skip;
++        }
++    }
+     if (node->op == GGML_OP_CONCAT) {
+         ggml_cuda_plan_conv_fuse(cuda_ctx, cgraph, i);
+         return 0;
+--- a/ggml/src/ggml-cuda/mmvq-fused-host.cuh
++++ b/ggml/src/ggml-cuda/mmvq-fused-host.cuh
+@@ -149,6 +149,8 @@
+         ggml_tensor * dst, const ggml_cuda_mm_fusion_args_host * fusion);
+ 
+ #if defined(GGML_USE_HIP)
++bool ggml_cuda_mmvq_q2_0_fwht_group(ggml_backend_cuda_context & ctx, const ggml_tensor * input,
++        const ggml_tensor * signs, ggml_tensor * const * outputs, int count);
+ bool ggml_cuda_mmvq_q2_0_mfma(ggml_backend_cuda_context & ctx, const ggml_tensor * w,
+         const ggml_tensor * src, ggml_tensor * dst);
+ #endif
+--- a/ggml/src/ggml-cuda/mmvq-q2-0.cu
++++ b/ggml/src/ggml-cuda/mmvq-q2-0.cu
+@@ -1,6 +1,7 @@
+ #include "common.cuh"
+ #include "vecdotq.cuh"
+ #include "unary.cuh"
++#include "fwht.cuh"
+ #include "iq3-repack.cuh"
+ #include "mmvq-fused-host.cuh"
+ 
+@@ -329,10 +330,9 @@
+ }
+ 
+ template<int C, bool TILED>
+-__launch_bounds__(128)
+-static __global__ void q2_0_verify_mfma(const uint2 * codes, const half * scales,
++static __device__ __forceinline__ void q2_0_verify_rows(const uint2 * codes, const half * scales,
+         const q2_0_words * activations, const float4 * activation_scales,
+-        float * dst, int chunks, int rows) {
++        float * dst, int chunks, int rows, int row0) {
+     using int4_acc = int __attribute__((ext_vector_type(4)));
+     constexpr int row_groups = 2;
+     constexpr int rows_per_block = 4 * row_groups;
+@@ -341,7 +341,6 @@
+     const int tid = threadIdx.x;
+     const int quad_lane = tid % 4;
+     const int slot = tid / 4;
+-    const int row0 = blockIdx.x * rows_per_block;
+     float sums[parts][row_groups][C] = {};
+     for (int base = 0; base < chunks; base += 128) {
+ #pragma unroll
+@@ -405,6 +404,37 @@
+         }
+     }
+ }
++template<int C, bool TILED>
++__launch_bounds__(128)
++static __global__ void q2_0_verify_mfma(const uint2 * codes, const half * scales, const q2_0_words * activations,
++        const float4 * activation_scales, float * dst, int chunks, int rows) {
++    q2_0_verify_rows<C, TILED>(codes, scales, activations, activation_scales, dst, chunks, rows, blockIdx.x * 8);
++}
++
++struct q2_0_projection {
++    const uint2 * codes;
++    const half * scales;
++    float * dst;
++    int rows;
++};
++
++template<int C>
++__launch_bounds__(128)
++static __global__ void q2_0_verify_group(q2_0_projection first, q2_0_projection second, q2_0_projection third,
++        const q2_0_words * activations, const float4 * activation_scales, int chunks) {
++    int row = blockIdx.x * 8;
++    q2_0_projection proj = first;
++    if (row >= first.rows) {
++        row -= first.rows;
++        proj = second;
++        if (row >= second.rows) {
++            row -= second.rows;
++            proj = third;
++        }
++    }
++    q2_0_verify_rows<C, true>(proj.codes, proj.scales, activations, activation_scales, proj.dst, chunks, proj.rows, row);
++}
++
+ #endif
+ 
+ static bool q2_0_weight_ok(const ggml_tensor * w) {
+@@ -492,6 +522,62 @@
+     }
+     return true;
+ }
++
++template<int C>
++static void q2_0_fwht_project(ggml_backend_cuda_context & ctx, const ggml_tensor * input, const ggml_tensor * signs,
++        ggml_tensor * const * outputs, const void * const * packed, int count) {
++    const int width = input->ne[0];
++    const int chunks = width / QK8_1;
++    ggml_cuda_pool_alloc<char> scratch(ctx.pool());
++    auto * words = reinterpret_cast<q2_0_words *>(scratch.alloc(chunks * (4 * sizeof(q2_0_words) + sizeof(float4))));
++    auto * dy = reinterpret_cast<float4 *>(words + 4 * chunks);
++    ggml_cuda_fwht_q2_0_q8(ctx, static_cast<const float *>(input->data), static_cast<const float *>(signs->data),
++            width, C, reinterpret_cast<int8_t *>(words), reinterpret_cast<float *>(dy));
++#if defined(__gfx90a__) || !defined(__HIP_DEVICE_COMPILE__)
++    q2_0_projection proj[3] = {};
++    int total_rows = 0;
++    for (int i = 0; i < count; ++i) {
++        const auto * codes = static_cast<const uint2 *>(packed[i]);
++        const int rows = outputs[i]->ne[0];
++        proj[i] = {codes, reinterpret_cast<const half *>(codes + (int64_t) rows * chunks),
++                   static_cast<float *>(outputs[i]->data), rows};
++        total_rows += rows;
++    }
++    if (count == 1) {
++        q2_0_verify_mfma<C, true><<<total_rows / 8, 128, 0, ctx.stream()>>>(
++                proj[0].codes, proj[0].scales, words, dy, proj[0].dst, chunks, total_rows);
++    } else {
++        q2_0_verify_group<C><<<total_rows / 8, 128, 0, ctx.stream()>>>(proj[0], proj[1], proj[2], words, dy, chunks);
++    }
++    CUDA_CHECK(cudaGetLastError());
++#endif
++}
++
++bool ggml_cuda_mmvq_q2_0_fwht_group(ggml_backend_cuda_context & ctx, const ggml_tensor * input,
++        const ggml_tensor * signs, ggml_tensor * const * outputs, int count) {
++    GGML_ASSERT(count >= 1 && count <= 3);
++    if (!q2_0_use_tile4(ctx, outputs[0]->src[0]) || ggml_cuda_info().devices[ctx.device].warp_size != 64) {
++        return false;
++    }
++    const void * packed[3] = {};
++    for (int i = 0; i < count; ++i) {
++        const ggml_tensor * w = outputs[i]->src[0];
++        if (!q2_0_weight_ok(w) || w->ne[0] != input->ne[0] || w->ne[1] != outputs[i]->ne[0]) {
++            return false;
++        }
++        packed[i] = q2_0_packed(ctx, w, true);
++        if (!packed[i]) {
++            return false;
++        }
++    }
++    switch (input->ne[1]) {
++        case 2: q2_0_fwht_project<2>(ctx, input, signs, outputs, packed, count); break;
++        case 3: q2_0_fwht_project<3>(ctx, input, signs, outputs, packed, count); break;
++        case 4: q2_0_fwht_project<4>(ctx, input, signs, outputs, packed, count); break;
++        default: return false;
++    }
++    return true;
++}
+ #endif
+ 
+ bool ggml_cuda_mmvq_q2_0(
+--- /dev/null
++++ b/mi210-tools/eval/bonsai/fwht-group-check.cpp
+@@ -0,0 +1,110 @@
++#include "ggml.h"
++#include "ggml-alloc.h"
++#include "ggml-backend.h"
++
++#include <algorithm>
++#include <array>
++#include <cstdint>
++#include <cstdio>
++#include <fstream>
++#include <random>
++#include <vector>
++
++// Run twice in separate processes with GGML_MMVQ_Q2_0_FUSED_INPUT=0 and =1,
++// then compare the two binary output files.
++static void run_case(ggml_backend_t backend, int width, int columns, int count, int escape,
++                     bool strided, std::ofstream & dump) {
++    constexpr int block = 1024;
++    const ggml_init_params params = {2u << 20, nullptr, true};
++    ggml_context * weights = ggml_init(params);
++    ggml_context * ctx = ggml_init(params);
++    auto * rotation = ggml_new_tensor_2d(weights, GGML_TYPE_F32, block, block);
++    auto * signs = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, width);
++    const int stride = width + (strided ? 32 : 0);
++    auto * storage = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, stride, columns);
++    auto * x = strided ? ggml_view_2d(ctx, storage, width, columns, stride * sizeof(float), 0) : storage;
++    auto * mul = ggml_mul(ctx, x, signs);
++    auto * blocks = ggml_reshape_2d(ctx, mul, block, width / block * columns);
++    auto * transform = ggml_mul_mat(ctx, rotation, blocks);
++    ggml_mul_mat_set_hint(transform, GGML_HINT_SRC0_IS_HADAMARD);
++    auto * act = ggml_reshape_2d(ctx, transform, width, columns);
++    auto * graph = ggml_new_graph_custom(ctx, 64, false);
++    std::vector<ggml_tensor *> matrices, outputs;
++    for (int i = 0; i < count; ++i) {
++        auto * w = ggml_new_tensor_2d(weights, GGML_TYPE_Q2_0, width, 128 + i * 72);
++        matrices.push_back(w);
++        outputs.push_back(ggml_mul_mat(ctx, w, act));
++        ggml_set_output(outputs.back());
++        ggml_build_forward_expand(graph, outputs.back());
++    }
++    if (escape) {
++        // An observable intermediate or an extra consumer must survive fusion.
++        const std::array<ggml_tensor *, 4> extra = {mul, blocks, transform, act};
++        auto * result = escape <= 4 ? extra[escape - 1] : ggml_sqr(ctx, act);
++        ggml_set_output(result);
++        ggml_build_forward_expand(graph, result);
++        outputs.push_back(result);
++    }
++    auto wb = ggml_backend_alloc_ctx_tensors(weights, backend);
++    auto ab = ggml_backend_alloc_ctx_tensors(ctx, backend);
++    GGML_ASSERT(wb && ab);
++    ggml_backend_buffer_set_usage(wb, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
++    ggml_backend_buffer_clear(ab, 0x55);
++    std::vector<float> h(block * block);
++    for (int i = 0; i < block; ++i) {
++        for (int j = 0; j < block; ++j) {
++            h[i * block + j] = __builtin_parity(unsigned(i & j)) ? -1.f / 32.f : 1.f / 32.f;
++        }
++    }
++    ggml_backend_tensor_set(rotation, h.data(), 0, ggml_nbytes(rotation));
++    std::mt19937 rng(width + count + columns);
++    std::uniform_real_distribution<float> dist(-2.f, 2.f);
++    for (auto * w : matrices) {
++        std::vector<float> f(ggml_nelements(w));
++        for (float & value : f) value = dist(rng);
++        std::vector<uint8_t> data(ggml_nbytes(w));
++        GGML_ASSERT(ggml_quantize_chunk(w->type, f.data(), data.data(), 0, w->ne[1], width, nullptr) == data.size());
++        ggml_backend_tensor_set(w, data.data(), 0, data.size());
++    }
++    for (int pass = 0; pass < 3; ++pass) {
++        std::vector<float> s(width), f(ggml_nelements(storage));
++        for (float & value : s) value = pass == 1 ? dist(rng) : (rng() & 1 ? -1.f : 1.f);
++        for (float & value : f) value = pass == 2 ? 0.f : dist(rng);
++        ggml_backend_tensor_set(signs, s.data(), 0, ggml_nbytes(signs));
++        ggml_backend_tensor_set(storage, f.data(), 0, ggml_nbytes(storage));
++        GGML_ASSERT(ggml_backend_graph_compute(backend, graph) == GGML_STATUS_SUCCESS);
++        for (auto * tensor : outputs) {
++            std::vector<float> values(ggml_nelements(tensor));
++            ggml_backend_tensor_get(tensor, values.data(), 0, ggml_nbytes(tensor));
++            dump.write(reinterpret_cast<const char *>(values.data()), ggml_nbytes(tensor));
++            GGML_ASSERT(dump.good());
++        }
++    }
++    ggml_backend_buffer_free(ab);
++    ggml_backend_buffer_free(wb);
++    ggml_free(ctx);
++    ggml_free(weights);
++}
++
++int main(int argc, char ** argv) {
++    if (argc != 3) {
++        std::fprintf(stderr, "usage: %s BACKEND_DIRECTORY OUTPUT.bin\n", argv[0]);
++        return 1;
++    }
++    ggml_backend_load_all_from_path(argv[1]);
++    auto backend = ggml_backend_init_by_name("ROCm0", nullptr);
++    std::ofstream dump(argv[2], std::ios::binary);
++    if (!backend || !dump) return 1;
++    for (int width : {5120, 6144, 17408}) {
++        for (int columns : {2, 3, 4}) {
++            for (int count : {1, 2, 3}) run_case(backend, width, columns, count, 0, false, dump);
++        }
++    }
++    for (int escape = 1; escape <= 5; ++escape) run_case(backend, 5120, 4, 2, escape, false, dump);
++    run_case(backend, 5120, 4, 3, 0, true, dump);
++    run_case(backend, 5120, 5, 2, 0, false, dump);
++    run_case(backend, 5120, 4, 4, 0, false, dump);
++    ggml_backend_free(backend);
++    dump.close();
++    return dump.good() ? 0 : 1;
++}

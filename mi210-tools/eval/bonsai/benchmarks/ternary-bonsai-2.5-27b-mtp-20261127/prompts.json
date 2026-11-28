@@ -1,0 +1,22 @@
+[
+  {
+    "id": "p1",
+    "prompt": "The history of the printing press shows how a single technical change can reshape an entire society. In this essay we examine"
+  },
+  {
+    "id": "p2",
+    "prompt": "def merge_sorted_lists(a, b):\n    \"\"\"Merge two sorted lists into one sorted list.\"\"\"\n"
+  },
+  {
+    "id": "p3",
+    "prompt": "请用三段话解释为什么在显存带宽受限的情况下，大语言模型的单流解码速度主要取决于每个token需要读取的权重字节数。"
+  },
+  {
+    "id": "math",
+    "prompt": "A shop has 17 boxes with 24 pencils each. It sells 135 pencils, then receives 8 boxes of 30 pencils. Explain the calculation step by step and give the final number of pencils."
+  },
+  {
+    "id": "json",
+    "prompt": "Write a JSON array containing the first 20 positive integers. Each object must have keys \"number\", \"square\", and \"is_even\". Output only JSON.\n["
+  }
+]

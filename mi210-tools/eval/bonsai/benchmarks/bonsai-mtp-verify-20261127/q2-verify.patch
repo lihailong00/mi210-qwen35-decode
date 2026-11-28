@@ -1,0 +1,126 @@
+--- a/ggml/src/ggml-cuda/mmvq.cu
++++ b/ggml/src/ggml-cuda/mmvq.cu
+@@ -2176,7 +2176,7 @@
+     }
+ 
+ #if defined(GGML_USE_HIP)
+-    if (!ids && ne11 == 1 && ne12 == 1 && ne13 == 1 &&
++    if (!ids && src0->type == GGML_TYPE_Q2_0 && ne11 >= 1 && ne11 <= 4 && ne12 == 1 && ne13 == 1 &&
+             ggml_cuda_mmvq_q2_0(ctx, src0, src1_q8_1_ptr, dst, fusion)) {
+         return;
+     }
+--- a/ggml/src/ggml-cuda/mmvq-q2-0.cu
++++ b/ggml/src/ggml-cuda/mmvq-q2-0.cu
+@@ -135,6 +135,65 @@
+     }
+ }
+ 
++// Verify multiple tokens with one weight load. Each column retains the
++// accumulation and wave reduction order of the single-token kernel.
++template<int C>
++__launch_bounds__(128)
++static __global__ void q2_0_verify_kernel(const uint2 * codes, const half * scales,
++        const block_q8_1 * x, float * dst, int chunks, int x_stride, int rows) {
++    constexpr int wave = ggml_cuda_get_physical_warp_size();
++    constexpr int R = 2;
++    const int tid = threadIdx.x;
++    const int row = blockIdx.x*R;
++    float sums[R][C] = {};
++    for (int k = tid; k < chunks; k += 128) {
++        block_q8_1 act[C];
++#pragma unroll
++        for (int c = 0; c < C; ++c) {
++            act[c] = x[c*x_stride + k];
++        }
++#pragma unroll
++        for (int r = 0; r < R; ++r) {
++            const int64_t offset = (int64_t) (row+r)*chunks + k;
++            const uint2 code = codes[offset];
++            const float scale = __half2float(scales[offset/2]);
++#pragma unroll
++            for (int c = 0; c < C; ++c) {
++                sums[r][c] += q2_0_dot(code, scale, act[c]);
++            }
++        }
++    }
++    __shared__ float partial[R][C][64];
++    if (tid >= 64) {
++#pragma unroll
++        for (int r = 0; r < R; ++r) {
++#pragma unroll
++            for (int c = 0; c < C; ++c) {
++                partial[r][c][tid-64] = sums[r][c];
++            }
++        }
++    }
++    __syncthreads();
++    if (tid >= 64) return;
++#pragma unroll
++    for (int r = 0; r < R; ++r) {
++#pragma unroll
++        for (int c = 0; c < C; ++c) {
++            const float result = warp_reduce_sum<wave>(sums[r][c] + partial[r][c][tid]);
++            if (tid == 0) dst[c*rows + row + r] = result;
++        }
++    }
++}
++
++template<int C>
++static void q2_0_verify(const void * packed, const block_q8_1 * x, float * dst,
++        int K, int N, cudaStream_t stream) {
++    const auto * codes = (const uint2 *) packed;
++    const auto * scales = (const half *) (codes + (int64_t) N*K/QK8_1);
++    q2_0_verify_kernel<C><<<N/2, 128, 0, stream>>>(
++        codes, scales, x, dst, K/QK8_1, GGML_PAD(K, MATRIX_ROW_PADDING)/QK8_1, N);
++}
++
+ static bool q2_0_weight_ok(const ggml_tensor * w) {
+     return w && w->type == GGML_TYPE_Q2_0 && ggml_is_matrix(w) && ggml_is_contiguous(w) &&
+         w->ne[0] >= 4096 && w->ne[0] <= 32768 && w->ne[0]%256 == 0 &&
+@@ -154,7 +213,14 @@
+     if (!enabled || !GGML_CUDA_CC_IS_CDNA2(ggml_cuda_info().devices[ctx.device].cc) ||
+             ggml_cuda_info().devices[ctx.device].warp_size != 64 || !q2_0_weight_ok(w) ||
+             dst->type != GGML_TYPE_F32 || !ggml_is_contiguous(dst) ||
+-            dst->ne[0] != w->ne[1] || ggml_nelements(dst) != dst->ne[0]) {
++            dst->ne[0] != w->ne[1] || !ggml_is_matrix(dst) || dst->ne[1] < 1 || dst->ne[1] > 4) {
++        return false;
++    }
++    static const bool verify_enabled = [] {
++        const char * e = getenv("GGML_MMVQ_Q2_0_VERIFY_BATCH");
++        return !e || e[0] != '0';
++    }();
++    if (dst->ne[1] > 1 && (!verify_enabled || fusion)) {
+         return false;
+     }
+     const ggml_tensor * gate = fusion ? fusion->gate : nullptr;
+@@ -183,7 +249,13 @@
+     }
+     const int K = (int) w->ne[0], N = (int) w->ne[1];
+     const auto * residual = bias ? (const float *) bias->data : nullptr;
+-    q2_0_launch<2>(packed, packed_gate, x, (float *) dst->data, residual, K, N, ctx.stream());
++    auto * out = (float *) dst->data;
++    switch (dst->ne[1]) {
++        case 2: q2_0_verify<2>(packed, x, out, K, N, ctx.stream()); break;
++        case 3: q2_0_verify<3>(packed, x, out, K, N, ctx.stream()); break;
++        case 4: q2_0_verify<4>(packed, x, out, K, N, ctx.stream()); break;
++        default: q2_0_launch<2>(packed, packed_gate, x, out, residual, K, N, ctx.stream()); break;
++    }
+     CUDA_CHECK(cudaGetLastError());
+     return true;
+ #else
+--- a/tests/test-backend-ops.cpp
++++ b/tests/test-backend-ops.cpp
+@@ -12713,6 +12713,13 @@
+         test_cases.emplace_back(new test_gemm_fusion(GGML_TYPE_Q2_0, 256, n, 5120, GEMM_FUSION_FFN_ADD, true));
+     }
+ 
++    // Include K=4352 to exercise the padded q8_1 column stride.
++    for (int64_t k : { 4352, 5120, 17408 }) {
++        for (int64_t n : { 2, 3, 4, 5 }) {
++            test_cases.emplace_back(new test_gemm_fusion(GGML_TYPE_Q2_0, 256, n, k, GEMM_FUSION_MM, true));
++        }
++    }
++
+     // Multi-column MMVQ coverage for the Q4_K weight-reuse path and a Q5_K control.
+     for (ggml_type type_a : { GGML_TYPE_Q4_K, GGML_TYPE_Q5_K }) {
+         for (int n = 1; n <= 8; ++n) {
