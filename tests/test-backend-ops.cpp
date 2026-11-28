@@ -12699,6 +12699,27 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_mul_mat(type_a,    GGML_TYPE_F32, 16,  8, 16*256, { 1,  1}, {1, 1}));
     }
 
+    // Q2_0 weight-cache GEMV: real Bonsai inner dimensions, fused epilogues,
+    // and fallback boundaries. Weight contexts exercise the repack cache lifetime.
+    for (int64_t k : { 4096, 5120, 6144, 17408 }) {
+        for (auto pattern : { GEMM_FUSION_MM, GEMM_FUSION_ADD, GEMM_FUSION_RES_INPLACE }) {
+            test_cases.emplace_back(new test_gemm_fusion(GGML_TYPE_Q2_0, 256, 1, k, pattern, true));
+        }
+        test_cases.emplace_back(new test_mix_pair(GGML_TYPE_Q2_0, GGML_TYPE_Q2_0, 256, 256, 1, k, true));
+    }
+    for (int64_t n : { 1, 2 }) {
+        test_cases.emplace_back(new test_gemm_fusion(GGML_TYPE_Q2_0, 129, n, 5120, GEMM_FUSION_MM, true));
+        test_cases.emplace_back(new test_gemm_fusion(GGML_TYPE_Q2_0, 256, n, 2048, GEMM_FUSION_MM, true));
+        test_cases.emplace_back(new test_gemm_fusion(GGML_TYPE_Q2_0, 256, n, 5120, GEMM_FUSION_FFN_ADD, true));
+    }
+
+    // Include K=4352 to exercise the padded q8_1 column stride.
+    for (int64_t k : { 4352, 5120, 17408 }) {
+        for (int64_t n : { 2, 3, 4, 5 }) {
+            test_cases.emplace_back(new test_gemm_fusion(GGML_TYPE_Q2_0, 256, n, k, GEMM_FUSION_MM, true));
+        }
+    }
+
     // Multi-column MMVQ coverage for the Q4_K weight-reuse path and a Q5_K control.
     for (ggml_type type_a : { GGML_TYPE_Q4_K, GGML_TYPE_Q5_K }) {
         for (int n = 1; n <= 8; ++n) {

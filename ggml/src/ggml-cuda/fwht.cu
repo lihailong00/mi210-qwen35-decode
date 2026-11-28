@@ -62,37 +62,12 @@ __global__ void fwht_cuda(const T * src, float * dst, const int64_t n_rows, cons
     }
 }
 
-// Wide blocks: one row per thread block instead of per warp, so each thread keeps N/NT
-// values rather than N/32. Stages below the warp width still shuffle, those up to the
-// block width go through shared memory, and the rest stay in registers.
-template <int N, int NT, typename T>
-__launch_bounds__(NT, 1)
-__global__ void fwht_cuda_block(const T * src, float * dst, const int64_t n_rows, const float scale) {
+template<int N, int NT>
+static __device__ __forceinline__ void fwht_wide_transform(float (&reg)[N / NT], float * s) {
     constexpr int warp_size = ggml_cuda_get_physical_warp_size();
-    constexpr int NE        = N / NT;
-    static_assert(NE >= 1 && N % NT == 0 && NT % warp_size == 0, "bad FWHT block shape");
-
-    __shared__ float s[N];
-
-    const int64_t r = blockIdx.x;
-    if (r >= n_rows) {
-        return;
-    }
-
-    src += r * N;
-    dst += r * N;
-
-    const int tid  = threadIdx.x;
+    constexpr int NE = N / NT;
+    const int tid = threadIdx.x;
     const int lane = tid % warp_size;
-
-    ggml_cuda_pdl_sync();
-
-    float reg[NE];
-#pragma unroll
-    for (int i = 0; i < NE; ++i) {
-        reg[i] = ggml_cuda_cast<float>(src[i * NT + tid]) * scale;
-    }
-
     // stages within a warp: partner differs in the lane bits
 #pragma unroll
     for (int h = 1; h < warp_size; h *= 2) {
@@ -136,12 +111,83 @@ __global__ void fwht_cuda_block(const T * src, float * dst, const int64_t n_rows
             }
         }
     }
+}
+
+// Wide blocks: one row per thread block instead of per warp, so each thread keeps N/NT
+// values rather than N/32. Stages below the warp width still shuffle, those up to the
+// block width go through shared memory, and the rest stay in registers.
+template <int N, int NT, typename T>
+__launch_bounds__(NT, 1)
+__global__ void fwht_cuda_block(const T * src, float * dst, const int64_t n_rows, const float scale) {
+    constexpr int warp_size = ggml_cuda_get_physical_warp_size();
+    constexpr int NE        = N / NT;
+    static_assert(NE >= 1 && N % NT == 0 && NT % warp_size == 0, "bad FWHT block shape");
+
+    __shared__ float s[N];
+
+    const int64_t r = blockIdx.x;
+    if (r >= n_rows) {
+        return;
+    }
+
+    src += r * N;
+    dst += r * N;
+
+    const int tid  = threadIdx.x;
+
+    ggml_cuda_pdl_sync();
+
+    float reg[NE];
+#pragma unroll
+    for (int i = 0; i < NE; ++i) {
+        reg[i] = ggml_cuda_cast<float>(src[i * NT + tid]) * scale;
+    }
+
+    fwht_wide_transform<N, NT>(reg, s);
 
 #pragma unroll
     for (int i = 0; i < NE; ++i) {
         dst[i * NT + tid] = reg[i];
     }
 }
+
+#if defined(GGML_USE_HIP)
+// One normalized 1024-point transform for a column. Its Q8 blocks are interleaved across four columns.
+__launch_bounds__(GGML_CUDA_FWHT_BLOCK_NT, 1)
+static __global__ void fwht_signed_q8_tile4(const float * src, const float * signs, int width, int cols,
+        int8_t * bytes, float * scales) {
+    constexpr int N = 1024;
+    constexpr int NT = GGML_CUDA_FWHT_BLOCK_NT;
+    const int col = blockIdx.x / (width / N);
+    const int pos = (blockIdx.x % (width / N)) * N + threadIdx.x;
+    __shared__ float s[N];
+    float reg[N / NT];
+#pragma unroll
+    for (int i = 0; i < N / NT; ++i) {
+        const int k = pos + i * NT;
+        reg[i] = col < cols ? (src[col * width + k] * signs[k]) * (1.0f / 32.0f) : 0.0f;
+    }
+    fwht_wide_transform<N, NT>(reg, s);
+#pragma unroll
+    for (int i = 0; i < N / NT; ++i) {
+        const int k = pos + i * NT;
+        const int group = 4 * (k / 32) + col;
+        const float amax = warp_reduce_max<32>(fabsf(reg[i]));
+        const float d = amax / 127.0f;
+        bytes[32 * group + k % 32] = amax == 0.0f ? 0 : roundf(reg[i] / d);
+        if (k % 32 == 0) {
+            scales[group] = __half2float(__float2half(d));
+        }
+    }
+}
+
+void ggml_cuda_fwht_q2_0_q8(ggml_backend_cuda_context & ctx, const float * src, const float * signs,
+        int width, int cols, int8_t * bytes, float * scales) {
+    fwht_signed_q8_tile4<<<4 * (width / 1024), GGML_CUDA_FWHT_BLOCK_NT, 0, ctx.stream()>>>(
+            src, signs, width, cols, bytes, scales);
+    CUDA_CHECK(cudaGetLastError());
+}
+#endif
 
 template <typename T>
 static bool ggml_cuda_op_fwht_impl(ggml_backend_cuda_context & ctx, const ggml_tensor * src, ggml_tensor * dst) {

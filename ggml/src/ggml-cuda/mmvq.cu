@@ -2152,6 +2152,12 @@ void ggml_cuda_mul_mat_vec_q(
         }
     }
 
+#if defined(GGML_USE_HIP)
+    if (!ids && !fusion && src0->type == GGML_TYPE_Q2_0 && (ne11 >= 2 && ne11 <= 4) &&
+            ggml_cuda_mmvq_q2_0_mfma(ctx, src0, src1, dst)) {
+        return;
+    }
+#endif
     const int64_t ne10_padded = GGML_PAD(ne10, MATRIX_ROW_PADDING);
     ggml_cuda_pool_alloc<char> src1_q8_1_alloc(ctx.pool());
     const block_q8_1 * src1_q8_1_ptr = nullptr;
@@ -2176,6 +2182,10 @@ void ggml_cuda_mul_mat_vec_q(
     }
 
 #if defined(GGML_USE_HIP)
+    if (!ids && src0->type == GGML_TYPE_Q2_0 && ne11 >= 1 && ne11 <= 4 && ne12 == 1 && ne13 == 1 &&
+            ggml_cuda_mmvq_q2_0(ctx, src0, src1_q8_1_ptr, dst, fusion)) {
+        return;
+    }
     // IQ3_S / IQ3_XXS on the iq3gemv SoA re-layout (no codex packed copies are created for tensors handled here)
     if (!ids && ne11 == 1 && ne12 == 1 && ne13 == 1 &&
             ggml_cuda_mmvq_iq3(ctx, src0, src1_q8_1_ptr, dst, fusion)) {

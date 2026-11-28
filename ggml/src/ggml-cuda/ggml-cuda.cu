@@ -6569,6 +6569,66 @@ static int ggml_cuda_try_fuse_gate_up(ggml_backend_cuda_context * cuda_ctx, ggml
 }
 #endif // defined(GGML_USE_HIP)
 
+#if defined(GGML_USE_HIP)
+// MUL by a per-feature vector -> reshape -> normalized FWHT1024 -> reshape -> 1..3 Q2_0 projections.
+// The packed activation lives only between the two launches of this fusion.
+static int ggml_cuda_try_q2_0_fwht_group(ggml_backend_cuda_context * ctx, ggml_cgraph * graph, int i) {
+    static const bool enabled = ggml_cuda_env_int("GGML_MMVQ_Q2_0_FUSED_INPUT", 1) != 0;
+    if (!enabled || i + 4 >= graph->n_nodes) {
+        return 0;
+    }
+    auto ** nodes = graph->nodes + i;
+    const ggml_tensor * mul = nodes[0];
+    const ggml_tensor * blocks = nodes[1];
+    const ggml_tensor * fwht = nodes[2];
+    const ggml_tensor * act = nodes[3];
+    const ggml_tensor * x = mul->src[0];
+    const ggml_tensor * signs = mul->src[1];
+    if (!ggml_is_matrix(mul) || mul->ne[1] < 2 || mul->ne[1] > 4 || mul->ne[0] % 1024 != 0 ||
+            blocks->op != GGML_OP_RESHAPE || blocks->src[0] != mul || blocks->ne[0] != 1024 ||
+            fwht->op != GGML_OP_MUL_MAT || fwht->src[1] != blocks || !ggml_cuda_op_mul_mat_use_fwht(fwht) ||
+            act->op != GGML_OP_RESHAPE || act->src[0] != fwht || !ggml_are_same_shape(act, mul) ||
+            x->type != GGML_TYPE_F32 || signs->type != GGML_TYPE_F32 || mul->type != GGML_TYPE_F32 ||
+            !ggml_are_same_shape(x, mul) || signs->ne[0] != x->ne[0] || !ggml_is_vector(signs) ||
+            !ggml_is_contiguous(x) || !ggml_is_contiguous(signs)) {
+        return 0;
+    }
+    const auto buft = ggml_backend_cuda_buffer_type(ctx->device);
+    if (!x->buffer || x->buffer->buft != buft || !signs->buffer || signs->buffer->buft != buft) {
+        return 0;
+    }
+    int indices[7] = {i, i + 1, i + 2, i + 3};
+    const ggml_op ops[] = {GGML_OP_MUL, GGML_OP_RESHAPE, GGML_OP_MUL_MAT, GGML_OP_RESHAPE,
+                           GGML_OP_MUL_MAT, GGML_OP_MUL_MAT, GGML_OP_MUL_MAT};
+    ggml_tensor * outputs[3] = {};
+    int count = 0;
+    for (int j = i + 4; j < graph->n_nodes && count < 3; ++j) {
+        ggml_tensor * t = graph->nodes[j];
+        if (ggml_cuda_is_view_or_noop(t)) {
+            continue;
+        }
+        if (t->op != GGML_OP_MUL_MAT || t->src[1] != act || t->src[0]->type != GGML_TYPE_Q2_0 ||
+                t->type != GGML_TYPE_F32 || !ggml_is_matrix(t) || t->ne[1] != x->ne[1] ||
+                !ggml_is_contiguous(t) || !t->buffer || t->buffer->buft != buft) {
+            break;
+        }
+        // Different thread blocks write these outputs concurrently.
+        for (int k = 0; k < count; ++k) {
+            const uintptr_t a = (uintptr_t) t->data, b = (uintptr_t) outputs[k]->data;
+            if (a < b + ggml_nbytes(outputs[k]) && b < a + ggml_nbytes(t)) {
+                return 0;
+            }
+        }
+        indices[4 + count] = j;
+        outputs[count++] = t;
+    }
+    if (!count || !ggml_can_fuse_subgraph_ext(graph, indices, 4 + count, ops, indices + 4, count)) {
+        return 0;
+    }
+    return ggml_cuda_mmvq_q2_0_fwht_group(*ctx, x, signs, outputs, count) ? indices[3 + count] - i : 0;
+}
+#endif
+
 static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
 
     if (ggml_cuda_fusion_disabled()) {
@@ -6578,6 +6638,12 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     ggml_tensor * node = cgraph->nodes[i];
 
 #if defined(GGML_USE_HIP)
+    if (node->op == GGML_OP_MUL && cuda_ctx->stream_context().concurrent_events.empty()) {
+        const int skip = ggml_cuda_try_q2_0_fwht_group(cuda_ctx, cgraph, i);
+        if (skip) {
+            return skip;
+        }
+    }
     if (node->op == GGML_OP_CONCAT) {
         ggml_cuda_plan_conv_fuse(cuda_ctx, cgraph, i);
         return 0;

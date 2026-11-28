@@ -144,3 +144,13 @@ bool ggml_cuda_mmvq_iq3_multi_nc(ggml_backend_cuda_context & ctx, const ggml_ten
 bool ggml_cuda_mmvq_mix_member(const ggml_tensor * mm);
 bool ggml_cuda_mmvq_mix(ggml_backend_cuda_context & ctx, ggml_tensor * const * mm, int n, ggml_tensor * glu = nullptr);
 const void * ggml_cuda_mmvq_iq4k_soa_il4(const ggml_tensor * w, int device, cudaStream_t stream);
+
+bool ggml_cuda_mmvq_q2_0(ggml_backend_cuda_context & ctx, const ggml_tensor * w, const block_q8_1 * x,
+        ggml_tensor * dst, const ggml_cuda_mm_fusion_args_host * fusion);
+
+#if defined(GGML_USE_HIP)
+bool ggml_cuda_mmvq_q2_0_fwht_group(ggml_backend_cuda_context & ctx, const ggml_tensor * input,
+        const ggml_tensor * signs, ggml_tensor * const * outputs, int count);
+bool ggml_cuda_mmvq_q2_0_mfma(ggml_backend_cuda_context & ctx, const ggml_tensor * w,
+        const ggml_tensor * src, ggml_tensor * dst);
+#endif
