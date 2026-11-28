@@ -1057,6 +1057,15 @@ llama_model_dflash::graph<false>::graph(const llama_model & model, const llm_gra
     }
 
     ggml_tensor * inpL = ggml_get_rows(ctx0, tok_embd, inp_tokens);
+    if (model.tok_embd == nullptr) {
+        const auto & owner = *llama_get_model(cparams.ctx_other);
+        const auto it = owner.hdmd.inv.find(tok_embd);
+        if (it != owner.hdmd.inv.end()) {
+            inpL = llama_mul_mat_hadamard(ctx0, inpL, it->second.rot);
+            if (it->second.signs) inpL = ggml_mul(ctx0, inpL, it->second.signs);
+        }
+    }
+
     if (hparams.f_embedding_scale != 0.0f) {
         inpL = ggml_scale(ctx0, inpL, hparams.f_embedding_scale);
     }
@@ -1172,7 +1181,10 @@ llama_model_dflash::graph<false>::graph(const llama_model & model, const llm_gra
         output_s = model_other->output_s;
     }
 
+    const llama_hadamard *draft_transforms = hdmd;
+    if (model.output == nullptr) hdmd = &llama_get_model(cparams.ctx_other)->hdmd;
     cur = build_lora_mm(output, cur, output_s);
+    hdmd = draft_transforms;
 
     // DFlash2 feeds these logits to the selector, so they need the target's output
     // transforms; DFlash1 and DSpark read them through the sampler instead

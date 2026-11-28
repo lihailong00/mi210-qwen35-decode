@@ -187,6 +187,74 @@ void ggml_cuda_fwht_q2_0_q8(ggml_backend_cuda_context & ctx, const float * src, 
             src, signs, width, cols, bytes, scales);
     CUDA_CHECK(cudaGetLastError());
 }
+__launch_bounds__(GGML_CUDA_FWHT_BLOCK_NT, 1)
+static __global__ void fwht_signed_q8_five(const float * src, const float * signs, int width, int cols,
+        int8_t * bytes, float * scales, int8_t * tail, float * tail_scales) {
+    constexpr int N = 1024;
+    constexpr int NT = GGML_CUDA_FWHT_BLOCK_NT;
+    const int col = blockIdx.x / (width / N);
+    const int pos = (blockIdx.x % (width / N)) * N + threadIdx.x;
+    __shared__ float s[N];
+    float reg[N / NT];
+#pragma unroll
+    for (int i = 0; i < N / NT; ++i) {
+        const int k = pos + i * NT;
+        reg[i] = col < cols ? (src[col * width + k] * signs[k]) * (1.0f / 32.0f) : 0.0f;
+    }
+    fwht_wide_transform<N, NT>(reg, s);
+#pragma unroll
+    for (int i = 0; i < N / NT; ++i) {
+        const int k = pos + i * NT;
+        const int group = col == 4 ? k / 32 : 4 * (k / 32) + col;
+        const float amax = warp_reduce_max<32>(fabsf(reg[i]));
+        const float d = amax / 127.0f;
+        (col == 4 ? tail : bytes)[32 * group + k % 32] = amax == 0.0f ? 0 : roundf(reg[i] / d);
+        if (k % 32 == 0) {
+            (col == 4 ? tail_scales : scales)[group] = __half2float(__float2half(d));
+        }
+    }
+}
+
+void bonsai_fwht_five(ggml_backend_cuda_context & ctx, const float * src, const float * signs,
+        int width, int cols, int8_t * bytes, float * scales, int8_t * tail, float * tail_scales) {
+    fwht_signed_q8_five<<<5 * (width / 1024), GGML_CUDA_FWHT_BLOCK_NT, 0, ctx.stream()>>>(
+            src, signs, width, cols, bytes, scales, tail, tail_scales);
+    CUDA_CHECK(cudaGetLastError());
+}
+__launch_bounds__(GGML_CUDA_FWHT_BLOCK_NT, 1)
+static __global__ void fwht_signed_q8_eight(const float * src, const float * signs, int width, int cols,
+        int8_t * bytes, float * scales, int8_t * tail, float * tail_scales) {
+    constexpr int N = 1024;
+    constexpr int NT = GGML_CUDA_FWHT_BLOCK_NT;
+    const int col = blockIdx.x / (width / N);
+    const int pos = (blockIdx.x % (width / N)) * N + threadIdx.x;
+    __shared__ float s[N];
+    float reg[N / NT];
+#pragma unroll
+    for (int i = 0; i < N / NT; ++i) {
+        const int k = pos + i * NT;
+        reg[i] = col < cols ? (src[col * width + k] * signs[k]) * (1.0f / 32.0f) : 0.0f;
+    }
+    fwht_wide_transform<N, NT>(reg, s);
+#pragma unroll
+    for (int i = 0; i < N / NT; ++i) {
+        const int k = pos + i * NT;
+        const int group = 4 * (k / 32) + (col % 4);
+        const float amax = warp_reduce_max<32>(fabsf(reg[i]));
+        const float d = amax / 127.0f;
+        (col >= 4 ? tail : bytes)[32 * group + k % 32] = amax == 0.0f ? 0 : roundf(reg[i] / d);
+        if (k % 32 == 0) {
+            (col >= 4 ? tail_scales : scales)[group] = __half2float(__float2half(d));
+        }
+    }
+}
+
+void bonsai_fwht_eight(ggml_backend_cuda_context & ctx, const float * src, const float * signs,
+        int width, int cols, int8_t * bytes, float * scales, int8_t * tail, float * tail_scales) {
+    fwht_signed_q8_eight<<<8 * (width / 1024), GGML_CUDA_FWHT_BLOCK_NT, 0, ctx.stream()>>>(
+            src, signs, width, cols, bytes, scales, tail, tail_scales);
+    CUDA_CHECK(cudaGetLastError());
+}
 #endif
 
 template <typename T>

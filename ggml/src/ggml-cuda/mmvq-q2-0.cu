@@ -23,7 +23,11 @@ static __device__ __forceinline__ int64_t q2_0_offset(int row, int k, int width)
 // Same-size, lossless SoA copy: eight packed bytes per 32 values followed by
 // one fp16 scale per 64 values. Transpose the two-bit codes within each word
 // so a shift and byte permutation feed four signed values directly to dp4a.
-template<bool TILED>
+static __device__ __forceinline__ int64_t q2_0_pair_offset(int row, int k, int width) {
+    return (((int64_t)(row / 8) * width + k) * 4 + row % 4) * 2 + (row / 4) % 2;
+}
+
+template<bool TILED, bool PAIRED = false>
 static __global__ void q2_0_repack_kernel(const block_q2_0 * src, uint2 * codes, half * scales, const int64_t nblocks, int blocks_per_row) {
     const int64_t i = (int64_t) blockIdx.x*blockDim.x + threadIdx.x;
     if (i >= nblocks) {
@@ -32,7 +36,7 @@ static __global__ void q2_0_repack_kernel(const block_q2_0 * src, uint2 * codes,
     const block_q2_0 & b = src[i];
     const int row = i / blocks_per_row;
     const int block = i % blocks_per_row;
-    scales[TILED ? q2_0_offset<true>(row, block, blocks_per_row) : i] = b.d;
+    scales[PAIRED ? q2_0_pair_offset(row,block,blocks_per_row) : TILED ? q2_0_offset<true>(row, block, blocks_per_row) : i] = b.d;
 #pragma unroll
     for (int chunk = 0; chunk < 2; ++chunk) {
         uint32_t words[2] = {};
@@ -45,16 +49,16 @@ static __global__ void q2_0_repack_kernel(const block_q2_0 * src, uint2 * codes,
                 words[word] |= q << (8*(j%4) + 2*(j/4));
             }
         }
-        codes[TILED ? q2_0_offset<true>(row, 2*block + chunk, 2*blocks_per_row) : 2*i + chunk] = make_uint2(words[0], words[1]);
+        codes[PAIRED ? q2_0_pair_offset(row,2*block+chunk,2*blocks_per_row) : TILED ? q2_0_offset<true>(row, 2*block + chunk, 2*blocks_per_row) : 2*i + chunk] = make_uint2(words[0], words[1]);
     }
 }
 
-template<bool TILED>
+template<bool TILED, bool PAIRED = false>
 static void q2_0_repack(const void * src, void * dst, const ggml_tensor * w, hipStream_t stream) {
     const int64_t nblocks = ggml_nelements(w)/QK2_0;
     auto * codes = (uint2 *) dst;
     auto * scales = (half *) (codes + 2*nblocks);
-    q2_0_repack_kernel<TILED><<<(nblocks + 255)/256, 256, 0, stream>>>(
+    q2_0_repack_kernel<TILED, PAIRED><<<(nblocks + 255)/256, 256, 0, stream>>>(
         (const block_q2_0 *) src, codes, scales, nblocks, w->ne[0] / QK2_0);
     CUDA_CHECK(cudaGetLastError());
 }
@@ -435,6 +439,195 @@ static __global__ void q2_0_verify_group(q2_0_projection first, q2_0_projection 
     q2_0_verify_rows<C, true>(proj.codes, proj.scales, activations, activation_scales, proj.dst, chunks, proj.rows, row);
 }
 
+// A block covers eight output rows and four columns. Consecutive blocks cover the
+// two halves of one eight-column verification and can reuse the same weight lines.
+template <int CHUNKS, int SLOTS, bool INTERLEAVE>
+__launch_bounds__(4 * SLOTS)
+static __global__ void q2_0_eight_rows(q2_0_projection first, q2_0_projection second, q2_0_projection third,
+        const q2_0_words * lo, const float4 * lo_scale, const q2_0_words * hi, const float4 * hi_scale) {
+    using accum4 = int __attribute__((ext_vector_type(4)));
+    constexpr int parts = 128 / SLOTS;
+    const int thread = threadIdx.x;
+    const int lane = thread % 4;
+    const int slot = thread / 4;
+    const int side = blockIdx.x % 2;
+    int row0 = (blockIdx.x / 2) * 8;
+    auto proj = first;
+    if (row0 >= proj.rows) {
+        row0 -= proj.rows; proj = second;
+        if (row0 >= proj.rows) { row0 -= proj.rows; proj = third; }
+    }
+    const auto * act = side ? hi : lo;
+    const auto * scales = side ? hi_scale : lo_scale;
+    const auto * codes = reinterpret_cast<const uint4 *>(proj.codes) + size_t(row0 / 8) * CHUNKS * 4;
+    const auto * weight_scales = reinterpret_cast<const half2 *>(proj.scales) + size_t(row0 / 8) * (CHUNKS / 2) * 4;
+    float sums[parts][2][4] = {};
+#pragma unroll
+    for (int part = 0; part < parts; ++part) {
+        for (int base = 0; base < CHUNKS; base += 128) {
+            const int k = base + part * SLOTS + slot;
+            if (k >= CHUNKS) continue;
+            const q2_0_words x = act[4*k + lane];
+            const float4 dy = scales[k];
+            const uint4 code = codes[4*k + lane];
+            const half2 ds = weight_scales[4*(k/2) + lane];
+            accum4 dots[2] = {};
+            if constexpr (INTERLEAVE) {
+#pragma unroll
+                for (int j = 0; j < 8; ++j) {
+                    const int a = q2_0_component(j < 4 ? x.lo : x.hi, j%4);
+#pragma unroll
+                    for (int g = 0; g < 2; ++g) {
+                        const unsigned word = g == 0 ? (j < 4 ? code.x : code.y) : (j < 4 ? code.z : code.w);
+                        const int w = ggml_hip_perm(0x020100ff,0x020100ff,(word >> (2*(j%4))) & 0x03030303u);
+                        dots[g] = __builtin_amdgcn_mfma_i32_4x4x4i8(a,w,dots[g],0,0,0);
+                    }
+                }
+            } else {
+#pragma unroll
+                for (int g = 0; g < 2; ++g) {
+#pragma unroll
+                    for (int j = 0; j < 8; ++j) {
+                        const unsigned word = g == 0 ? (j < 4 ? code.x : code.y) : (j < 4 ? code.z : code.w);
+                        const int w = ggml_hip_perm(0x020100ff,0x020100ff,(word >> (2*(j%4))) & 0x03030303u);
+                        const int a = q2_0_component(j < 4 ? x.lo : x.hi,j%4);
+                        dots[g] = __builtin_amdgcn_mfma_i32_4x4x4i8(a,w,dots[g],0,0,0);
+                    }
+                }
+            }
+#pragma unroll
+            for (int g = 0; g < 2; ++g) {
+                const float dw = __half2float(g == 0 ? __low2half(ds) : __high2half(ds));
+#pragma unroll
+                for (int c = 0; c < 4; ++c) sums[part][g][c] += dw*q2_0_component(dy,c)*dots[g][c];
+            }
+        }
+    }
+    __shared__ float partial[32][SLOTS + 1];
+#pragma unroll
+    for (int g = 0; g < 2; ++g) {
+#pragma unroll
+        for (int c = 0; c < 4; ++c) {
+#pragma unroll
+            for (int delta = parts/2; delta; delta /= 2) {
+#pragma unroll
+                for (int i = 0; i < delta; ++i) sums[i][g][c] += sums[i+delta][g][c];
+            }
+            if constexpr (SLOTS == 16) {
+                float v = sums[0][g][c];
+#pragma unroll
+                for (int delta = 8; delta; delta /= 2) v += __shfl_xor(v,4*delta,64);
+                if (slot == 0) proj.dst[(4*side+c)*proj.rows + row0+4*g+lane] = v;
+            } else {
+                partial[(4*g+lane)*4+c][slot] = sums[0][g][c];
+            }
+        }
+    }
+    if constexpr (SLOTS != 16) {
+        __syncthreads();
+        for (int out = thread/SLOTS; out < 32; out += 4) {
+            const float v = warp_reduce_sum<SLOTS>(partial[out][thread%SLOTS]);
+            if (thread%SLOTS == 0) proj.dst[(4*side+out%4)*proj.rows + row0+out/4] = v;
+        }
+    }
+}
+
+template<int C, bool TILED>
+static __device__ __forceinline__ void q2_0_verify_rows_wide(const uint2 * codes, const half * scales,
+        const q2_0_words * activations, const float4 * activation_scales,
+        const q2_0_words * activations_hi, const float4 * scales_hi, float * dst, int chunks, int rows, int row0) {
+    using int4_acc = int __attribute__((ext_vector_type(4)));
+    constexpr int row_groups = 2;
+    constexpr int rows_per_block = 4 * row_groups;
+    constexpr int slots = 32; // 128 threads in quads, one K chunk per quad
+    constexpr int parts = 128 / slots;
+    const int tid = threadIdx.x;
+    const int quad_lane = tid % 4;
+    const int slot = tid / 4;
+    float sums[parts][row_groups][C] = {};
+    for (int base = 0; base < chunks; base += 128) {
+#pragma unroll
+        for (int part = 0; part < parts; ++part) {
+            const int wave_start = base + part * slots + 16 * (tid / 64);
+            // Tiled weights have a multiple of 32 chunks. Both waves can skip a full slot group together.
+            if ((TILED ? base + part * slots : wave_start) >= chunks) {
+                continue;
+            }
+            const int item = wave_start + (tid % 64) / 4;
+            // All lanes must reach the MFMA even for a partially filled wave.
+            const int k = TILED ? item : min(item, chunks - 1);
+            const q2_0_words act = activations[4 * k + quad_lane];
+            const float4 dy = activation_scales[k];
+            const q2_0_words act_hi = activations_hi[C == 5 ? k : 4*k+quad_lane];
+            const float4 dy_hi = C == 5 ? make_float4(reinterpret_cast<const float *>(scales_hi)[k],0,0,0) : scales_hi[k];
+#pragma unroll
+            for (int group = 0; group < row_groups; ++group) {
+                const int row = row0 + 4 * group + quad_lane;
+                const int64_t offset = q2_0_offset<TILED>(row, k, chunks);
+                const uint2 code = codes[offset];
+                const float dw = __half2float(scales[q2_0_offset<TILED>(row, k / 2, chunks / 2)]);
+                int4_acc dots = {}, dots_hi = {}; int fifth = 0;
+                // Each quad forms a 4-row x 4-column tile. Eight integer matrix
+                // instructions cover 32 K values; a lane owns one row of results.
+#pragma unroll
+                for (int j = 0; j < 8; ++j) {
+                    const uint32_t word = j < 4 ? code.x : code.y;
+                    const uint32_t sel = (word >> (2 * (j % 4))) & 0x03030303u;
+                    const int w = ggml_hip_perm(0x020100ff, 0x020100ff, sel);
+#if defined(__gfx90a__)
+                    const int a = q2_0_component(j < 4 ? act.lo : act.hi, j % 4);
+                    dots = __builtin_amdgcn_mfma_i32_4x4x4i8(a, w, dots, 0, 0, 0);
+                    const int a_hi = q2_0_component(j < 4 ? act_hi.lo : act_hi.hi, j % 4);
+                    if constexpr(C == 5) fifth = ggml_cuda_dp4a(a_hi,w,fifth); else dots_hi = __builtin_amdgcn_mfma_i32_4x4x4i8(a_hi,w,dots_hi,0,0,0);
+#endif
+                }
+                if (TILED || item < chunks) {
+#pragma unroll
+                    for (int col = 0; col < C; ++col) {
+                        sums[part][group][col] += dw * q2_0_component(col < 4 ? dy : dy_hi, col % 4) * (col < 4 ? dots[col % 4] : (C == 5 ? fifth : dots_hi[col % 4]));
+                    }
+                }
+            }
+        }
+    }
+    // Match GEMV's 128-slot FP32 reduction: combine slots 64 apart, then
+    // 32 apart, then use the same shuffle tree on the remaining 32 slots.
+    __shared__ float partial[rows_per_block * C][slots + 1];
+#pragma unroll
+    for (int group = 0; group < row_groups; ++group) {
+#pragma unroll
+        for (int col = 0; col < C; ++col) {
+            const float lo = sums[0][group][col] + sums[2][group][col];
+            const float hi = sums[1][group][col] + sums[3][group][col];
+            partial[(4 * group + quad_lane) * C + col][slot] = lo + hi;
+        }
+    }
+    __syncthreads();
+    for (int output = tid / slots; output < rows_per_block * C; output += 128 / slots) {
+        const int lane = tid % slots;
+        const float sum = warp_reduce_sum<slots>(partial[output][lane]);
+        if (lane == 0) {
+            dst[(output % C) * rows + row0 + output / C] = sum;
+        }
+    }
+}
+template<int C>
+__launch_bounds__(128)
+static __global__ void q2_0_verify_group_wide(q2_0_projection first, q2_0_projection second, q2_0_projection third,
+        const q2_0_words * activations, const float4 * activation_scales, const q2_0_words * hi, const float4 * dy_hi, int chunks) {
+    int row = blockIdx.x * 8;
+    q2_0_projection proj = first;
+    if (row >= first.rows) {
+        row -= first.rows;
+        proj = second;
+        if (row >= second.rows) {
+            row -= second.rows;
+            proj = third;
+        }
+    }
+    q2_0_verify_rows_wide<C, true>(proj.codes, proj.scales, activations, activation_scales, hi, dy_hi, proj.dst, chunks, proj.rows, row);
+}
+
 #endif
 
 static bool q2_0_weight_ok(const ggml_tensor * w) {
@@ -553,6 +746,62 @@ static void q2_0_fwht_project(ggml_backend_cuda_context & ctx, const ggml_tensor
 #endif
 }
 
+void bonsai_fwht_five(ggml_backend_cuda_context &,const float *,const float *,int,int,int8_t *,float *,int8_t *,float *);
+void bonsai_fwht_eight(ggml_backend_cuda_context &,const float *,const float *,int,int,int8_t *,float *,int8_t *,float *);
+template<int C>
+static void q2_0_fwht_project_wide(ggml_backend_cuda_context & ctx, const ggml_tensor * input, const ggml_tensor * signs,
+        ggml_tensor * const * outputs, const void * const * packed, int count, bool pair_eight = false) {
+    const int width = input->ne[0];
+    const int chunks = width / QK8_1;
+    ggml_cuda_pool_alloc<char> scratch(ctx.pool());
+    auto * words = reinterpret_cast<q2_0_words *>(scratch.alloc(2*chunks * (4 * sizeof(q2_0_words) + sizeof(float4))));
+    auto * dy = reinterpret_cast<float4 *>(words + 4 * chunks);
+    auto * hi = reinterpret_cast<q2_0_words *>(dy+chunks);
+    auto * dy_hi = reinterpret_cast<float4 *>(hi+4*chunks);
+    if constexpr (C == 5) {
+        bonsai_fwht_five(ctx,static_cast<const float *>(input->data),static_cast<const float *>(signs->data),width,C,
+            reinterpret_cast<int8_t *>(words),reinterpret_cast<float *>(dy),reinterpret_cast<int8_t *>(hi),reinterpret_cast<float *>(dy_hi));
+    } else if (C == 8 && [] {const char *e=getenv("BONSAI_Q2_EIGHT_PREP");return !e || e[0]!='0';}()) {
+        bonsai_fwht_eight(ctx,static_cast<const float *>(input->data),static_cast<const float *>(signs->data),width,C,
+                reinterpret_cast<int8_t *>(words),reinterpret_cast<float *>(dy),reinterpret_cast<int8_t *>(hi),reinterpret_cast<float *>(dy_hi));
+    } else {
+        ggml_cuda_fwht_q2_0_q8(ctx,static_cast<const float *>(input->data),static_cast<const float *>(signs->data),width,4,reinterpret_cast<int8_t *>(words),reinterpret_cast<float *>(dy));
+        ggml_cuda_fwht_q2_0_q8(ctx,static_cast<const float *>(input->data)+4*width,static_cast<const float *>(signs->data),width,C-4,reinterpret_cast<int8_t *>(hi),reinterpret_cast<float *>(dy_hi));
+    }
+#if defined(__gfx90a__) || !defined(__HIP_DEVICE_COMPILE__)
+    q2_0_projection proj[3] = {};
+    int total_rows = 0;
+    for (int i = 0; i < count; ++i) {
+        const auto * codes = static_cast<const uint2 *>(packed[i]);
+        const int rows = outputs[i]->ne[0];
+        proj[i] = {codes, reinterpret_cast<const half *>(codes + (int64_t) rows * chunks),
+                   static_cast<float *>(outputs[i]->data), rows};
+        total_rows += rows;
+    }
+    if constexpr (C == 8) {
+        if (pair_eight) {
+            const auto grid = total_rows / 4;
+            if (chunks == 160) {
+                q2_0_eight_rows<160,16,true><<<grid,64,0,ctx.stream()>>>(proj[0],proj[1],proj[2],words,dy,hi,dy_hi);
+            } else if (chunks == 192) {
+                q2_0_eight_rows<192,32,false><<<grid,128,0,ctx.stream()>>>(proj[0],proj[1],proj[2],words,dy,hi,dy_hi);
+            } else {
+                GGML_ASSERT(chunks == 544);
+                q2_0_eight_rows<544,32,false><<<grid,128,0,ctx.stream()>>>(proj[0],proj[1],proj[2],words,dy,hi,dy_hi);
+            }
+            CUDA_CHECK(cudaGetLastError());
+            static const bool logged = (fprintf(stderr,"Bonsai eight-column paired verification enabled\n"),true);
+            (void)logged;
+            return;
+        }
+    }
+    q2_0_verify_group_wide<C><<<total_rows/8,128,0,ctx.stream()>>>(proj[0],proj[1],proj[2],words,dy,hi,dy_hi,chunks);
+    static const bool logged = (fprintf(stderr, "Bonsai wide verification: %d columns\n", C),true);
+    (void) logged;
+    CUDA_CHECK(cudaGetLastError());
+#endif
+}
+
 bool ggml_cuda_mmvq_q2_0_fwht_group(ggml_backend_cuda_context & ctx, const ggml_tensor * input,
         const ggml_tensor * signs, ggml_tensor * const * outputs, int count) {
     GGML_ASSERT(count >= 1 && count <= 3);
@@ -565,15 +814,31 @@ bool ggml_cuda_mmvq_q2_0_fwht_group(ggml_backend_cuda_context & ctx, const ggml_
         if (!q2_0_weight_ok(w) || w->ne[0] != input->ne[0] || w->ne[1] != outputs[i]->ne[0]) {
             return false;
         }
-        packed[i] = q2_0_packed(ctx, w, true);
-        if (!packed[i]) {
-            return false;
+    }
+    static const bool enable_pair = [] {const char *e=getenv("BONSAI_Q2_EIGHT");return !e || e[0]!='0';}();
+    const int64_t width = input->ne[0];
+    bool pair_eight = enable_pair && input->ne[1] == 8 && (width == 5120 || width == 6144 || width == 17408);
+    if (pair_eight) {
+        for (int i=0; i<count; ++i) {
+            const auto *w = outputs[i]->src[0];
+            packed[i] = ggml_cuda_get_repacked(w,ctx.device,ctx.stream(),0x7e81,ggml_nbytes(w),q2_0_repack<true,true>);
+            if (!packed[i]) { pair_eight = false; break; }
+        }
+    }
+    if (!pair_eight) {
+        for (int i=0; i<count; ++i) {
+            packed[i] = q2_0_packed(ctx, outputs[i]->src[0], true);
+            if (!packed[i]) return false;
         }
     }
     switch (input->ne[1]) {
         case 2: q2_0_fwht_project<2>(ctx, input, signs, outputs, packed, count); break;
         case 3: q2_0_fwht_project<3>(ctx, input, signs, outputs, packed, count); break;
         case 4: q2_0_fwht_project<4>(ctx, input, signs, outputs, packed, count); break;
+        case 5: q2_0_fwht_project_wide<5>(ctx, input, signs, outputs, packed, count); break;
+        case 6: q2_0_fwht_project_wide<6>(ctx, input, signs, outputs, packed, count); break;
+        case 7: q2_0_fwht_project_wide<7>(ctx, input, signs, outputs, packed, count); break;
+        case 8: q2_0_fwht_project_wide<8>(ctx, input, signs, outputs, packed, count, pair_eight); break;
         default: return false;
     }
     return true;

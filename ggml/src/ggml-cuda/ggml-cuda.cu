@@ -6584,7 +6584,7 @@ static int ggml_cuda_try_q2_0_fwht_group(ggml_backend_cuda_context * ctx, ggml_c
     const ggml_tensor * act = nodes[3];
     const ggml_tensor * x = mul->src[0];
     const ggml_tensor * signs = mul->src[1];
-    if (!ggml_is_matrix(mul) || mul->ne[1] < 2 || mul->ne[1] > 4 || mul->ne[0] % 1024 != 0 ||
+    if (!ggml_is_matrix(mul) || mul->ne[1] < 2 || mul->ne[1] > 8 || mul->ne[0] % 1024 != 0 ||
             blocks->op != GGML_OP_RESHAPE || blocks->src[0] != mul || blocks->ne[0] != 1024 ||
             fwht->op != GGML_OP_MUL_MAT || fwht->src[1] != blocks || !ggml_cuda_op_mul_mat_use_fwht(fwht) ||
             act->op != GGML_OP_RESHAPE || act->src[0] != fwht || !ggml_are_same_shape(act, mul) ||
